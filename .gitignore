@@ -1,0 +1,9 @@
+# Live configuration + backups never leave the VM.
+.env
+.env.app
+backups/*
+!backups/.gitkeep
+# Written by update.sh during an automatic rollback.
+.rollback-image.yml
+# Inter-script mutual-exclusion lockfile.
+.deploy.lock

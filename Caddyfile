@@ -1,0 +1,73 @@
+# Caddy reverse proxy for the NXPi app (Azure single-VM deploy, standalone package).
+#
+# {$SITE_ADDRESS} is read from the caddy service environment. The compose file
+# defaults it to ":80" when SITE_ADDRESS is not set in ./.env — the default
+# lives THERE because Caddy's own {$VAR:default} syntax ignores set-but-empty
+# variables.
+#
+#   IP-only mode (default) — SITE_ADDRESS unset → the site address is `:80`:
+#     plain HTTP on the VM's public IP, no certificates, no DNS required.
+#
+#   Domain mode — SITE_ADDRESS=your.domain.com (in ./.env):
+#     Caddy automatically obtains and renews a Let's Encrypt certificate once
+#     the domain's DNS A-record points at this VM and ports 80/443 are
+#     reachable, and redirects HTTP→HTTPS by default. Also update
+#     BETTER_AUTH_URL in ./.env to https://your.domain.com.
+#
+# To set the ACME contact email, add a global block above the site:
+#   {
+#       email you@example.com
+#   }
+#
+# Deliberately NOT configured here:
+#   • rate limiting — the stock caddy:2-alpine image has no rate-limit module
+#     (it would require a custom xcaddy build, against this package's
+#     pull-only posture) and the app ships its own per-user rate limiting.
+#   • X-Frame-Options / Content-Security-Policy — the platform has an external
+#     copilot-embedding feature; a blanket frame-deny at the proxy would break
+#     it. Frame/CSP policy belongs to the app.
+
+{$SITE_ADDRESS} {
+	# Compress compressible responses only. This is an explicit Content-Type
+	# ALLOWLIST so `text/event-stream` (AI chat token streaming) is never
+	# routed through the compressor — compression buffers would defeat the
+	# unbuffered streaming guaranteed by flush_interval -1 below.
+	encode zstd gzip {
+		match {
+			header Content-Type text/html*
+			header Content-Type text/css*
+			header Content-Type text/plain*
+			header Content-Type application/json*
+			header Content-Type application/javascript*
+			header Content-Type text/javascript*
+			header Content-Type application/xml*
+			header Content-Type application/rss+xml*
+			header Content-Type image/svg+xml*
+			header Content-Type font/*
+		}
+	}
+
+	header {
+		# Active only when served over TLS (domain mode); browsers ignore it on
+		# plain HTTP / IP hosts, so it is safe to send unconditionally.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		# Never MIME-sniff responses into a different type.
+		X-Content-Type-Options "nosniff"
+		# Full referrer same-origin only; origin-only cross-origin over HTTPS.
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# Lock down powerful browser features the app does not use. NOTE:
+		# microphone is deliberately NOT disabled — the app's voice chat
+		# (OpenAI Realtime speech) needs it.
+		Permissions-Policy "camera=(), geolocation=()"
+		# Do not advertise server software.
+		-Server
+		-X-Powered-By
+	}
+
+	# Stream responses immediately (flush_interval -1) so AI chat SSE / token
+	# streaming is not buffered by the proxy. Caddy sets X-Forwarded-* and
+	# upgrades WebSockets automatically.
+	reverse_proxy app:3000 {
+		flush_interval -1
+	}
+}
