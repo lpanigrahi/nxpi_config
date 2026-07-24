@@ -6,6 +6,17 @@ set -e
 PFX_FILE="${1:-wildcard_nbcbearings_in.pfx}"
 CERTS_DIR="certs"
 
+# PFX export password: taken from the PFX_PASSWORD environment variable when
+# pre-set (non-interactive use, e.g. PFX_PASSWORD='...' ./install.sh), else
+# prompted for. Passed to openssl via `env:` so it never appears in `ps`
+# output. An empty password is valid — just press Enter at the prompt.
+if [ -z "${PFX_PASSWORD+x}" ]; then
+    read -r -s -p "Enter the PFX export password (empty if none): " PFX_PASSWORD \
+        || { echo "ERROR: PFX_PASSWORD is not set and there is no terminal to prompt on."; exit 1; }
+    echo
+fi
+export PFX_PASSWORD
+
 echo "Step 1: Checking for the PFX file..."
 if [ ! -f "$PFX_FILE" ]; then
     echo "ERROR: $PFX_FILE not found in the current directory."
@@ -21,13 +32,13 @@ echo "Step 3: Entering certs directory..."
 cd "$CERTS_DIR"
 
 echo "Step 4: Extracting server key..."
-openssl pkcs12 -legacy -in "../$PFX_FILE" -nocerts -nodes -out server.key -passin pass:""
+openssl pkcs12 -legacy -in "../$PFX_FILE" -nocerts -nodes -out server.key -passin env:PFX_PASSWORD
 
 echo "Step 5: Extracting server certificate..."
-openssl pkcs12 -legacy -in "../$PFX_FILE" -clcerts -nokeys -out server.crt -passin pass:""
+openssl pkcs12 -legacy -in "../$PFX_FILE" -clcerts -nokeys -out server.crt -passin env:PFX_PASSWORD
 
 echo "Step 6: Extracting intermediate certificate..."
-openssl pkcs12 -legacy -in "../$PFX_FILE" -cacerts -nokeys -out intermediate.crt -passin pass:""
+openssl pkcs12 -legacy -in "../$PFX_FILE" -cacerts -nokeys -out intermediate.crt -passin env:PFX_PASSWORD
 
 echo "Step 7: Building fullchain..."
 cat server.crt intermediate.crt > fullchain.crt

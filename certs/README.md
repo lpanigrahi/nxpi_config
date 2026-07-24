@@ -20,6 +20,13 @@ empty. Real cert/key files here must never be committed.
    ./generate-certs.sh [your-bundle.pfx]   # defaults to wildcard_nbcbearings_in.pfx
    ```
 
+   Extraction prompts for the PFX **export password** (press Enter if the
+   bundle has none). For non-interactive runs pre-set it in the environment:
+   `PFX_PASSWORD='...' ./install.sh` — it is passed to openssl via the
+   environment, never on the command line. A `Mac verify error: invalid
+   password?` means the password was wrong (or the `.pfx` was corrupted in
+   transfer — re-upload it in binary mode and compare checksums).
+
    Extraction produces, in this directory:
 
    ```
