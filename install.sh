@@ -207,6 +207,12 @@ if [ -n "$PFX_FILE" ]; then
     log "keep existing certs ($PFX_FILE is not newer than certs/fullchain.crt)"
   else
     log "extracting $PFX_FILE → ./certs (custom-cert mode)…"
+    # PFX export password precedence: an already-exported PFX_PASSWORD wins,
+    # then PFX_PASSWORD from ./.env; with neither, generate-certs.sh prompts.
+    if [ -z "${PFX_PASSWORD+x}" ]; then
+      PFX_PW=$(env_get .env PFX_PASSWORD "")
+      [ -z "$PFX_PW" ] || export PFX_PASSWORD="$PFX_PW"
+    fi
     ./generate-certs.sh "$PFX_FILE" || die "certificate extraction failed — see the output above (wrong PFX
   password/format?)"
     CERTS_REGENERATED=1
