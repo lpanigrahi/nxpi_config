@@ -97,13 +97,15 @@ on the VM by the public `nxpi-hash` helper. Nothing clones or builds the app.
 | `.env.app` | `BETTER_AUTH_COOKIE_SECURE=false` (auto-set — without it sign-in loops) | leave unset | leave unset |
 
 Custom-cert mode is for a corporate CA, a wildcard cert, or a VM the Let's
-Encrypt servers cannot reach: put the `.pfx` at the project root and run
-`./generate-certs.sh` — it extracts `certs/fullchain.crt` + `certs/server.key`
-and writes `certs/tls.caddy`, which the Caddyfile imports (see
-`certs/README.md`; `TLS_CERT_PATH`/`TLS_KEY_PATH` in `.env` are optional
-overrides, defaulted to those files). Open 443 in the NSG. With a private CA,
-also add the CA to the VM trust store or the update health gate's certificate
-check will fail.
+Encrypt servers cannot reach: put the `.pfx` at the project root — `install.sh`
+auto-detects it and runs `./generate-certs.sh`, which extracts
+`certs/fullchain.crt` + `certs/server.key` and writes `certs/tls.caddy`, the
+snippet the Caddyfile imports (see `certs/README.md`;
+`TLS_CERT_PATH`/`TLS_KEY_PATH` in `.env` are optional overrides, defaulted to
+those files). Re-runs skip extraction while the generated files are current;
+uploading a newer `.pfx` and re-running `./install.sh` renews the cert and
+restarts caddy. Open 443 in the NSG. With a private CA, also add the CA to the
+VM trust store or the update health gate's certificate check will fail.
 
 To switch to a domain later: point the DNS A-record at the VM, edit `.env`
 (set `SITE_ADDRESS`, change `BETTER_AUTH_URL` to `https://…`), then re-run

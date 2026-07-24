@@ -9,14 +9,18 @@ empty. Real cert/key files here must never be committed.
 ## Usage
 
 1. Put the PFX bundle at the **project root** (it is gitignored there) and
-   run the extraction script:
+   run the installer — it auto-detects any `*.pfx` there (exactly one) and
+   extracts it, skipping the step on re-runs when the generated files are
+   already up to date:
 
    ```bash
    cd ..                      # project root
-   ./generate-certs.sh        # expects wildcard_nbcbearings_in.pfx
+   ./install.sh               # detects the .pfx and extracts it
+   # or manually, outside an install run:
+   ./generate-certs.sh [your-bundle.pfx]   # defaults to wildcard_nbcbearings_in.pfx
    ```
 
-   It produces, in this directory:
+   Extraction produces, in this directory:
 
    ```
    fullchain.crt   # leaf + intermediate, PEM
@@ -41,9 +45,12 @@ empty. Real cert/key files here must never be committed.
 3. Apply: `../compose.sh up -d caddy` (or re-run `../install.sh`, which also
    validates the setup and fails fast on inconsistencies).
 
-**Renewal**: replace the `.pfx`, re-run `../generate-certs.sh`, then
-`../compose.sh restart caddy` to load the new files.
-**Disable the mode**: delete `tls.caddy` here and restart caddy.
+**Renewal**: replace the `.pfx` with the newer bundle and re-run
+`../install.sh` — it re-extracts (the `.pfx` being newer than
+`fullchain.crt` triggers it) and restarts caddy automatically. The manual
+flow still works: `../generate-certs.sh`, then `../compose.sh restart caddy`.
+**Disable the mode**: delete `tls.caddy` here (and the root `.pfx`, or the
+next install re-creates it) and restart caddy.
 
 ## Permissions
 

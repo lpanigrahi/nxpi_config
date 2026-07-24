@@ -187,6 +187,34 @@ if [ -n "$SITE" ] && [ "$BAU" != "https://$SITE" ]; then
   Fix ./.env (either set BETTER_AUTH_URL=https://$SITE, or unset SITE_ADDRESS
   for IP-only mode) and re-run."
 fi
+# Custom-cert generation (idempotent): a *.pfx at the project root opts into
+# custom-cert mode. Extract it via ./generate-certs.sh unless the generated
+# files already exist and are not older than the bundle (renewal = upload a
+# newer .pfx and re-run). No .pfx present → nothing to do here: with
+# generated certs we keep using them, without them the stack runs in
+# IP-only / Let's Encrypt mode. Validation of the result happens below.
+PFX_FILE=""
+for f in *.pfx; do
+  [ -e "$f" ] || continue          # unmatched glob stays literal
+  [ -z "$PFX_FILE" ] || die "multiple .pfx files at the project root ($PFX_FILE, $f) — keep exactly
+  one and re-run."
+  PFX_FILE="$f"
+done
+CERTS_REGENERATED=""
+if [ -n "$PFX_FILE" ]; then
+  if [ -s certs/fullchain.crt ] && [ -s certs/server.key ] && [ -s certs/tls.caddy ] \
+     && [ ! "$PFX_FILE" -nt certs/fullchain.crt ]; then
+    log "keep existing certs ($PFX_FILE is not newer than certs/fullchain.crt)"
+  else
+    log "extracting $PFX_FILE → ./certs (custom-cert mode)…"
+    ./generate-certs.sh "$PFX_FILE" || die "certificate extraction failed — see the output above (wrong PFX
+  password/format?)"
+    CERTS_REGENERATED=1
+    ok "certificates generated in ./certs"
+  fi
+elif [ -f certs/tls.caddy ]; then
+  log "no .pfx at the project root — keeping existing certificates in ./certs"
+fi
 # Custom-cert consistency: the mode is enabled by certs/tls.caddy (written by
 # ./generate-certs.sh and imported by the Caddyfile). When enabled it requires
 # domain mode (the cert names a hostname) and the cert/key files — resolved
@@ -198,8 +226,9 @@ TLS_CERT=$(env_get .env TLS_CERT_PATH "")
 TLS_KEY=$(env_get .env TLS_KEY_PATH "")
 if { [ -n "$TLS_CERT" ] || [ -n "$TLS_KEY" ]; } && [ ! -f certs/tls.caddy ]; then
   die "TLS_CERT_PATH/TLS_KEY_PATH are set in ./.env but ./certs/tls.caddy does not
-  exist — custom-cert mode is enabled by that snippet. Run ./generate-certs.sh
-  (see certs/README.md), or unset the vars, and re-run."
+  exist — custom-cert mode is enabled by that snippet. Put the certificate .pfx
+  at the project root and re-run ./install.sh (or run ./generate-certs.sh
+  manually — see certs/README.md), or unset the vars."
 fi
 if [ -f certs/tls.caddy ]; then
   [ -n "$SITE" ] || die "./certs/tls.caddy exists but SITE_ADDRESS is not set — custom-cert mode
@@ -217,7 +246,8 @@ if [ -f certs/tls.caddy ]; then
     esac
     tls_host_file="certs/${tls_path#/certs/}"
     [ -f "$tls_host_file" ] || die "custom-cert mode needs $tls_path but ./$tls_host_file does not exist —
-  run ./generate-certs.sh (see certs/README.md) and re-run."
+  put the certificate .pfx at the project root and re-run ./install.sh (or run
+  ./generate-certs.sh manually — see certs/README.md)."
   done
   ok "custom-cert mode: $TLS_CERT + $TLS_KEY (files present in ./certs)"
 fi
@@ -420,6 +450,10 @@ if [ -z "$(compose ps -q caddy 2>/dev/null)" ] && command -v ss >/dev/null 2>&1;
   fi
 fi
 compose up -d
+# `up -d` does not recreate caddy when only the bind-mounted cert files
+# changed — restart it so a renewed certificate is actually served (harmless
+# on a fresh install; the health gate below re-verifies either way).
+[ -z "$CERTS_REGENERATED" ] || { log "restarting caddy to load the renewed certificate…"; compose restart caddy; }
 health_gate 300 || die "the app did not pass the health gate — inspect: $DOCKER compose logs app caddy"
 
 # ── 9. Summary ───────────────────────────────────────────────────────────────

@@ -1,8 +1,9 @@
 #!/bin/bash
 set -e
 
-# Configuration
-PFX_FILE="wildcard_nbcbearings_in.pfx"
+# Configuration — the PFX path may be passed as $1 (install.sh auto-detects
+# any *.pfx at the project root and passes it); default kept for manual runs.
+PFX_FILE="${1:-wildcard_nbcbearings_in.pfx}"
 CERTS_DIR="certs"
 
 echo "Step 1: Checking for the PFX file..."
