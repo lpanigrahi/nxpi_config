@@ -456,10 +456,22 @@ if [ -z "$(compose ps -q caddy 2>/dev/null)" ] && command -v ss >/dev/null 2>&1;
   fi
 fi
 compose up -d
-# `up -d` does not recreate caddy when only the bind-mounted cert files
-# changed — restart it so a renewed certificate is actually served (harmless
-# on a fresh install; the health gate below re-verifies either way).
-[ -z "$CERTS_REGENERATED" ] || { log "restarting caddy to load the renewed certificate…"; compose restart caddy; }
+# Reload caddy when its running config predates the custom-cert snippet —
+# `up -d` does not recreate caddy for bind-mounted file changes. Two triggers:
+#   - CERTS_REGENERATED: this very run (re)extracted the bundle;
+#   - stale-config check: certs/tls.caddy may exist from an earlier run that
+#     failed later (e.g. at the health gate) — the re-run then skips
+#     extraction, but the running caddy still serves the pre-snippet config
+#     and keeps attempting ACME for the domain. Ask caddy's admin API (same
+#     endpoint the healthcheck probes) whether the loaded config references
+#     the /certs/ paths; if not (or the API is unreachable), restart. A
+#     restart is harmless either way — the health gate below re-verifies.
+NEED_CADDY_RESTART="$CERTS_REGENERATED"
+if [ -z "$NEED_CADDY_RESTART" ] && [ -f certs/tls.caddy ] && [ -n "$(compose ps -q caddy 2>/dev/null)" ]; then
+  compose exec -T caddy wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -q '/certs/' \
+    || NEED_CADDY_RESTART=1
+fi
+[ -z "$NEED_CADDY_RESTART" ] || { log "restarting caddy to load the custom certificate…"; compose restart caddy; }
 health_gate 300 || die "the app did not pass the health gate — inspect: $DOCKER compose logs app caddy"
 
 # ── 9. Summary ───────────────────────────────────────────────────────────────
