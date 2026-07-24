@@ -1,6 +1,12 @@
 #!/bin/bash
 set -e
 
+# Do not inherit the caller's umask: install.sh runs under umask 077 (secrets
+# phase), which would create ./certs as 0700 — the caddy container drops ALL
+# capabilities (no CAP_DAC_OVERRIDE), so even container-root then cannot
+# traverse the directory and fails with "permission denied" on the cert.
+umask 022
+
 # Configuration — the PFX path may be passed as $1 (install.sh auto-detects
 # any *.pfx at the project root and passes it); default kept for manual runs.
 PFX_FILE="${1:-wildcard_nbcbearings_in.pfx}"
@@ -26,10 +32,18 @@ fi
 
 echo "Step 2: Preparing certs directory..."
 mkdir -p "$CERTS_DIR"
+# Must be world-traversable for the capability-stripped caddy container
+# (also repairs a directory created 0700 by an earlier run's umask).
+chmod 755 "$CERTS_DIR"
 
 echo "Step 3: Entering certs directory..."
 # Entering the directory just like you would manually
 cd "$CERTS_DIR"
+
+# Remove previous outputs first: install.sh root-owns server.key after
+# extraction, and openssl cannot truncate a root-owned file as the operator —
+# unlinking only needs write permission on this (operator-owned) directory.
+rm -f server.key server.crt intermediate.crt fullchain.crt tls.caddy
 
 echo "Step 4: Extracting server key..."
 openssl pkcs12 -legacy -in "../$PFX_FILE" -nocerts -nodes -out server.key -passin env:PFX_PASSWORD
@@ -55,6 +69,7 @@ echo "Step 10: Writing Caddy TLS snippet..."
 # custom-cert mode. Single-quoted: the {$VAR} placeholders are expanded by
 # Caddy at startup (from the compose-provided env), never by this shell.
 printf 'tls {$TLS_CERT_PATH} {$TLS_KEY_PATH}\n' > tls.caddy
+chmod 644 tls.caddy
 
 # Leave the certs directory to return to the project root
 cd ..

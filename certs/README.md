@@ -63,10 +63,25 @@ next install re-creates it) and restart caddy.
 
 ## Permissions
 
-The mount keeps host ownership and caddy runs as root in the stock
-`caddy:2-alpine` image, so the script's `chmod 640 server.key` /
-`chmod 644 fullchain.crt` work as-is. The key never needs to be
-group/world readable.
+The mount keeps host ownership, and although caddy runs as root in the
+stock `caddy:2-alpine` image, the compose service **drops all Linux
+capabilities** — without `CAP_DAC_OVERRIDE`, container-root is subject to
+plain permission bits like any other user. Required state (set up
+automatically by `../install.sh` after extraction):
+
+```
+drwxr-xr-x  certs/              # 755 — traversable by the container
+-rw-r--r--  fullchain.crt       # 644 — public material
+-rw-r--r--  tls.caddy           # 644 — non-secret snippet
+-rw-------  server.key  root:root  # 600 — container-root reads it as OWNER
+```
+
+After a **manual** `../generate-certs.sh` run, apply the key ownership
+yourself (or just re-run `../install.sh`):
+
+```bash
+sudo chown root:root certs/server.key && sudo chmod 600 certs/server.key
+```
 
 > If the certificate is signed by a **private/corporate CA** not in the VM's
 > trust store, the deploy health gate (`lib.sh`), which probes

@@ -215,6 +215,13 @@ if [ -n "$PFX_FILE" ]; then
     fi
     ./generate-certs.sh "$PFX_FILE" || die "certificate extraction failed — see the output above (wrong PFX
   password/format?)"
+    # The caddy container drops ALL capabilities, so container-root has no
+    # CAP_DAC_OVERRIDE and is subject to plain permission bits: root-own the
+    # key (owner-read) instead of loosening its mode. Renewal stays sudo-free
+    # because generate-certs.sh unlinks old outputs first (directory write
+    # permission is all that unlinking needs).
+    as_root chown root:root certs/server.key
+    as_root chmod 600 certs/server.key
     CERTS_REGENERATED=1
     ok "certificates generated in ./certs"
   fi
