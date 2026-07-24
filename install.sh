@@ -187,30 +187,37 @@ if [ -n "$SITE" ] && [ "$BAU" != "https://$SITE" ]; then
   Fix ./.env (either set BETTER_AUTH_URL=https://$SITE, or unset SITE_ADDRESS
   for IP-only mode) and re-run."
 fi
-# Custom-cert consistency: TLS_CERT_PATH/TLS_KEY_PATH must be set together,
-# require domain mode (the cert names a hostname), and the files must exist
-# under ./certs — the only host path mounted into the caddy container (at
-# /etc/caddy/certs, read-only). Fatal here: a bad combo would otherwise only
-# surface as a caddy crash-loop after the stack is up.
+# Custom-cert consistency: the mode is enabled by certs/tls.caddy (written by
+# ./generate-certs.sh and imported by the Caddyfile). When enabled it requires
+# domain mode (the cert names a hostname) and the cert/key files — resolved
+# with the same defaults as docker-compose.yml — must exist under ./certs, the
+# only host path mounted into the caddy container (at /certs, read-only).
+# Fatal here: a bad combo would otherwise only surface as a caddy crash-loop
+# after the stack is up.
 TLS_CERT=$(env_get .env TLS_CERT_PATH "")
 TLS_KEY=$(env_get .env TLS_KEY_PATH "")
-if [ -n "$TLS_CERT" ] || [ -n "$TLS_KEY" ]; then
-  if [ -z "$TLS_CERT" ] || [ -z "$TLS_KEY" ]; then
-    die "TLS_CERT_PATH and TLS_KEY_PATH must be set together (both or neither).
-  Fix ./.env and re-run."
-  fi
-  [ -n "$SITE" ] || die "TLS_CERT_PATH/TLS_KEY_PATH are set but SITE_ADDRESS is not — custom-cert
-  mode needs SITE_ADDRESS set to the certificate's hostname (and
-  BETTER_AUTH_URL=https://<SITE_ADDRESS>). Fix ./.env and re-run."
+if { [ -n "$TLS_CERT" ] || [ -n "$TLS_KEY" ]; } && [ ! -f certs/tls.caddy ]; then
+  die "TLS_CERT_PATH/TLS_KEY_PATH are set in ./.env but ./certs/tls.caddy does not
+  exist — custom-cert mode is enabled by that snippet. Run ./generate-certs.sh
+  (see certs/README.md), or unset the vars, and re-run."
+fi
+if [ -f certs/tls.caddy ]; then
+  [ -n "$SITE" ] || die "./certs/tls.caddy exists but SITE_ADDRESS is not set — custom-cert mode
+  needs SITE_ADDRESS set to the certificate's hostname (and
+  BETTER_AUTH_URL=https://<SITE_ADDRESS>). Fix ./.env, or delete
+  ./certs/tls.caddy for IP-only mode, and re-run."
+  # Same defaults as the caddy service environment in docker-compose.yml.
+  TLS_CERT=${TLS_CERT:-/certs/fullchain.crt}
+  TLS_KEY=${TLS_KEY:-/certs/server.key}
   for tls_path in "$TLS_CERT" "$TLS_KEY"; do
     case "$tls_path" in
-      /etc/caddy/certs/*) ;;
+      /certs/*) ;;
       *) die "$tls_path — TLS_CERT_PATH/TLS_KEY_PATH must be container paths under
-  /etc/caddy/certs/ (the ./certs bind mount), e.g. /etc/caddy/certs/site.crt." ;;
+  /certs/ (the ./certs bind mount), e.g. /certs/fullchain.crt." ;;
     esac
-    tls_host_file="certs/${tls_path#/etc/caddy/certs/}"
-    [ -f "$tls_host_file" ] || die "$tls_path is set but ./$tls_host_file does not exist — copy the file into
-  ./certs/ (see certs/README.md) and re-run."
+    tls_host_file="certs/${tls_path#/certs/}"
+    [ -f "$tls_host_file" ] || die "custom-cert mode needs $tls_path but ./$tls_host_file does not exist —
+  run ./generate-certs.sh (see certs/README.md) and re-run."
   done
   ok "custom-cert mode: $TLS_CERT + $TLS_KEY (files present in ./certs)"
 fi

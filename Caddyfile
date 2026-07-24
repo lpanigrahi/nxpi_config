@@ -14,13 +14,15 @@
 #     reachable, and redirects HTTP→HTTPS by default. Also update
 #     BETTER_AUTH_URL in ./.env to https://your.domain.com.
 #
-#   Custom-certificate mode — SITE_ADDRESS=your.domain.com plus
-#   TLS_CERT_PATH/TLS_KEY_PATH (in ./.env):
+#   Custom-certificate mode — SITE_ADDRESS=your.domain.com plus a generated
+#   certs/tls.caddy snippet:
 #     bring your own certificate (corporate CA, wildcard, or a VM the ACME
-#     servers cannot reach) instead of Let's Encrypt. Drop the files into
-#     ./certs/ (bind-mounted read-only at /etc/caddy/certs) and point both
-#     vars at the container paths — see certs/README.md. The compose file
-#     assembles them into {$TLS_DIRECTIVE} used inside the site block below.
+#     servers cannot reach) instead of Let's Encrypt. Put the .pfx at the
+#     project root and run ./generate-certs.sh — it extracts
+#     certs/fullchain.crt + certs/server.key and writes certs/tls.caddy
+#     containing `tls {$TLS_CERT_PATH} {$TLS_KEY_PATH}` (paths default in
+#     docker-compose.yml to those files under the read-only /certs mount).
+#     The site block below imports the snippet — see certs/README.md.
 #
 # To set the ACME contact email, add a global block above the site:
 #   {
@@ -36,12 +38,11 @@
 #     it. Frame/CSP policy belongs to the app.
 
 {$SITE_ADDRESS} {
-	# Custom-certificate mode: expands to `tls <cert> <key>` when
-	# TLS_CERT_PATH/TLS_KEY_PATH are set in ./.env, otherwise to nothing —
-	# keeping automatic HTTPS (domain mode) / plain HTTP (IP-only mode)
-	# untouched. The whole line is assembled in docker-compose.yml as
-	# TLS_DIRECTIVE because a bare `tls` with empty args is a parse error.
-	{$TLS_DIRECTIVE}
+	# Custom-certificate mode: ./generate-certs.sh writes /certs/tls.caddy
+	# containing `tls {$TLS_CERT_PATH} {$TLS_KEY_PATH}`. An empty glob is
+	# ignored by Caddy, so with no snippet present automatic HTTPS (domain
+	# mode) / plain HTTP (IP-only mode) work exactly as before.
+	import /certs/*.caddy
 
 	# Compress compressible responses only. This is an explicit Content-Type
 	# ALLOWLIST so `text/event-stream` (AI chat token streaming) is never

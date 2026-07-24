@@ -1,6 +1,8 @@
 # Live configuration + backups never leave the VM.
 .env
 .env.app
+# Certificate bundles (contain the private key) — consumed by generate-certs.sh.
+*.pfx
 backups/*
 !backups/.gitkeep
 # Written by update.sh during an automatic rollback.
