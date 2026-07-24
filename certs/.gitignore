@@ -1,0 +1,4 @@
+# Certificate/key material is never committed — only this .gitignore and README.md.
+*
+!.gitignore
+!README.md

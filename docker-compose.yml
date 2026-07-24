@@ -219,6 +219,17 @@ services:
       #   unset (default)          → ":80" = plain HTTP on the VM IP (IP-only mode)
       #   SITE_ADDRESS=example.com → auto-TLS via Let's Encrypt (set in ./.env)
       SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+      # Custom-certificate mode (optional): container paths of an operator-
+      # supplied cert/key pair from ./.env, e.g. /etc/caddy/certs/site.crt
+      # (files live in ./certs — see the bind mount below and certs/README.md).
+      TLS_CERT_PATH: ${TLS_CERT_PATH:-}
+      TLS_KEY_PATH: ${TLS_KEY_PATH:-}
+      # Consumed by ./Caddyfile as {$TLS_DIRECTIVE}. The whole `tls cert key`
+      # line is assembled HERE because a bare `tls` with empty placeholder args
+      # is a Caddy parse error:
+      #   unset → expands to nothing (auto-TLS / plain HTTP, exactly as before)
+      #   set   → `tls <TLS_CERT_PATH> <TLS_KEY_PATH>` (custom certificate)
+      TLS_DIRECTIVE: ${TLS_CERT_PATH:+tls ${TLS_CERT_PATH} ${TLS_KEY_PATH}}
     ports:
       # Host ports are interpolable so the stack can also be smoke-tested on a
       # workstation where 80/443 are taken. On the VM leave them at defaults.
@@ -226,6 +237,7 @@ services:
       - "${CADDY_HTTPS_PORT:-443}:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/etc/caddy/certs:ro   # operator-supplied cert/key (custom-cert mode)
       - caddy-data:/data      # persisted ACME account + issued certificates
       - caddy-config:/config
     networks:

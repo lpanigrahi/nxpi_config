@@ -14,6 +14,14 @@
 #     reachable, and redirects HTTP→HTTPS by default. Also update
 #     BETTER_AUTH_URL in ./.env to https://your.domain.com.
 #
+#   Custom-certificate mode — SITE_ADDRESS=your.domain.com plus
+#   TLS_CERT_PATH/TLS_KEY_PATH (in ./.env):
+#     bring your own certificate (corporate CA, wildcard, or a VM the ACME
+#     servers cannot reach) instead of Let's Encrypt. Drop the files into
+#     ./certs/ (bind-mounted read-only at /etc/caddy/certs) and point both
+#     vars at the container paths — see certs/README.md. The compose file
+#     assembles them into {$TLS_DIRECTIVE} used inside the site block below.
+#
 # To set the ACME contact email, add a global block above the site:
 #   {
 #       email you@example.com
@@ -28,6 +36,13 @@
 #     it. Frame/CSP policy belongs to the app.
 
 {$SITE_ADDRESS} {
+	# Custom-certificate mode: expands to `tls <cert> <key>` when
+	# TLS_CERT_PATH/TLS_KEY_PATH are set in ./.env, otherwise to nothing —
+	# keeping automatic HTTPS (domain mode) / plain HTTP (IP-only mode)
+	# untouched. The whole line is assembled in docker-compose.yml as
+	# TLS_DIRECTIVE because a bare `tls` with empty args is a parse error.
+	{$TLS_DIRECTIVE}
+
 	# Compress compressible responses only. This is an explicit Content-Type
 	# ALLOWLIST so `text/event-stream` (AI chat token streaming) is never
 	# routed through the compressor — compression buffers would defeat the

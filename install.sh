@@ -187,6 +187,33 @@ if [ -n "$SITE" ] && [ "$BAU" != "https://$SITE" ]; then
   Fix ./.env (either set BETTER_AUTH_URL=https://$SITE, or unset SITE_ADDRESS
   for IP-only mode) and re-run."
 fi
+# Custom-cert consistency: TLS_CERT_PATH/TLS_KEY_PATH must be set together,
+# require domain mode (the cert names a hostname), and the files must exist
+# under ./certs — the only host path mounted into the caddy container (at
+# /etc/caddy/certs, read-only). Fatal here: a bad combo would otherwise only
+# surface as a caddy crash-loop after the stack is up.
+TLS_CERT=$(env_get .env TLS_CERT_PATH "")
+TLS_KEY=$(env_get .env TLS_KEY_PATH "")
+if [ -n "$TLS_CERT" ] || [ -n "$TLS_KEY" ]; then
+  if [ -z "$TLS_CERT" ] || [ -z "$TLS_KEY" ]; then
+    die "TLS_CERT_PATH and TLS_KEY_PATH must be set together (both or neither).
+  Fix ./.env and re-run."
+  fi
+  [ -n "$SITE" ] || die "TLS_CERT_PATH/TLS_KEY_PATH are set but SITE_ADDRESS is not — custom-cert
+  mode needs SITE_ADDRESS set to the certificate's hostname (and
+  BETTER_AUTH_URL=https://<SITE_ADDRESS>). Fix ./.env and re-run."
+  for tls_path in "$TLS_CERT" "$TLS_KEY"; do
+    case "$tls_path" in
+      /etc/caddy/certs/*) ;;
+      *) die "$tls_path — TLS_CERT_PATH/TLS_KEY_PATH must be container paths under
+  /etc/caddy/certs/ (the ./certs bind mount), e.g. /etc/caddy/certs/site.crt." ;;
+    esac
+    tls_host_file="certs/${tls_path#/etc/caddy/certs/}"
+    [ -f "$tls_host_file" ] || die "$tls_path is set but ./$tls_host_file does not exist — copy the file into
+  ./certs/ (see certs/README.md) and re-run."
+  done
+  ok "custom-cert mode: $TLS_CERT + $TLS_KEY (files present in ./certs)"
+fi
 case "$BAU" in
   http://*)
     # IP-only / plain-HTTP mode: browsers refuse Secure cookies over http://,
