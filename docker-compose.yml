@@ -271,6 +271,12 @@ services:
       #   unset (default)          → ":80" = plain HTTP on the VM IP (IP-only mode)
       #   SITE_ADDRESS=example.com → auto-TLS via Let's Encrypt (set in ./.env)
       SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+      # Custom-certificate mode (optional): consumed by certs/tls.caddy —
+      # written by ./generate-certs.sh — as {$TLS_CERT_PATH}/{$TLS_KEY_PATH}.
+      # Defaults match the generate-certs.sh output names; override only for
+      # differently-named files under ./certs (mounted read-only at /certs).
+      TLS_CERT_PATH: ${TLS_CERT_PATH:-/certs/fullchain.crt}
+      TLS_KEY_PATH: ${TLS_KEY_PATH:-/certs/server.key}
     ports:
       # Host ports are interpolable so the stack can also be smoke-tested on a
       # workstation where 80/443 are taken. On the VM leave them at defaults.
@@ -278,6 +284,7 @@ services:
       - "${CADDY_HTTPS_PORT:-443}:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/certs:ro     # operator-supplied cert/key + tls.caddy snippet
       - caddy-data:/data      # persisted ACME account + issued certificates
       - caddy-config:/config
     networks:

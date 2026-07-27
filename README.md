@@ -86,14 +86,26 @@ on the VM by the public `nxpi-hash` helper. Nothing clones or builds the app.
    the installer **generates a strong password and prints it once** in its
    summary — capture it, then change it after first login.
 
-### IP-only mode vs domain mode
+### Ingress modes: IP-only vs domain vs custom cert
 
-| | IP-only (default) | Domain |
-|---|---|---|
-| `SITE_ADDRESS` in `.env` | *(unset)* | `your.domain.com` |
-| `BETTER_AUTH_URL` in `.env` | `http://<vm-ip>` (auto-filled) | `https://your.domain.com` |
-| TLS | none (plain HTTP :80) | automatic Let's Encrypt on 80/443 |
-| `.env.app` | `BETTER_AUTH_COOKIE_SECURE=false` (auto-set — without it sign-in loops) | leave unset |
+| | IP-only (default) | Domain | Custom cert |
+|---|---|---|---|
+| `SITE_ADDRESS` in `.env` | *(unset)* | `your.domain.com` | `your.domain.com` |
+| `BETTER_AUTH_URL` in `.env` | `http://<vm-ip>` (auto-filled) | `https://your.domain.com` | `https://your.domain.com` |
+| `./certs/tls.caddy` (from `./generate-certs.sh`) | *(absent)* | *(absent)* | present (enables the mode) |
+| TLS | none (plain HTTP :80) | automatic Let's Encrypt on 80/443 | your cert/key files from `./certs/` on 80/443 |
+| `.env.app` | `BETTER_AUTH_COOKIE_SECURE=false` (auto-set — without it sign-in loops) | leave unset | leave unset |
+
+Custom-cert mode is for a corporate CA, a wildcard cert, or a VM the Let's
+Encrypt servers cannot reach: put the `.pfx` at the project root — `install.sh`
+auto-detects it and runs `./generate-certs.sh`, which extracts
+`certs/fullchain.crt` + `certs/server.key` and writes `certs/tls.caddy`, the
+snippet the Caddyfile imports (see `certs/README.md`;
+`TLS_CERT_PATH`/`TLS_KEY_PATH` in `.env` are optional overrides, defaulted to
+those files). Re-runs skip extraction while the generated files are current;
+uploading a newer `.pfx` and re-running `./install.sh` renews the cert and
+restarts caddy. Open 443 in the NSG. With a private CA, also add the CA to the
+VM trust store or the update health gate's certificate check will fail.
 
 To switch to a domain later: point the DNS A-record at the VM, edit `.env`
 (set `SITE_ADDRESS`, change `BETTER_AUTH_URL` to `https://…`), then re-run
