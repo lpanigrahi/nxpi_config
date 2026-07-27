@@ -1,0 +1,231 @@
+# =============================================================================
+# SharePoint MCP — standalone MULTI-SITE stack, fully ISOLATED from the NXPi
+# app stack. One container per SharePoint site (NBC Bearings), all running the
+# same registry image; only the per-site env file differs.
+#
+# The image is PULLED from the registry (never built on the VM):
+#   ghcr.io/lpanigrahi/ms-sharepoint-mcp  — pin a tag via MCP_IMAGE_TAG in ./.env
+# It is built and pushed by GitHub Actions CI (.github/workflows/ci.yml):
+#   merges to main   → :latest and :sha-<commit>
+#   git tags vX.Y.Z  → :X.Y.Z and :X.Y
+# If the GHCR package is private, log in first:
+#   echo $GHCR_TOKEN | docker login ghcr.io -u <github-user> --password-stdin
+#
+# This package is deliberately a SEPARATE compose project from the app's
+# `azure-deployment/` package: no shared networks, no shared volumes, no shared
+# env files, independent lifecycles.
+#
+# Port map (host → container). The app reaches each server via the VM's
+# PRIVATE IP; register each in the NXπ MCP Configuration UI as:
+#   { "url": "http://<vm-private-ip>:<port>/mcp" }
+#
+#   8001  mcp-rd             Research & Development
+#   8002  mcp-manufacturing  Manufacturing
+#   8003  mcp-qa             Quality Assurance
+#   8004  mcp-sales          Sales & Marketing
+#   8005  mcp-hr             Human Resources
+#   8006  mcp-finance        Finance
+#   8007  mcp-logistics      Central Logistics & Stores
+#   8008  mcp-gm             General Management
+#   8009  mcp-ir             IR (Industrial Relations)
+#   8010  mcp-scm            Supply Chain Management
+#   8011  mcp-nei            NEI Amsted
+#
+# Env layering (the reason creds are NOT duplicated per site):
+#   1. ./.env            shared: TENANT_ID/CLIENT_ID/CLIENT_SECRET,
+#                        MCP_ALLOWED_HOSTS (written by ./setup.sh), DEBUG.
+#                        Do NOT put SITE_URL or SITE_N_* entries here — they
+#                        would leak into every container.
+#   2. envs/mcp-*.env    per-site: SITE_URL only. Listed AFTER ./.env in each
+#                        service's env_file, so it wins on any overlap.
+# MCP_ALLOWED_HOSTS entries are "IP:*" (port-wildcarded), so the one shared
+# allow-list covers all 11 host ports.
+#
+# Run:
+#   ./setup.sh                        # env files + IP + pull + up + prints all URLs
+#   docker compose pull && docker compose up -d   # day-2 image update
+#
+# The MCP endpoints are UNAUTHENTICATED: keep ports 8001-8011 CLOSED inbound
+# in the Azure NSG (default-deny); MCP_ALLOWED_HOSTS + the NSG are the guards.
+# =============================================================================
+name: sharepoint-mcp
+
+# Same production hygiene as the app package: log rotation + no setuid escalation.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-security: &security
+  - "no-new-privileges:true"
+
+# ---------------------------------------------------------------------------
+# Shared service template — all sites use the same image; only env differs.
+# NOTE: env_file is deliberately NOT in this anchor: a service-level env_file
+# would REPLACE (not merge with) an inherited one, so each service lists the
+# [shared, per-site] pair explicitly.
+# ---------------------------------------------------------------------------
+x-mcp-common: &mcp-common
+  image: ghcr.io/lpanigrahi/ms-sharepoint-mcp:${MCP_IMAGE_TAG:-latest}
+  environment:
+    MCP_TRANSPORT: streamable-http
+    MCP_HOST: 0.0.0.0
+    MCP_PORT: 8000
+  restart: unless-stopped
+  logging: *logging
+  security_opt: *security
+  # Non-root python process (uid 1001, set in the Dockerfile) on an
+  # unprivileged port — no Linux capabilities needed.
+  cap_drop:
+    - ALL
+  # python:3.11-slim has neither wget nor curl; a TCP connect proves the HTTP
+  # transport is listening. KNOWN LIMITATION: a container stays "healthy" even
+  # when Graph auth failed at boot (the server serves an error context instead
+  # of crashing) — verify auth per container via the logs:
+  #   docker compose logs <service> | grep -i "authentication"
+  healthcheck:
+    test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), 3)"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 15s
+  # Default cap sized for typical document/list reads. Heavy-document sites
+  # get a per-service override (see mcp-finance) — unbounded containers could
+  # OOM-pressure the whole VM, which also runs the NXPi app stack.
+  deploy:
+    resources:
+      limits:
+        memory: 512m
+
+# ---------------------------------------------------------------------------
+# Services — one per SharePoint site
+# ---------------------------------------------------------------------------
+services:
+
+  # ── Research & Development ─────────────────────────────────────────────────
+  mcp-rd:
+    <<: *mcp-common
+    container_name: mcp-rd
+    env_file: [./.env, envs/mcp-rd.env]
+    ports:
+      - "${MCP_BIND_IP:-0.0.0.0}:8001:8000"
+    labels:
+      com.nbcbearings.site: "Research & Development"
+      com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/researchanddevelopment"
+
+  # ── Manufacturing ──────────────────────────────────────────────────────────
+  mcp-manufacturing:
+    <<: *mcp-common
+    container_name: mcp-manufacturing
+    env_file: [./.env, envs/mcp-manufacturing.env]
+    ports:
+      - "${MCP_BIND_IP:-0.0.0.0}:8002:8000"
+    labels:
+      com.nbcbearings.site: "Manufacturing"
+      com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/manufacturing"
+
+  # ── Quality Assurance ──────────────────────────────────────────────────────
+  mcp-qa:
+    <<: *mcp-common
+    container_name: mcp-qa
+    env_file: [./.env, envs/mcp-qa.env]
+    ports:
+      - "${MCP_BIND_IP:-0.0.0.0}:8003:8000"
+    labels:
+      com.nbcbearings.site: "Quality Assurance"
+      com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/qualityassurance"
+
+  # ── Sales & Marketing ──────────────────────────────────────────────────────
+  mcp-sales:
+    <<: *mcp-common
+    container_name: mcp-sales
+    env_file: [./.env, envs/mcp-sales.env]
+    ports:
+      - "${MCP_BIND_IP:-0.0.0.0}:8004:8000"
+    labels:
+      com.nbcbearings.site: "Sales & Marketing"
+      com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/salesmarketing"
+
+  # ── Human Resources ────────────────────────────────────────────────────────
+  mcp-hr:
+    <<: *mcp-common
+    container_name: mcp-hr
+    env_file: [./.env, envs/mcp-hr.env]
+    ports:
+      - "${MCP_BIND_IP:-0.0.0.0}:8005:8000"
+    labels:
+      com.nbcbearings.site: "Human Resources"
+      com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/hr"
+
+  # ── Finance ────────────────────────────────────────────────────────────────
+  # Higher cap: large .xlsb workbook parsing has been observed to peak near
+  # 3GB (upstream's finding). Raise/lower to match the VM's headroom.
+  mcp-finance:
+    <<: *mcp-common
+    container_name: mcp-finance
+    env_file: [./.env, envs/mcp-finance.env]
+    ports:
+      - "${MCP_BIND_IP:-0.0.0.0}:8006:8000"
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+    labels:
+      com.nbcbearings.site: "Finance"
+      com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/Finance"
+
+  # ── Central Logistics & Stores ─────────────────────────────────────────────
+  mcp-logistics:
+    <<: *mcp-common
+    container_name: mcp-logistics
+    env_file: [./.env, envs/mcp-logistics.env]
+    ports:
+      - "${MCP_BIND_IP:-0.0.0.0}:8007:8000"
+    labels:
+      com.nbcbearings.site: "Central Logistics & Stores"
+      com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/centrallogistics-stores"
+
+  # ── General Management ─────────────────────────────────────────────────────
+  mcp-gm:
+    <<: *mcp-common
+    container_name: mcp-gm
+    env_file: [./.env, envs/mcp-gm.env]
+    ports:
+      - "${MCP_BIND_IP:-0.0.0.0}:8008:8000"
+    labels:
+      com.nbcbearings.site: "General Management"
+      com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/GeneralManagement"
+
+  # ── IR (Industrial Relations) ──────────────────────────────────────────────
+  mcp-ir:
+    <<: *mcp-common
+    container_name: mcp-ir
+    env_file: [./.env, envs/mcp-ir.env]
+    ports:
+      - "${MCP_BIND_IP:-0.0.0.0}:8009:8000"
+    labels:
+      com.nbcbearings.site: "IR"
+      com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/ir"
+
+  # ── Supply Chain Management ────────────────────────────────────────────────
+  mcp-scm:
+    <<: *mcp-common
+    container_name: mcp-scm
+    env_file: [./.env, envs/mcp-scm.env]
+    ports:
+      - "${MCP_BIND_IP:-0.0.0.0}:8010:8000"
+    labels:
+      com.nbcbearings.site: "Supply Chain Management"
+      com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/SCM"
+
+  # ── NEI Amsted ─────────────────────────────────────────────────────────────
+  mcp-nei:
+    <<: *mcp-common
+    container_name: mcp-nei
+    env_file: [./.env, envs/mcp-nei.env]
+    ports:
+      - "${MCP_BIND_IP:-0.0.0.0}:8011:8000"
+    labels:
+      com.nbcbearings.site: "NEI Amsted"
+      com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/nei-amsted"
