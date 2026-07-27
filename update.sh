@@ -12,11 +12,16 @@
 #   4. docker compose pull app        (ONLY the app image — postgres/redis/
 #      caddy are never restarted by an update; infra image updates apply on
 #      ./install.sh re-runs instead)
-#   5. additive-only schema sync      (one-shot `migrate`; a DESTRUCTIVE diff
-#      fails loudly here and the running app keeps serving untouched)
+#   5. additive-only schema sync      (static db/<ver>/migrate-*.sql via psql;
+#      a DESTRUCTIVE migration is refused here and routed to ./migrate.sh —
+#      the running app keeps serving untouched)
 #   6. docker compose up -d app       (single-container rolling restart)
 #   7. health gate through the public ingress
 #      → on FAILURE: automatic rollback to the captured digest + re-gate
+#
+# Exit codes (for cron/automation):
+#   0 = updated and healthy      2 = update FAILED but ROLLED BACK healthy
+#   1 = hard failure (including: rollback itself did not become healthy)
 #
 # Never rebuilds anything, never runs `down`, never touches volumes.
 # =============================================================================
@@ -30,7 +35,7 @@ DO_BACKUP=true
 for arg in "$@"; do
   case "$arg" in
     --no-backup) DO_BACKUP=false ;;
-    -h|--help)   grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,20p'; exit 0 ;;
+    -h|--help)   grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,25p'; exit 0 ;;
     *) die "unknown flag: $arg (see --help)" ;;
   esac
 done
@@ -49,8 +54,8 @@ wait_healthy postgres 60 >/dev/null || die "postgres is not healthy — fix the 
 wait_healthy redis 30 >/dev/null || die "redis is not healthy — fix the data tier before updating"
 # Fresh-database guard: updating implies an EXISTING deployment. An empty DB
 # means this is really a first install — refuse rather than half-provision
-# (the migrate one-shot never seeds admin/org data). A FAILED count query
-# (empty/non-numeric) is also fatal: never guess about provisioning state.
+# (this path applies migrations only, never admin/org seed data). A FAILED
+# count query (empty/non-numeric) is also fatal: never guess about state.
 TABLES=$(table_count)
 assert_numeric "$TABLES" "the table count"
 [ "$TABLES" != "0" ] || die "the database is EMPTY — this is an update script, not an installer.
@@ -180,7 +185,9 @@ if health_gate 300; then
   warn "(install/update/restore) until a later successful ./update.sh clears it."
   warn "Diagnose the new image before retrying:  $DOCKER compose logs app"
   warn "If data damage is suspected, restore the pre-update backup: ./restore.sh --yes"
-  exit 1
+  # Exit 2, not 1: "degraded but SERVING on the old image" must be
+  # distinguishable from a hard failure by cron/automation wrappers.
+  exit 2
 fi
 die "rollback did not become healthy either — inspect immediately:
   $DOCKER compose ps

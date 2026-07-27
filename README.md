@@ -37,7 +37,7 @@ on the VM by the public `nxpi-hash` helper. Nothing clones or builds the app.
 | `restore.sh` | Restore a backup (destructive, `--yes`-gated, health-gated) |
 | `compose.sh` | Pin-honoring `docker compose` wrapper — use it for all manual compose operations |
 | `lib.sh` | Shared helpers sourced by the scripts above |
-| `docker-compose.yml` | The full production stack (app, Caddy, Postgres+pgvector, Redis, one-shots) |
+| `docker-compose.yml` | The full production stack (app, Caddy, Postgres+pgvector, Redis) |
 | `Caddyfile` | Reverse proxy: auto-HTTPS (domain mode), security headers, SSE-safe compression |
 | `secrets-entrypoint.sh` | Bridges Docker file-secrets → env for the app container |
 | `init.sql` | Enables the pgvector extension on first Postgres boot |
@@ -86,26 +86,14 @@ on the VM by the public `nxpi-hash` helper. Nothing clones or builds the app.
    the installer **generates a strong password and prints it once** in its
    summary — capture it, then change it after first login.
 
-### Ingress modes: IP-only vs domain vs custom cert
+### IP-only mode vs domain mode
 
-| | IP-only (default) | Domain | Custom cert |
-|---|---|---|---|
-| `SITE_ADDRESS` in `.env` | *(unset)* | `your.domain.com` | `your.domain.com` |
-| `BETTER_AUTH_URL` in `.env` | `http://<vm-ip>` (auto-filled) | `https://your.domain.com` | `https://your.domain.com` |
-| `./certs/tls.caddy` (from `./generate-certs.sh`) | *(absent)* | *(absent)* | present (enables the mode) |
-| TLS | none (plain HTTP :80) | automatic Let's Encrypt on 80/443 | your cert/key files from `./certs/` on 80/443 |
-| `.env.app` | `BETTER_AUTH_COOKIE_SECURE=false` (auto-set — without it sign-in loops) | leave unset | leave unset |
-
-Custom-cert mode is for a corporate CA, a wildcard cert, or a VM the Let's
-Encrypt servers cannot reach: put the `.pfx` at the project root — `install.sh`
-auto-detects it and runs `./generate-certs.sh`, which extracts
-`certs/fullchain.crt` + `certs/server.key` and writes `certs/tls.caddy`, the
-snippet the Caddyfile imports (see `certs/README.md`;
-`TLS_CERT_PATH`/`TLS_KEY_PATH` in `.env` are optional overrides, defaulted to
-those files). Re-runs skip extraction while the generated files are current;
-uploading a newer `.pfx` and re-running `./install.sh` renews the cert and
-restarts caddy. Open 443 in the NSG. With a private CA, also add the CA to the
-VM trust store or the update health gate's certificate check will fail.
+| | IP-only (default) | Domain |
+|---|---|---|
+| `SITE_ADDRESS` in `.env` | *(unset)* | `your.domain.com` |
+| `BETTER_AUTH_URL` in `.env` | `http://<vm-ip>` (auto-filled) | `https://your.domain.com` |
+| TLS | none (plain HTTP :80) | automatic Let's Encrypt on 80/443 |
+| `.env.app` | `BETTER_AUTH_COOKIE_SECURE=false` (auto-set — without it sign-in loops) | leave unset |
 
 To switch to a domain later: point the DNS A-record at the VM, edit `.env`
 (set `SITE_ADDRESS`, change `BETTER_AUTH_URL` to `https://…`), then re-run
@@ -120,10 +108,10 @@ describe the **same release**. `install.sh` auto-derives the artifact version
 from the image tag; set `DB_VERSION` explicitly when the tag is `:latest`.
 
 ```bash
-# deterministic, recommended for production (artifacts at db/1.2.0/):
-APP_IMAGE=ghcr.io/lpanigrahi/nxpi_dev:1.2.0    NXPI_HASH_IMAGE=ghcr.io/lpanigrahi/nxpi-hash:1.2.0
+# deterministic, recommended for production (artifacts at db/1.4.0/):
+APP_IMAGE=ghcr.io/lpanigrahi/nxpi_dev:1.4.0    NXPI_HASH_IMAGE=ghcr.io/lpanigrahi/nxpi-hash:1.4.0
 # newest build — pin the artifact version explicitly:
-APP_IMAGE=ghcr.io/lpanigrahi/nxpi_dev:latest   DB_VERSION=1.2.0
+APP_IMAGE=ghcr.io/lpanigrahi/nxpi_dev:latest   DB_VERSION=1.4.0
 ```
 
 ## Updating
@@ -142,9 +130,12 @@ the public ingress (in domain mode this probes `https://<domain>` against the
 real certificate, so a broken TLS/vhost fails the gate). If the gate fails,
 the app is **automatically rolled back** to the captured digest and re-gated.
 
-**Updates never re-initialize the database.** The schema step is the `migrate`
-one-shot: it refuses to create a database, never seeds or overwrites rows, and
-applies additive-only diffs — your data survives every upgrade. Both
+**Updates never re-initialize the database.** The schema step applies the
+shipped `db/<version>/migrate-*.sql` via `psql` inside the postgres container:
+it never seeds or overwrites rows and is additive-only on this path — your
+data survives every upgrade. (A migration flagged `REQUIRES-REVIEW` is refused
+here and routed through `./migrate.sh` for a deliberate maintenance window.)
+Both
 `update.sh` and `migrate.sh` additionally refuse to run against an *empty*
 database (that's `install.sh`'s job), so a mis-targeted "update" can never
 half-provision one.
@@ -156,8 +147,14 @@ half-provision one.
 ```
 
 Use it when a release ships schema changes you want applied ahead of (or
-independent of) rolling the app image — `update.sh` runs this same one-shot
-as part of the full upgrade.
+independent of) rolling the app image — `update.sh` applies this same
+migration set as part of the full upgrade. After a *destructive*
+(`REQUIRES-REVIEW`) migration applied with `ALLOW_DESTRUCTIVE_MIGRATION=1`,
+the still-running old image is *expected* to fail the post-migration health
+check — `migrate.sh` says so and exits 0; roll the matching image with
+`./update.sh` right after. For an adopted or freshly-restored database whose
+migration marker is empty, set `ADOPT_SCHEMA_VERSION=<its release>` so
+already-present migrations are stamped instead of re-applied.
 
 ## Backup
 
@@ -176,6 +173,13 @@ crontab -e
 # 0 3 * * *  cd $HOME/azure-deployment && ./backup.sh >> "backups/cron-$(date +\%F).log" 2>&1
 ```
 
+Exit codes for cron/automation: `backup.sh` exits **1** when the database
+dump succeeded but the uploads archive failed (a silent 0 would let uploads
+backups quietly stop accumulating); `update.sh` exits **0** on success, **2**
+when the update failed but the automatic rollback left the OLD image serving
+healthily, and **1** on hard failures; `restore.sh` exits **1** when the
+restore completed degraded (e.g. uploads not restored).
+
 (Dated cron logs are pruned by the same retention window as the dumps. If a
 backup fires while another operation holds the deployment lock, it skips that
 run rather than snapshotting a mid-operation database.)
@@ -183,8 +187,8 @@ run rather than snapshotting a mid-operation database.)
 **A single VM's disk is not a durability story** — ship dumps off the VM
 (`az storage blob upload …`; the exact command is printed after every backup),
 and keep a copy of the `secrets/` directory somewhere safe: **losing the
-secrets means losing access to the data** (a bootstrap re-run adopts, it never
-resets passwords).
+secrets means losing access to the data** (an `install.sh` re-run adopts, it
+never resets passwords).
 
 ## Restore
 
@@ -249,10 +253,24 @@ Reboots need nothing: every service has `restart: unless-stopped`.
 - Credentials are **file-secrets** (never in `docker inspect` or process
   argv); the app's secrets are readable only by uid 1001, mode 400.
 - Least-privilege DB split: the app connects as `neo_gen` (DML-only); the
-  superuser is used only by the one-shot DDL jobs.
+  superuser is used only by the deployment scripts' DDL, via `psql` inside
+  the postgres container.
 - Security headers + SSE-safe compression at the proxy (see `Caddyfile` for
   what is deliberately *not* set there, and why).
 - Memory limits and log rotation (10 MB × 3) on every service.
+
+## Development: helper self-test
+
+`tests/lib-harness.sh` asserts the pure helpers in `lib.sh` (dotenv parsing,
+semver ordering, version/artifact resolution, migration-file selection,
+percent-decoding, the rollback-pin compose wrapper) in a throwaway sandbox —
+no docker or database needed. Run it after any `lib.sh` change:
+
+```bash
+bash tests/lib-harness.sh                 # local
+docker run --rm -v "$PWD":/pkg:ro ubuntu:24.04 \
+  bash /pkg/tests/lib-harness.sh /pkg/lib.sh   # target-fidelity (Ubuntu)
+```
 
 ## Troubleshooting
 

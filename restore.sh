@@ -7,11 +7,13 @@
 #   ./restore.sh --yes <dump> --uploads backups/uploads-<ts>.tar.gz
 #   ./restore.sh --yes --no-backup <dump>       # skip the pre-restore backup
 #
-# DESTRUCTIVE: pg_restore --clean drops and recreates the application's
-# objects from the dump — data written after the dump is LOST. A safety
-# backup of the CURRENT state is taken first (so restoring the wrong dump is
-# recoverable), the app is stopped for the duration, and restarted (with a
-# health gate) afterwards.
+# DESTRUCTIVE: the application schemas (public + drizzle) are DROPPED and
+# recreated exactly from the dump — data written after the dump is LOST, and
+# nothing outside the dump survives (drop-first guarantees no silent mixing of
+# old and restored objects, e.g. when restoring a pre-rename dump under a
+# newer release). A safety backup of the CURRENT state is taken first (so
+# restoring the wrong dump is recoverable), the app is stopped for the
+# duration, and restarted (with a health gate) afterwards.
 # =============================================================================
 set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -96,7 +98,9 @@ if $DO_BACKUP; then
   # shellcheck disable=SC2086
   ./backup.sh $BK_FLAGS || die "safety backup failed — refusing to restore without one (override with --no-backup)"
 else
-  warn "skipping the pre-restore safety backup (--no-backup)"
+  warn "skipping the pre-restore safety backup (--no-backup)."
+  warn "This restore DROPS the current schemas BEFORE loading the dump — if the"
+  warn "load aborts mid-stream, the current data is GONE with no safety copy."
 fi
 # Re-verify the dump is still there and intact before any mutation.
 [ -s "$DUMP" ] || die "$DUMP disappeared before the restore could start — nothing was touched"
@@ -121,18 +125,32 @@ hdr "Restore"
 log "stopping app…"
 compose stop app >/dev/null
 
-# Same flags as the app repo's own restore path (scripts/db-backup.ts). No
-# --exit-on-error: with --clean, per-object errors can be benign — better to
-# let pg_restore finish, then VERIFY the result below than to abort midway.
+# Drop-first: `pg_restore --clean` only drops objects PRESENT IN THE DUMP, so
+# a cross-release restore (e.g. a pre-rename dump under a newer release) would
+# leave current-only objects behind — a silently MIXED schema that no gate
+# detects. Dropping the application schemas outright guarantees the restored
+# DB equals the dump exactly. The drizzle drop is required for the same
+# reason: the full-DB dump ships `drizzle` and its journal table. The dump
+# recreates both schemas and the pgvector extension (neogen_admin is the
+# cluster superuser). A die here is correct — the app is stopped and the DB is
+# not yet trusted (still before NEEDS_APP_RESTART=true).
+log "dropping application schemas (public, drizzle) for an exact-dump restore…"
+printf 'DROP SCHEMA IF EXISTS public CASCADE;\nDROP SCHEMA IF EXISTS drizzle CASCADE;\nCREATE SCHEMA public;\n' \
+  | psql_admin >/dev/null \
+  || die "could not drop/recreate the application schemas — the load has NOT started.
+  The database may now be missing its schemas; the app is still stopped and the
+  pre-restore safety backup is in ./backups (restore it with ./restore.sh --yes)."
+# No --exit-on-error: per-object errors can be benign (e.g. the dump's own
+# CREATE SCHEMA public against the pre-created one) — better to let pg_restore
+# finish, then VERIFY the result below than to abort midway.
 # stderr is captured so a nonzero exit can be classified: pg_restore prints
 # "errors ignored on restore: N" ONLY when it ran to completion — its absence
-# on failure means a hard abort (connection lost, unreadable dump, …) where
-# the table count of the UNTOUCHED old database would falsely read as success.
+# on failure means a hard abort (connection lost, unreadable dump, …).
 RESTORE_LOG="backups/restore-$(date +%Y%m%d-%H%M%S).log"
-log "pg_restore --clean --if-exists --no-owner (this can take a while; log: $RESTORE_LOG)…"
+log "pg_restore --no-owner into the emptied schemas (this can take a while; log: $RESTORE_LOG)…"
 set +e
 compose exec -T postgres pg_restore -U neogen_admin -d neogen \
-  --clean --if-exists --no-owner < "$DUMP" 2> "$RESTORE_LOG"
+  --no-owner < "$DUMP" 2> "$RESTORE_LOG"
 RC=$?
 set -e
 if [ $RC -ne 0 ]; then
@@ -157,14 +175,35 @@ case "$TABLES" in
 esac
 if [ "$TABLES" -lt 50 ]; then
   die "restore looks INCOMPLETE ($TABLES tables in schema public).
-  The database may be in a mixed state — do NOT start the app.
-  Re-try with another dump, or re-provision + restore on a fresh volume."
+  The schemas were dropped before loading, so the database is now EMPTY or
+  PARTIALLY loaded — do NOT start the app. Restore the pre-restore safety
+  dump from ./backups (./restore.sh --yes backups/neogen-<newest>.dump), or
+  re-try with another dump."
 fi
 ok "restore landed: $TABLES tables in schema public"
 # The DB is verified good from here on — any later failure MUST still restart
 # the app (the EXIT trap handles it). Dies BEFORE this point correctly leave the
 # app stopped, since the database state is unknown/untrusted.
 NEEDS_APP_RESTART=true
+
+# ── Re-assert grants ─────────────────────────────────────────────────────────
+# DROP SCHEMA destroyed the in-schema default-privilege entries and schema
+# grants, and the recreated `public` is owned by neogen_admin (PG15+
+# semantics) — without this the neo_gen app role loses USAGE/DML on the
+# restored objects. grants.sql is idempotent. warn (not die): the data restore
+# itself is good and grants are re-appliable manually; degraded exit surfaces it.
+if RS_GRANTS_DIR=$(db_dir); then
+  if psql_admin < "$RS_GRANTS_DIR/grants.sql" >/dev/null; then
+    ok "grants re-applied ($RS_GRANTS_DIR/grants.sql)"
+  else
+    warn "could not re-apply $RS_GRANTS_DIR/grants.sql — the app role may lack access. Re-apply manually:"
+    warn "  ./compose.sh exec -T postgres psql -U neogen_admin -d neogen < $RS_GRANTS_DIR/grants.sql"
+    RESTORE_DEGRADED=true
+  fi
+else
+  warn "no SQL artifacts under ./db — cannot re-apply grants.sql; the app role may lack access to restored objects."
+  RESTORE_DEGRADED=true
+fi
 
 # ── Re-sync the schema to the CURRENT app image ──────────────────────────────
 # A dump older than the running release restores the OLD schema; applying the
@@ -175,27 +214,49 @@ NEEDS_APP_RESTART=true
 # be auto-applied is downgraded to a warning; the app is always restarted below.
 hdr "Schema re-sync (additive, matches the current release)"
 if RS_DIR=$(db_dir); then
-  RS_MARK=$(marker_row_count)
-  # No `|| true`: has_pending_destructive fails closed. A die here is past the
-  # verified restore, so the EXIT trap still restarts the app.
-  RS_DESTRUCTIVE=$(has_pending_destructive)
-  if [ -z "$RS_MARK" ] || [ "$RS_MARK" = "0" ]; then
+  # Probe the marker BEFORE has_pending_destructive (whose
+  # ensure_migration_marker would CREATE the table and mask "absent"), and
+  # distinguish three states: table absent in the dump (pre-marker dump),
+  # present with N rows, or a TRANSIENT read failure — the old single read
+  # collapsed the last two and misdiagnosed a postgres hiccup as "the dump has
+  # no marker rows". Same safe action either way, accurate message.
+  set +e
+  RS_MARK_MISSING=$(psql_admin -tAc "select to_regclass('public.deploy_schema_migrations') is null" 2>/dev/null)
+  RS_MARK_RC=$?
+  set -e
+  RS_MARK_MISSING=$(printf '%s' "$RS_MARK_MISSING" | tr -d '[:space:]')
+  RS_MARK=""
+  if [ $RS_MARK_RC -eq 0 ] && [ "$RS_MARK_MISSING" = "t" ]; then
+    RS_MARK=0
+  elif [ $RS_MARK_RC -eq 0 ] && [ "$RS_MARK_MISSING" = "f" ]; then
+    RS_MARK=$(marker_row_count)   # prints nothing on failure → transient branch
+  fi
+  if [ -z "$RS_MARK" ]; then
+    warn "could not read the migration marker (transient — postgres busy?) — NOT auto-migrating."
+    warn "When the stack is stable, verify and if needed run ./migrate.sh."
+  elif [ "$RS_MARK" = "0" ]; then
     # The restored dump has no migration-marker rows (a pre-marker or external
     # dump). We cannot tell which migrations its schema already contains, so
     # auto-applying every migrate-*.sql would re-run DDL already present and
-    # fail. Do NOT guess — leave it to the operator.
+    # fail. Do NOT guess — leave it to the operator (migrate.sh enforces the
+    # same ADOPT_SCHEMA_VERSION contract it names here).
     warn "the restored dump has no migration-marker rows — NOT auto-migrating."
-    warn "Verify the restored schema version; if it predates the running image, run"
-    warn "  ./migrate.sh   (additive) then restart with ./compose.sh up -d."
-  elif [ -n "$RS_DESTRUCTIVE" ]; then
-    # A destructive migration is pending — apply_migrations would die and leave
-    # the app stopped. Skip it here; the operator applies it deliberately.
-    warn "a pending migration ($RS_DESTRUCTIVE) is destructive (REQUIRES-REVIEW) — NOT auto-migrating."
-    warn "Apply it deliberately after this restore: ALLOW_DESTRUCTIVE_MIGRATION=1 ./migrate.sh"
-  elif apply_migrations; then
-    ok "schema re-synced to ./$RS_DIR"
+    warn "Confirm the dump's release, then stamp + sync it explicitly:"
+    warn "  ADOPT_SCHEMA_VERSION=<the dump's release> ./migrate.sh"
   else
-    ok "no pending migrations — restored schema already matches this release"
+    # No `|| true`: has_pending_destructive fails closed. A die here is past the
+    # verified restore, so the EXIT trap still restarts the app.
+    RS_DESTRUCTIVE=$(has_pending_destructive)
+    if [ -n "$RS_DESTRUCTIVE" ]; then
+      # A destructive migration is pending — apply_migrations would die and leave
+      # the app stopped. Skip it here; the operator applies it deliberately.
+      warn "a pending migration ($RS_DESTRUCTIVE) is destructive (REQUIRES-REVIEW) — NOT auto-migrating."
+      warn "Apply it deliberately after this restore: ALLOW_DESTRUCTIVE_MIGRATION=1 ./migrate.sh"
+    elif apply_migrations; then
+      ok "schema re-synced to ./$RS_DIR"
+    else
+      ok "no pending migrations — restored schema already matches this release"
+    fi
   fi
 else
   warn "no SQL artifacts under ./db — skipping schema re-sync (set DB_VERSION if the dump predates the running image)"
@@ -215,6 +276,13 @@ if [ -n "$UPLOADS_TAR" ]; then
   # it into the sh -c string would word-split / shell-inject on filenames
   # with spaces or metacharacters, after the wipe already ran.
   log "restoring uploads volume (${PROJECT}_uploads-data)…"
+  # Deliberate materialization: `docker run -v name:…` AUTO-CREATES a missing
+  # volume. Backup.sh guards against that (an accidental empty archive); here
+  # creating it is CORRECT (we are about to populate it from the archive) —
+  # but say so, instead of relying on the silent auto-create.
+  if ! $DOCKER volume inspect "${PROJECT}_uploads-data" >/dev/null 2>&1; then
+    warn "uploads volume ${PROJECT}_uploads-data does not exist — creating it and populating from the archive"
+  fi
   # WARN (not die): the DB restore already succeeded; a failed uploads
   # extraction must not leave the app stopped (the volume was wiped, so warn
   # loudly — but still restart the app below).

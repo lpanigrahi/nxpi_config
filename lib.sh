@@ -40,13 +40,24 @@ init_docker() {
 # the app on the known-broken .env image and undo the rollback. update.sh
 # removes the pin when a later update succeeds.
 ROLLBACK_PIN=".rollback-image.yml"
+
+# Set true by apply_migrations when it applies a REQUIRES-REVIEW (destructive)
+# migration in the current run. Top-level init: consumers run `set -u`, and the
+# flag must be safely readable even when apply_migrations never ran.
+APPLIED_DESTRUCTIVE=false
+
 compose() {
   if [ -f "$ROLLBACK_PIN" ]; then
-    # Explicit -f lists disable Compose's default file discovery — include a
-    # user's docker-compose.override.yml (a standard Compose idiom) so pin
-    # mode deploys the same config as non-pin mode, plus the pin (last wins).
-    if [ -f docker-compose.override.yml ]; then
-      $DOCKER compose -f docker-compose.yml -f docker-compose.override.yml -f "$ROLLBACK_PIN" "$@"
+    # Explicit -f lists disable Compose's default file discovery — include the
+    # user's override file (a standard Compose idiom; first-found of the two
+    # spellings, mirroring Compose's own discovery order) so pin mode deploys
+    # the same config as non-pin mode, plus the pin (last wins).
+    local ovr="" f
+    for f in docker-compose.override.yml docker-compose.override.yaml; do
+      if [ -f "$f" ]; then ovr="$f"; break; fi
+    done
+    if [ -n "$ovr" ]; then
+      $DOCKER compose -f docker-compose.yml -f "$ovr" -f "$ROLLBACK_PIN" "$@"
     else
       $DOCKER compose -f docker-compose.yml -f "$ROLLBACK_PIN" "$@"
     fi
@@ -84,6 +95,10 @@ acquire_lock() {
 #   • an UNQUOTED value has a trailing inline comment (` # …`) and trailing
 #     whitespace stripped (so `SITE_ADDRESS=x.com  # prod` yields `x.com`).
 # Values with spaces / `#` MUST be quoted in ./.env (see .env.example).
+# KNOWN DEVIATION from Compose dotenv: an EXPLICITLY-EMPTY assignment (`KEY=`)
+# returns the caller's DEFAULT here, while Compose keeps the empty string.
+# Deliberate: these scripts treat "blanked" and "absent" alike. Keep values
+# non-empty, or delete the line entirely to mean "use the default".
 env_get() {
   local file="$1" key="$2" def="${3:-}" raw val s ch nx
   raw=$(grep -E "^${key}=" "$file" 2>/dev/null | tail -n1 | cut -d= -f2- || true)
@@ -128,9 +143,12 @@ NXPI_HASH_DEFAULT="ghcr.io/lpanigrahi/nxpi-hash:latest"
 # ── Health helpers ───────────────────────────────────────────────────────────
 # wait_healthy SERVICE TIMEOUT_SECONDS — polls the container health status.
 wait_healthy() {
-  local svc="$1" timeout="${2:-180}" start now cid status
+  local svc="$1" timeout="${2:-180}" start now cid status restarts base_restarts=""
   start=$(date +%s)
   while :; do
+    # Reset each iteration so the timeout message never shows a STALE status
+    # from a prior loop (e.g. a container that vanished mid-wait).
+    status="no container"
     cid=$(compose ps -q "$svc" 2>/dev/null | head -n1 || true)
     if [ -n "$cid" ]; then
       status=$($DOCKER inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || echo "unknown")
@@ -143,10 +161,26 @@ wait_healthy() {
         compose logs --tail 30 "$svc" || true
         return 1
       fi
+      # Crash-loop fast-fail: every service runs restart:unless-stopped, so a
+      # crashing container cycles restarting/running and NEVER reports
+      # `exited` — without this check the full timeout burns before a caller
+      # (e.g. update.sh's auto-rollback) can react. Two restarts observed
+      # during THIS wait = a loop, not a slow boot.
+      restarts=$($DOCKER inspect --format '{{.RestartCount}}' "$cid" 2>/dev/null || echo "")
+      case "$restarts" in
+        ''|*[!0-9]*) : ;;   # inspect failed — leave it to the timeout
+        *)
+          [ -n "$base_restarts" ] || base_restarts=$restarts
+          if [ $((restarts - base_restarts)) -ge 2 ]; then
+            warn "$svc is crash-looping (+$((restarts - base_restarts)) restarts during this wait)"
+            compose logs --tail 30 "$svc" || true
+            return 1
+          fi ;;
+      esac
     fi
     now=$(date +%s)
     if [ $((now - start)) -ge "$timeout" ]; then
-      warn "$svc did not become healthy within ${timeout}s (status: ${status:-no container})"
+      warn "$svc did not become healthy within ${timeout}s (status: ${status})"
       compose logs --tail 30 "$svc" || true
       return 1
     fi
@@ -369,7 +403,14 @@ neo_gen_password() {
   local url pw
   url=$(cat secrets/postgres_url 2>/dev/null || true)
   if [ -z "$url" ] && [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
-    url=$(sudo cat secrets/postgres_url 2>/dev/null || true)
+    # `-n` first: an EXPIRED sudo cache in a non-interactive run (plausible
+    # after a long image pull) must fail fast, not hang on a hidden password
+    # prompt with stderr discarded. Retry interactively only when a tty can
+    # actually take the prompt.
+    url=$(sudo -n cat secrets/postgres_url 2>/dev/null || true)
+    if [ -z "$url" ] && [ -t 0 ]; then
+      url=$(sudo cat secrets/postgres_url 2>/dev/null || true)
+    fi
   fi
   pw=${url#*://}     # neo_gen:<pw>@postgres:5432/neogen
   pw=${pw#*:}        # <pw>@postgres:5432/neogen
@@ -438,25 +479,30 @@ reconcile_marker() {
 # migration_files_through VERSION — every db/*/migrate-*.sql whose embedded
 # version is <= VERSION, one path per line, ascending semver order. This spans
 # ALL version folders, so a multi-release jump applies each intermediate delta.
+# Ordering key is the FILENAME's embedded version (the same key the <= filter
+# uses) — path order would let a hotfix file whose version differs from its
+# folder (db/1.3.0/migrate-1.2.5.sql) apply out of numeric order.
 migration_files_through() {
   local target="$1" f base ver
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     base=$(basename "$f" .sql); ver=${base#migrate-}
-    ver_le "$ver" "$target" && printf '%s\n' "$f"
-  done < <(find db -mindepth 2 -maxdepth 2 -name 'migrate-*.sql' 2>/dev/null | sort -V)
+    ver_le "$ver" "$target" && printf '%s\t%s\n' "$ver" "$f"
+  done < <(find db -mindepth 2 -maxdepth 2 -name 'migrate-*.sql' 2>/dev/null) \
+    | sort -V -k1,1 | cut -f2-
 }
 
 # stamp_migrations_through VERSION — record all migrations <= VERSION as applied
 # WITHOUT running them. Used after a FRESH install, whose schema.sql already
 # embeds every change up to VERSION (so a later update never re-applies them).
 stamp_migrations_through() {
-  local target="$1" f base
+  local target="$1" f base base_sql
   ensure_migration_marker
   while IFS= read -r f <&3; do
     [ -n "$f" ] || continue
     base=$(basename "$f")
-    psql_admin -c "insert into public.deploy_schema_migrations (filename) values ('$base') on conflict do nothing;" >/dev/null \
+    base_sql=${base//\'/\'\'}   # SQL-escape: filenames come from CI, but cheap
+    psql_admin -c "insert into public.deploy_schema_migrations (filename) values ('$base_sql') on conflict do nothing;" >/dev/null \
       || die "could not record migration $base in the marker table — re-run when the DB is stable"
   done 3< <(migration_files_through "$target")
 }
@@ -467,7 +513,8 @@ stamp_migrations_through() {
 # A migration failure — or a REQUIRES-REVIEW file without an explicit override —
 # is FATAL (caller must not roll the app onto it).
 apply_migrations() {
-  local target f base applied any=false
+  local target f base base_sql applied any=false
+  APPLIED_DESTRUCTIVE=false   # per-invocation reset (global — callers inspect it)
   target=$(resolved_db_version) || die "cannot resolve the target DB version — set DB_VERSION in ./.env"
   ensure_migration_marker
   # Read the list on fd 3, NOT fd 0: the `compose exec -T` calls in the loop
@@ -476,10 +523,11 @@ apply_migrations() {
   while IFS= read -r f <&3; do
     [ -n "$f" ] || continue
     base=$(basename "$f")
+    base_sql=${base//\'/\'\'}
     # FAIL CLOSED: a transient psql error must not be read as "not applied"
     # (which would re-run a non-idempotent ADD COLUMN and die "already exists").
     local rc
-    set +e; applied=$(psql_admin -tAc "select 1 from public.deploy_schema_migrations where filename = '$base'" 2>/dev/null); rc=$?; set -e
+    set +e; applied=$(psql_admin -tAc "select 1 from public.deploy_schema_migrations where filename = '$base_sql'" 2>/dev/null); rc=$?; set -e
     [ $rc -eq 0 ] || die "could not read the migration marker for $base (postgres busy?) — re-run when stable"
     applied=$(printf '%s' "$applied" | tr -d '[:space:]')
     [ "$applied" = "1" ] && { log "migration already applied: $base"; continue; }
@@ -492,10 +540,11 @@ apply_migrations() {
   ALLOW_DESTRUCTIVE_MIGRATION=1 to apply it."
       fi
       warn "applying DESTRUCTIVE migration $base (ALLOW_DESTRUCTIVE_MIGRATION=1)"
+      APPLIED_DESTRUCTIVE=true
     fi
     log "applying migration: $base"
     psql_admin < "$f" || die "migration $base FAILED — the app was NOT changed; inspect $f and retry"
-    psql_admin -c "insert into public.deploy_schema_migrations (filename) values ('$base') on conflict do nothing;" >/dev/null \
+    psql_admin -c "insert into public.deploy_schema_migrations (filename) values ('$base_sql') on conflict do nothing;" >/dev/null \
       || die "could not record migration $base in the marker table — re-run when the DB is stable"
     any=true
   done 3< <(migration_files_through "$target")
@@ -508,15 +557,16 @@ apply_migrations() {
 # go through ./migrate.sh (its own backup, no auto-rollback "additive-compatible"
 # assumption), never the rolling path whose rollback trusts additivity.
 has_pending_destructive() {
-  local target f base applied rc
+  local target f base base_sql applied rc
   target=$(resolved_db_version) || return 0
   ensure_migration_marker
   while IFS= read -r f <&3; do
     [ -n "$f" ] || continue
     base=$(basename "$f")
+    base_sql=${base//\'/\'\'}
     # FAIL CLOSED (like apply_migrations): a transient psql error must not read
     # as "not applied" and falsely flag an already-applied migration as pending.
-    set +e; applied=$(psql_admin -tAc "select 1 from public.deploy_schema_migrations where filename = '$base'" 2>/dev/null); rc=$?; set -e
+    set +e; applied=$(psql_admin -tAc "select 1 from public.deploy_schema_migrations where filename = '$base_sql'" 2>/dev/null); rc=$?; set -e
     [ $rc -eq 0 ] || die "could not read the migration marker for $base (postgres busy?) — re-run when stable"
     applied=$(printf '%s' "$applied" | tr -d '[:space:]')
     [ "$applied" = "1" ] && continue
@@ -528,13 +578,14 @@ has_pending_destructive() {
 # not yet recorded (the DB is behind the target image). Fails closed on a
 # marker-read error, like apply_migrations.
 has_pending_migration() {
-  local target f base applied rc
+  local target f base base_sql applied rc
   target=$(resolved_db_version) || return 1
   ensure_migration_marker
   while IFS= read -r f <&3; do
     [ -n "$f" ] || continue
     base=$(basename "$f")
-    set +e; applied=$(psql_admin -tAc "select 1 from public.deploy_schema_migrations where filename = '$base'" 2>/dev/null); rc=$?; set -e
+    base_sql=${base//\'/\'\'}
+    set +e; applied=$(psql_admin -tAc "select 1 from public.deploy_schema_migrations where filename = '$base_sql'" 2>/dev/null); rc=$?; set -e
     [ $rc -eq 0 ] || die "could not read the migration marker for $base (postgres busy?) — re-run when stable"
     [ "$(printf '%s' "$applied" | tr -d '[:space:]')" = "1" ] || return 0
   done 3< <(migration_files_through "$target")

@@ -48,6 +48,6 @@ chmod 600 postgres_password redis_password
 > the shim strips a trailing `\n` only, so a CRLF file leaves an invisible
 > `\r` inside the secret value.
 >
-> **Password loss = no recovery**: a bootstrap re-run adopts the existing
+> **Password loss = no recovery**: an install.sh re-run adopts the existing
 > database, it never resets passwords. Keep backups of this directory
 > somewhere safe (it IS the keys to your data).

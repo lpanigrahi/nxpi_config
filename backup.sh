@@ -24,6 +24,7 @@ cd "$SCRIPT_DIR"
 
 PRUNE=true
 REQUIRE_UPLOADS=false
+BACKUP_DEGRADED=false   # uploads archive failed (best-effort path) → exit 1 at the end
 for arg in "$@"; do
   case "$arg" in
     # Used by restore.sh's pre-restore safety backup: retention pruning here
@@ -62,8 +63,12 @@ compose exec -T postgres pg_restore --list < "$DUMP" >/dev/null \
 ok "database dump: $DUMP ($(du -h "$DUMP" | cut -f1))"
 
 # ── Uploads volume (only meaningful on local file storage) ───────────────────
+# --require-uploads OVERRIDES the storage-type skip: it is restore.sh's
+# pre-wipe safety contract ("I am about to destroy the uploads volume — a
+# safety archive is mandatory"), which must hold even after an operator
+# switched FILE_STORAGE_TYPE away from local while the volume still has data.
 STORAGE_TYPE=$(env_get .env.app FILE_STORAGE_TYPE "local")
-if [ "$STORAGE_TYPE" = "local" ]; then
+if [ "$STORAGE_TYPE" = "local" ] || $REQUIRE_UPLOADS; then
   # Guard BEFORE `docker run`: a `-v name:/data` mount silently AUTO-CREATES a
   # missing volume, which would make this step archive a fresh empty volume
   # and report it as a good backup.
@@ -89,10 +94,11 @@ if [ "$STORAGE_TYPE" = "local" ]; then
       die "uploads archive FAILED and --require-uploads was given (disk space?) — aborting"
     else
       warn "uploads archive failed — database dump is still good"
+      BACKUP_DEGRADED=true   # cron must see this (a silent exit 0 here means zero uploads backups accumulate unnoticed)
     fi
   fi
 else
-  log "FILE_STORAGE_TYPE=$STORAGE_TYPE — uploads live off-VM, skipping volume archive"
+  log "FILE_STORAGE_TYPE=$STORAGE_TYPE — uploads live off-VM, skipping volume archive (--require-uploads would force it)"
 fi
 
 # ── Retention ────────────────────────────────────────────────────────────────
@@ -109,3 +115,7 @@ hdr "Backup complete"
 ok "latest: $DUMP"
 log "ship it OFF the VM (single-VM disk is not a durability story):"
 log "  az storage blob upload --account-name <acct> -c backups -f $DUMP -n $(basename "$DUMP")"
+if $BACKUP_DEGRADED; then
+  warn "backup completed WITHOUT the uploads archive (database dump is good) — exiting nonzero for cron/automation."
+  exit 1
+fi

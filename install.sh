@@ -5,7 +5,6 @@
 #
 #   ./install.sh            # fresh install OR converge an existing deployment
 #   ./install.sh --force    # skip the Ubuntu distro check
-#   ./install.sh --no-migrate  # re-run without the day-2 schema sync
 #
 # What it does (each step skips itself when already done):
 #   1. verifies the environment (Ubuntu, sudo, curl/openssl)
@@ -30,11 +29,9 @@ cd "$SCRIPT_DIR"
 . ./lib.sh
 
 FORCE=false
-RUN_MIGRATE=true
 for arg in "$@"; do
   case "$arg" in
     --force)      FORCE=true ;;
-    --no-migrate) RUN_MIGRATE=false ;;
     -h|--help)    grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,25p'; exit 0 ;;
     *) die "unknown flag: $arg (see --help)" ;;
   esac
@@ -187,83 +184,6 @@ if [ -n "$SITE" ] && [ "$BAU" != "https://$SITE" ]; then
   Fix ./.env (either set BETTER_AUTH_URL=https://$SITE, or unset SITE_ADDRESS
   for IP-only mode) and re-run."
 fi
-# Custom-cert generation (idempotent): a *.pfx at the project root opts into
-# custom-cert mode. Extract it via ./generate-certs.sh unless the generated
-# files already exist and are not older than the bundle (renewal = upload a
-# newer .pfx and re-run). No .pfx present → nothing to do here: with
-# generated certs we keep using them, without them the stack runs in
-# IP-only / Let's Encrypt mode. Validation of the result happens below.
-PFX_FILE=""
-for f in *.pfx; do
-  [ -e "$f" ] || continue          # unmatched glob stays literal
-  [ -z "$PFX_FILE" ] || die "multiple .pfx files at the project root ($PFX_FILE, $f) — keep exactly
-  one and re-run."
-  PFX_FILE="$f"
-done
-CERTS_REGENERATED=""
-if [ -n "$PFX_FILE" ]; then
-  if [ -s certs/fullchain.crt ] && [ -s certs/server.key ] && [ -s certs/tls.caddy ] \
-     && [ ! "$PFX_FILE" -nt certs/fullchain.crt ]; then
-    log "keep existing certs ($PFX_FILE is not newer than certs/fullchain.crt)"
-  else
-    log "extracting $PFX_FILE → ./certs (custom-cert mode)…"
-    # PFX export password precedence: an already-exported PFX_PASSWORD wins,
-    # then PFX_PASSWORD from ./.env; with neither, generate-certs.sh prompts.
-    if [ -z "${PFX_PASSWORD+x}" ]; then
-      PFX_PW=$(env_get .env PFX_PASSWORD "")
-      [ -z "$PFX_PW" ] || export PFX_PASSWORD="$PFX_PW"
-    fi
-    ./generate-certs.sh "$PFX_FILE" || die "certificate extraction failed — see the output above (wrong PFX
-  password/format?)"
-    # The caddy container drops ALL capabilities, so container-root has no
-    # CAP_DAC_OVERRIDE and is subject to plain permission bits: root-own the
-    # key (owner-read) instead of loosening its mode. Renewal stays sudo-free
-    # because generate-certs.sh unlinks old outputs first (directory write
-    # permission is all that unlinking needs).
-    as_root chown root:root certs/server.key
-    as_root chmod 600 certs/server.key
-    CERTS_REGENERATED=1
-    ok "certificates generated in ./certs"
-  fi
-elif [ -f certs/tls.caddy ]; then
-  log "no .pfx at the project root — keeping existing certificates in ./certs"
-fi
-# Custom-cert consistency: the mode is enabled by certs/tls.caddy (written by
-# ./generate-certs.sh and imported by the Caddyfile). When enabled it requires
-# domain mode (the cert names a hostname) and the cert/key files — resolved
-# with the same defaults as docker-compose.yml — must exist under ./certs, the
-# only host path mounted into the caddy container (at /certs, read-only).
-# Fatal here: a bad combo would otherwise only surface as a caddy crash-loop
-# after the stack is up.
-TLS_CERT=$(env_get .env TLS_CERT_PATH "")
-TLS_KEY=$(env_get .env TLS_KEY_PATH "")
-if { [ -n "$TLS_CERT" ] || [ -n "$TLS_KEY" ]; } && [ ! -f certs/tls.caddy ]; then
-  die "TLS_CERT_PATH/TLS_KEY_PATH are set in ./.env but ./certs/tls.caddy does not
-  exist — custom-cert mode is enabled by that snippet. Put the certificate .pfx
-  at the project root and re-run ./install.sh (or run ./generate-certs.sh
-  manually — see certs/README.md), or unset the vars."
-fi
-if [ -f certs/tls.caddy ]; then
-  [ -n "$SITE" ] || die "./certs/tls.caddy exists but SITE_ADDRESS is not set — custom-cert mode
-  needs SITE_ADDRESS set to the certificate's hostname (and
-  BETTER_AUTH_URL=https://<SITE_ADDRESS>). Fix ./.env, or delete
-  ./certs/tls.caddy for IP-only mode, and re-run."
-  # Same defaults as the caddy service environment in docker-compose.yml.
-  TLS_CERT=${TLS_CERT:-/certs/fullchain.crt}
-  TLS_KEY=${TLS_KEY:-/certs/server.key}
-  for tls_path in "$TLS_CERT" "$TLS_KEY"; do
-    case "$tls_path" in
-      /certs/*) ;;
-      *) die "$tls_path — TLS_CERT_PATH/TLS_KEY_PATH must be container paths under
-  /certs/ (the ./certs bind mount), e.g. /certs/fullchain.crt." ;;
-    esac
-    tls_host_file="certs/${tls_path#/certs/}"
-    [ -f "$tls_host_file" ] || die "custom-cert mode needs $tls_path but ./$tls_host_file does not exist —
-  put the certificate .pfx at the project root and re-run ./install.sh (or run
-  ./generate-certs.sh manually — see certs/README.md)."
-  done
-  ok "custom-cert mode: $TLS_CERT + $TLS_KEY (files present in ./certs)"
-fi
 case "$BAU" in
   http://*)
     # IP-only / plain-HTTP mode: browsers refuse Secure cookies over http://,
@@ -308,10 +228,12 @@ fi
 # drizzle-kit, no git access. Resolve and validate the artifact set up front.
 hdr "Database artifacts"
 assert_version_alignment   # DB_VERSION must match a semver APP_IMAGE tag if both set
-DB_DIR=$(db_dir) || die "no SQL artifacts found under ./db.
-  Expected ./db/<version>/{schema.sql,grants.sql,seed.sql} matching your
-  APP_IMAGE tag. Set DB_VERSION in ./.env, or ensure the db/<version> folder
-  ships in this package (published per release by the app repo's CI)."
+DB_DIR=$(db_dir) || die "cannot pick a ./db/<version> SQL artifact set.
+  Found: $(find db -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tr '\n' ' ' || true)
+  With multiple candidates and a non-semver APP_IMAGE tag (e.g. :latest), the
+  version cannot be derived — set DB_VERSION in ./.env (e.g. DB_VERSION=1.3.0).
+  If nothing is listed above, this package is missing its db/<version> folder
+  (published per release by the app repo's CI)."
 for f in schema.sql grants.sql seed.sql; do
   [ -s "$DB_DIR/$f" ] || die "missing or empty: $DB_DIR/$f"
 done
@@ -363,7 +285,10 @@ apply_seed() {
   # SQL-escape it (double single-quotes) and pipe the whole statement on STDIN —
   # never via `psql -v`/argv, which `docker compose exec` exposes to host `ps`.
   app_pw=$(neo_gen_password)
-  [ -n "$app_pw" ] || die "could not read the app-role password from secrets/postgres_url"
+  [ -n "$app_pw" ] || die "could not read the app-role password from secrets/postgres_url.
+  The file is app-owned (uid 1001, mode 400) — reading it needs sudo, and an
+  expired sudo cache in a non-interactive run fails silently. Refresh sudo
+  (run: sudo -v) or fix the file's ownership/permissions, then re-run."
   app_pw_esc=${app_pw//\'/\'\'}
   printf "ALTER ROLE neo_gen PASSWORD '%s';\n" "$app_pw_esc" | psql_admin >/dev/null \
     || die "failed to set the neo_gen role password"
@@ -392,6 +317,17 @@ apply_seed() {
     warn "    ${admin_email} / ${GEN_ADMIN_PW}"
     printf '\n'
   fi
+
+  # A surviving redis volume (secrets are keep-if-present, so it stays readable)
+  # holds cache/queue state from the PREVIOUS database generation — and the
+  # seed's deterministic UUIDs make stale entries COLLIDE with the new rows.
+  # Inside apply_seed so EVERY seed path (fresh + resume) flushes; deliberately
+  # AFTER the once-shown password print (flush never dies, but its
+  # `compose exec` could hang — the password must already be on screen).
+  # Accepted residual: a SIGKILL between the seed commit and this flush leaves
+  # redis unflushed with USERS>0 (the converge no-op path never flushes — a
+  # re-run FLUSHALL on a healthy deployment would drop live queues).
+  flush_redis
 }
 
 # FAIL CLOSED: an empty/non-numeric count (transient exec/psql failure) aborts
@@ -403,14 +339,15 @@ if [ "$TABLES" = "0" ]; then
   log "fresh database — provisioning from static SQL (no source, no git)…"
   log "applying schema.sql (DDL)…"
   psql_admin < "$DB_DIR/schema.sql" || die "schema.sql failed to apply — start fresh with: $DOCKER compose down -v"
-  apply_seed   # grants + role password + atomic seed
-  # schema.sql already embeds every change up to $DB_VER — stamp those migrations
-  # as applied so a later ./update.sh does not re-apply an already-present diff.
+  # Stamp BEFORE the seed: schema.sql already embeds every change up to $DB_VER
+  # (ON_ERROR_STOP guarantees the apply above was COMPLETE), so the stamp is
+  # correct regardless of seed state. Stamping first means a die anywhere in
+  # apply_seed re-enters via the USERS==0 resume branch below — the OLD
+  # ordering (stamp after seed) let a die between the seed commit and the stamp
+  # land in the already-provisioned branch, which misrouted the operator to
+  # ./update.sh where the schema-embedded migration would be RE-applied.
   stamp_migrations_through "$DB_VER"
-  # A surviving redis volume (secrets are keep-if-present, so it stays readable)
-  # holds cache/queue state from the PREVIOUS database generation — and the
-  # seed's deterministic UUIDs make stale entries collide with the new rows.
-  flush_redis
+  apply_seed   # grants + role password + atomic seed + redis flush
   ok "database provisioned from ./$DB_DIR"
 else
   # Completion sentinel: schema present but ZERO users ⇒ a prior seed step did
@@ -425,9 +362,11 @@ else
   assert_numeric "$USERS" "the user count"
   if [ "$USERS" = "0" ]; then
     warn "schema present ($TABLES tables) but no users — finishing the interrupted seed…"
-    apply_seed   # re-applies grants (idempotent) + atomic seed
+    apply_seed   # re-applies grants (idempotent) + atomic seed + redis flush
+    # Idempotent re-stamp (ON CONFLICT DO NOTHING). Kept deliberately: covers a
+    # kill in the window between the schema apply and the fresh-branch stamp,
+    # and legacy installs interrupted under the old stamp-after-seed ordering.
     stamp_migrations_through "$DB_VER"
-    flush_redis  # same surviving-redis hazard as the fresh path
     ok "database seed completed"
   else
     # Initialize the marker for an adopted DB (or no-op for a this-flow one).
@@ -463,22 +402,6 @@ if [ -z "$(compose ps -q caddy 2>/dev/null)" ] && command -v ss >/dev/null 2>&1;
   fi
 fi
 compose up -d
-# Reload caddy when its running config predates the custom-cert snippet —
-# `up -d` does not recreate caddy for bind-mounted file changes. Two triggers:
-#   - CERTS_REGENERATED: this very run (re)extracted the bundle;
-#   - stale-config check: certs/tls.caddy may exist from an earlier run that
-#     failed later (e.g. at the health gate) — the re-run then skips
-#     extraction, but the running caddy still serves the pre-snippet config
-#     and keeps attempting ACME for the domain. Ask caddy's admin API (same
-#     endpoint the healthcheck probes) whether the loaded config references
-#     the /certs/ paths; if not (or the API is unreachable), restart. A
-#     restart is harmless either way — the health gate below re-verifies.
-NEED_CADDY_RESTART="$CERTS_REGENERATED"
-if [ -z "$NEED_CADDY_RESTART" ] && [ -f certs/tls.caddy ] && [ -n "$(compose ps -q caddy 2>/dev/null)" ]; then
-  compose exec -T caddy wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null | grep -q '/certs/' \
-    || NEED_CADDY_RESTART=1
-fi
-[ -z "$NEED_CADDY_RESTART" ] || { log "restarting caddy to load the custom certificate…"; compose restart caddy; }
 health_gate 300 || die "the app did not pass the health gate — inspect: $DOCKER compose logs app caddy"
 
 # ── 9. Summary ───────────────────────────────────────────────────────────────
