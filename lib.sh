@@ -213,6 +213,56 @@ ingress_probe() {
   fi
 }
 
+# deep_probe_body — print /api/health/deep's response body (empty on failure).
+# Unlike ingress_probe this does NOT use -f: a 503 body is exactly what we want
+# to read. Same --resolve treatment so the real vhost is exercised.
+deep_probe_body() {
+  local site http_port https_port
+  site=$(env_get .env SITE_ADDRESS "")
+  if [ -n "$site" ]; then
+    https_port=$(env_get .env CADDY_HTTPS_PORT 443)
+    curl -sS --max-time 5 \
+      --resolve "${site}:${https_port}:127.0.0.1" \
+      "https://${site}:${https_port}/api/health/deep" 2>/dev/null || true
+  else
+    http_port=$(env_get .env CADDY_HTTP_PORT 80)
+    curl -sS --max-time 5 \
+      "http://127.0.0.1:${http_port}/api/health/deep" 2>/dev/null || true
+  fi
+}
+
+# schema_notice — surface a schema-behind-image condition to the OPERATOR at the
+# one moment they are watching: the end of install/update/migrate.
+#
+# Readiness deliberately does not gate on schema currency (a drifted schema is
+# degraded, not unservable), so without this the 2026-07-28 VM incident repeats:
+# every skill route 500s with 42703 while every deploy signal stays green. Deep
+# DOES gate, so a 503 there with a healthy readiness means schema skew.
+#
+# NEVER fails: this is advisory output, not a gate. Prints the deep body rather
+# than extracting from it — no jq dependency, and the operator gets the missing
+# columns AND the pending migration names verbatim.
+#
+# The match relies on `schema` being the LAST key of `checks` (probes.ts builds
+# `{ database, redis, queues, schema }`), so a queue-level "status":"error"
+# earlier in the body cannot be mistaken for schema drift — verified against
+# that exact shape. Worst case if that order ever changes is a spurious advisory
+# line, never a failed deploy.
+schema_notice() {
+  local body
+  body=$(deep_probe_body)
+  case "$body" in
+    *'"schema"'*'"status":"error"'*) ;;
+    *) return 0 ;;
+  esac
+  warn "DATABASE SCHEMA IS BEHIND THIS IMAGE — skill/plugin requests will fail
+  with 42703/42P01 until the pending delta is applied:
+      set DB_VERSION in ./.env and run ./migrate.sh
+  /api/health/deep reports:
+$body"
+  return 0
+}
+
 ingress_desc() {
   local site
   site=$(env_get .env SITE_ADDRESS "")
@@ -235,6 +285,8 @@ health_gate() {
   while :; do
     if ingress_probe; then
       ok "readiness OK through Caddy"
+      # Advisory, never gating — see schema_notice.
+      schema_notice
       return 0
     fi
     if [ $(($(date +%s) - start)) -ge "$timeout" ]; then
