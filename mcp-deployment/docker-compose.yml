@@ -79,17 +79,28 @@ x-mcp-common: &mcp-common
   # unprivileged port — no Linux capabilities needed.
   cap_drop:
     - ALL
-  # python:3.11-slim has neither wget nor curl; a TCP connect proves the HTTP
-  # transport is listening. KNOWN LIMITATION: a container stays "healthy" even
-  # when Graph auth failed at boot (the server serves an error context instead
-  # of crashing) — verify auth per container via the logs:
-  #   docker compose logs <service> | grep -i "authentication"
+  # python:3.11-slim has neither wget nor curl, so this uses urllib rather
+  # than a shell tool.
+  #
+  # The limitation this used to carry is now fixed. A TCP connect proved only
+  # that the HTTP transport was listening, so a container whose Graph
+  # authentication failed at boot stayed "healthy" indefinitely while
+  # answering every tool call with an error — and the only way to find one was
+  # to grep its logs. /ready reports 503 until the server can actually serve,
+  # and the server recovers on its own once the cause clears, so a container
+  # that goes unready and comes back needs no intervention.
+  #
+  # /ready answers from cached state and makes no Graph call: eleven
+  # containers probing one tenant every 30 s would otherwise be a throttling
+  # source of their own.
   healthcheck:
-    test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), 3)"]
+    test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=5).status==200 else 1)"]
     interval: 30s
-    timeout: 5s
+    timeout: 10s
     retries: 3
-    start_period: 15s
+    # Generous: the first token acquisition must be allowed to finish before
+    # an unready answer starts counting against the container.
+    start_period: 45s
   # Default cap sized for typical document/list reads. Heavy-document sites
   # get a per-service override (see mcp-finance) — unbounded containers could
   # OOM-pressure the whole VM, which also runs the NXPi app stack.
@@ -111,7 +122,7 @@ services:
     ports:
       - "${MCP_BIND_IP:-0.0.0.0}:8001:8000"
     labels:
-      com.nbcbearings.site: "Research & Development"
+      com.nbcbearings.site: "researchanddevelopment"
       com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/researchanddevelopment"
 
   # ── Manufacturing ──────────────────────────────────────────────────────────
@@ -122,7 +133,7 @@ services:
     ports:
       - "${MCP_BIND_IP:-0.0.0.0}:8002:8000"
     labels:
-      com.nbcbearings.site: "Manufacturing"
+      com.nbcbearings.site: "manufacturing"
       com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/manufacturing"
 
   # ── Quality Assurance ──────────────────────────────────────────────────────
@@ -133,7 +144,7 @@ services:
     ports:
       - "${MCP_BIND_IP:-0.0.0.0}:8003:8000"
     labels:
-      com.nbcbearings.site: "Quality Assurance"
+      com.nbcbearings.site: "qualityassurance"
       com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/qualityassurance"
 
   # ── Sales & Marketing ──────────────────────────────────────────────────────
@@ -144,7 +155,7 @@ services:
     ports:
       - "${MCP_BIND_IP:-0.0.0.0}:8004:8000"
     labels:
-      com.nbcbearings.site: "Sales & Marketing"
+      com.nbcbearings.site: "salesmarketing"
       com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/salesmarketing"
 
   # ── Human Resources ────────────────────────────────────────────────────────
@@ -155,7 +166,7 @@ services:
     ports:
       - "${MCP_BIND_IP:-0.0.0.0}:8005:8000"
     labels:
-      com.nbcbearings.site: "Human Resources"
+      com.nbcbearings.site: "hr"
       com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/hr"
 
   # ── Finance ────────────────────────────────────────────────────────────────
@@ -183,7 +194,7 @@ services:
     ports:
       - "${MCP_BIND_IP:-0.0.0.0}:8007:8000"
     labels:
-      com.nbcbearings.site: "Central Logistics & Stores"
+      com.nbcbearings.site: "centrallogistics-stores"
       com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/centrallogistics-stores"
 
   # ── General Management ─────────────────────────────────────────────────────
@@ -194,7 +205,7 @@ services:
     ports:
       - "${MCP_BIND_IP:-0.0.0.0}:8008:8000"
     labels:
-      com.nbcbearings.site: "General Management"
+      com.nbcbearings.site: "GeneralManagement"
       com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/GeneralManagement"
 
   # ── IR (Industrial Relations) ──────────────────────────────────────────────
@@ -205,7 +216,7 @@ services:
     ports:
       - "${MCP_BIND_IP:-0.0.0.0}:8009:8000"
     labels:
-      com.nbcbearings.site: "IR"
+      com.nbcbearings.site: "ir"
       com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/ir"
 
   # ── Supply Chain Management ────────────────────────────────────────────────
@@ -216,7 +227,7 @@ services:
     ports:
       - "${MCP_BIND_IP:-0.0.0.0}:8010:8000"
     labels:
-      com.nbcbearings.site: "Supply Chain Management"
+      com.nbcbearings.site: "SCM"
       com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/SCM"
 
   # ── NEI Amsted ─────────────────────────────────────────────────────────────
@@ -227,5 +238,5 @@ services:
     ports:
       - "${MCP_BIND_IP:-0.0.0.0}:8011:8000"
     labels:
-      com.nbcbearings.site: "NEI Amsted"
+      com.nbcbearings.site: "nei-amsted"
       com.nbcbearings.url: "https://nbcbearingsrj.sharepoint.com/sites/nei-amsted"
