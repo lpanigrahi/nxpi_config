@@ -37,6 +37,7 @@ on the VM by the public `nxpi-hash` helper. Nothing clones or builds the app.
 | `install.sh` | Single-command idempotent installer / converger |
 | `update.sh` | Pull latest image → schema sync → roll → health gate → auto-rollback |
 | `migrate.sh` | Schema-ONLY migration of the existing database — never initializes, never touches data rows |
+| `upgrade-to-1.9.sh` | Guided multi-release upgrade of an existing database to db 1.9.0: pre-checks, row-count snapshot, `migrate.sh`, then verifies every expected object and that nothing was lost |
 | `backup.sh` | `pg_dump` + uploads-volume archive + retention (cron-able) |
 | `restore.sh` | Restore a backup (destructive, `--yes`-gated, health-gated) |
 | `compose.sh` | Pin-honoring `docker compose` wrapper — use it for all manual compose operations |
@@ -182,6 +183,39 @@ ownership). It is flagged REQUIRES-REVIEW because 0073 re-creates the
 `document_chunk` organization FK as `ON DELETE CASCADE` — deleting an
 organization then deletes its RAG corpus instead of re-homing it. Runbook:
 
+**Recommended — the guided path.** `./upgrade-to-1.9.sh` drives the same
+machinery with the pre- and post-checks a multi-release jump needs:
+
+```bash
+./upgrade-to-1.9.sh --dry-run     # report what would happen, change nothing
+./upgrade-to-1.9.sh               # backup → migrate → verify
+./update.sh                       # then roll the matching image
+```
+
+It adds no migration logic of its own — it calls `./migrate.sh` — but it:
+
+* **refuses to guess `ADOPT_SCHEMA_VERSION`** on a database whose migration
+  marker is empty, and shows exactly which files would be *stamped* versus
+  *executed* before you confirm. This matters: guessing too low re-runs
+  `db/1.3.0/migrate-1.3.0.sql`, which `DELETE`s `org_role_permission` and
+  `org_permission_group_item` rows. Use
+  `./upgrade-to-1.9.sh --adopt-schema-version <X.Y.Z>` once you have confirmed
+  the schema's actual release;
+* **pre-checks `cron_run_log` for duplicate `running` rows.**
+  `migrate-1.9.0.sql` downgrades that collision to a `NOTICE`, so psql still
+  exits 0 and the file is stamped applied while its unique index is silently
+  never created — the app then fails at runtime with *"no unique or exclusion
+  constraint matching the ON CONFLICT specification"* and nothing in the marker
+  table hints at it;
+* **snapshots every table's row count** to `backups/pre-1.9.0-rowcounts.txt`
+  before migrating and re-compares afterwards, so "no data was lost" is
+  verified rather than assumed;
+* **verifies the result** — every table, column, index, trigger and FK the
+  1.5.0–1.9.0 deltas should have produced, plus that `grants.sql` actually
+  reached the new tables — and refuses to declare success if any check fails.
+
+**Manual equivalent**, if you prefer to drive it yourself:
+
 ```bash
 # 1. review the delta:  less db/1.9.0/migrate-1.9.0.sql
 # 2. set DB_VERSION=1.9.0 in ./.env
@@ -190,6 +224,10 @@ ALLOW_DESTRUCTIVE_MIGRATION=1 ./migrate.sh
 # 4. roll the matching image:
 ./update.sh
 ```
+
+Either way, set `AUDIT_SIGNING_KEY` in `./.env.app` **before** the first
+post-1.9.0 audit row is written — 1.9.0 installs the admin-audit hash chain, and
+it starts from whatever key is active at the first write.
 
 ## Backup
 
@@ -276,6 +314,7 @@ pinned to the last-good image where raw compose would redeploy the broken one.
 ./compose.sh logs -f caddy               # ingress logs
 curl -s localhost/api/health/ready       # readiness through Caddy
 ./migrate.sh                             # schema-only migration (data preserved)
+./upgrade-to-1.9.sh --dry-run            # what a 1.9.0 upgrade would do (no changes)
 ./compose.sh exec postgres psql -U neogen_admin -d neogen   # SQL console
 ```
 

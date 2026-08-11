@@ -1,6 +1,9 @@
 # Live configuration + backups never leave the VM.
 .env
 .env.app
+# Timestamped ./.env copies taken by upgrade-to-1.9.sh before it edits DB_VERSION
+# — same live config, same secrecy.
+.env.bak-*
 # Certificate bundles (contain the private key) — consumed by generate-certs.sh.
 *.pfx
 backups/*
