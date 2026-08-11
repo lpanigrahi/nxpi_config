@@ -1,5 +1,28 @@
 # Sourceless Deployment Plan — NXPi on Azure VM via Static SQL
 
+> **CI reality as of 2026-08-11** — the publishing model described in the
+> design sections below has since been consolidated. There is no
+> `db-artifacts.yml`, no `container.yaml`, and no `CONFIG_REPO_TOKEN`
+> cross-publish to a separate `nxpi_config` repo. Today:
+>
+> - this package lives INSIDE the app repo (`github.com/negentrophi/nxpi_dev`,
+>   folder `azure-deployment/`);
+> - the single pipeline `.github/workflows/ci.yml` publishes, after both
+>   quality gates pass: the app image (`ghcr.io/negentrophi/nxpi_dev`), the
+>   SQL bundle schema/grants/seed as an ORAS OCI artifact
+>   (`ghcr.io/negentrophi/nxpi_dev/db:<ver>`), and the `nxpi-hash` helper
+>   (`ghcr.io/negentrophi/nxpi-hash`);
+> - the day-2 `db/<version>/migrate-*.sql` deltas are hand-composed in this
+>   folder (`scripts/gen-migration-diff.sh` exists in the app repo but is not
+>   wired into CI); since 1.9.0 they are built by concatenating the app tree's
+>   hand-authored idempotent deltas verbatim, not from a raw migra diff;
+> - versioning: main builds publish `<pkg.json ver>-main.<shortsha>` +
+>   `latest`; `v*` tags publish the bare semver. Only exact `X.Y.Z` image tags
+>   participate in the package's DB-version alignment/derivation.
+>
+> The sections below are the original design record; where they conflict with
+> this note, this note wins.
+
 ## Goal & chosen approach
 
 Deploy the NXPi platform to an Azure Ubuntu VM such that the deploy target needs
@@ -108,7 +131,7 @@ New CI only; **no application code changes**.
   `deploy_schema_version`, or a dedicated 1-row table). The updater applies the
   ordered chain of `migrate-*.sql` between the installed and target versions.
 
-### 1d. Password hash helper → `ghcr.io/lpanigrahi/nxpi-hash` (public)
+### 1d. Password hash helper → `ghcr.io/negentrophi/nxpi-hash` (public)
 - ~10-line Dockerfile: `FROM node:24-alpine; RUN npm i better-auth@<pinned>;
   COPY hash.mjs .; ENTRYPOINT ["node","hash.mjs"]`.
 - `hash.mjs`: `import {hashPassword} from "better-auth/crypto";
@@ -308,12 +331,15 @@ tokens** (app image + `nxpi-hash` public, SQL in the public config repo).
 
 ## Remaining / optional
 
-- **Decisions still open:** the cross-repo publish credential `CONFIG_REPO_TOKEN`
-  (+ optional `CONFIG_REPO` var) so CI auto-commits SQL into `nxpi_config`;
-  whether to ship an optional RLS-on schema variant.
+- ~~Cross-repo publish credential `CONFIG_REPO_TOKEN`~~ — OBSOLETE: the
+  package moved into the app repo and `ci.yml` publishes the SQL bundle to
+  GHCR directly (see the status note at the top).
+- Optional RLS-on schema variant — still open.
 - **Slim `nxpi-hash`** (259 MB) — deferred; the real library guarantees hash
   format parity.
-- **Multi-version jumps:** `update.sh` applies the target version's
-  `migrate-*.sql`; crossing several releases at once needs each intermediate
-  `db/<v>/` present (or a squashed diff) — document as an operational note.
-- All work is **UNCOMMITTED** in both repos.
+- **Multi-version jumps:** `apply_migrations` scans ALL `db/*/migrate-*.sql`
+  with version ≤ target (ordered by the filename's version), so crossing
+  several releases applies each intermediate delta — each `db/<v>/` folder
+  must be present, which this folder guarantees.
+- Wiring `gen-migration-diff.sh` into `ci.yml` (auto-draft the next
+  `migrate-*.sql` for human review) — open; deltas are hand-maintained today.

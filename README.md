@@ -4,13 +4,17 @@ A **self-contained production deployment package** for running the NXPi
 chatbot platform on a single Azure Ubuntu VM. Copy it to the VM and run one
 command.
 
-The application itself is an **immutable release artifact**: a multi-arch
-Docker image published by CI to GHCR. This package only *pulls* it — it never
-builds, compiles, or modifies the application.
+The application itself is an **immutable release artifact**: a Docker image
+(linux/amd64) published by the app repo's CI to GHCR. This package only
+*pulls* it — it never builds, compiles, or modifies the application.
 
 ```
-ghcr.io/lpanigrahi/nxpi_dev        latest | X.Y.Z | sha-<commit>
+ghcr.io/negentrophi/nxpi_dev   latest | main | sha-<short> | <pkgver>-main.<shortsha> | X.Y.Z
 ```
+
+Only an exact `X.Y.Z` tag (published from a `v*` release tag) participates in
+DB-version alignment/derivation — every other form is a moving or suffixed
+build tag, and `DB_VERSION` in `.env` is authoritative alongside it.
 
 ## Prerequisites
 
@@ -38,7 +42,9 @@ on the VM by the public `nxpi-hash` helper. Nothing clones or builds the app.
 | `compose.sh` | Pin-honoring `docker compose` wrapper — use it for all manual compose operations |
 | `lib.sh` | Shared helpers sourced by the scripts above |
 | `docker-compose.yml` | The full production stack (app, Caddy, Postgres+pgvector, Redis) |
-| `Caddyfile` | Reverse proxy: auto-HTTPS (domain mode), security headers, SSE-safe compression |
+| `Caddyfile` | Reverse proxy: auto-HTTPS (domain mode), custom-cert import, security headers, SSE-safe compression |
+| `generate-certs.sh` | Extract a `.pfx` bundle into `certs/` for custom-certificate mode (see `certs/README.md`) |
+| `certs/` | Bring-your-own certificate material (bind-mounted read-only into Caddy) |
 | `secrets-entrypoint.sh` | Bridges Docker file-secrets → env for the app container |
 | `init.sql` | Enables the pgvector extension on first Postgres boot |
 | `db/<version>/` | Static provisioning SQL: `schema.sql` + `grants.sql` + `seed.sql` (+ `migrate-<version>.sql` for upgrades), published per release |
@@ -86,26 +92,15 @@ on the VM by the public `nxpi-hash` helper. Nothing clones or builds the app.
    the installer **generates a strong password and prints it once** in its
    summary — capture it, then change it after first login.
 
-### Ingress modes: IP-only vs domain vs custom cert
+### Ingress modes: IP-only, domain (Let's Encrypt), custom certificate
 
-| | IP-only (default) | Domain | Custom cert |
+| | IP-only (default) | Domain | Custom cert (bring your own) |
 |---|---|---|---|
-| `SITE_ADDRESS` in `.env` | *(unset)* | `your.domain.com` | `your.domain.com` |
+| `SITE_ADDRESS` in `.env` | *(unset)* | `your.domain.com` | `your.domain.com` (must match the cert) |
 | `BETTER_AUTH_URL` in `.env` | `http://<vm-ip>` (auto-filled) | `https://your.domain.com` | `https://your.domain.com` |
-| `./certs/tls.caddy` (from `./generate-certs.sh`) | *(absent)* | *(absent)* | present (enables the mode) |
-| TLS | none (plain HTTP :80) | automatic Let's Encrypt on 80/443 | your cert/key files from `./certs/` on 80/443 |
+| TLS | none (plain HTTP :80) | automatic Let's Encrypt on 80/443 | your certificate (corporate CA / wildcard / no ACME reachability) |
+| Extra setup | — | DNS A-record → VM | put the `.pfx` at the project root; `install.sh` extracts it (see `certs/README.md`) |
 | `.env.app` | `BETTER_AUTH_COOKIE_SECURE=false` (auto-set — without it sign-in loops) | leave unset | leave unset |
-
-Custom-cert mode is for a corporate CA, a wildcard cert, or a VM the Let's
-Encrypt servers cannot reach: put the `.pfx` at the project root — `install.sh`
-auto-detects it and runs `./generate-certs.sh`, which extracts
-`certs/fullchain.crt` + `certs/server.key` and writes `certs/tls.caddy`, the
-snippet the Caddyfile imports (see `certs/README.md`;
-`TLS_CERT_PATH`/`TLS_KEY_PATH` in `.env` are optional overrides, defaulted to
-those files). Re-runs skip extraction while the generated files are current;
-uploading a newer `.pfx` and re-running `./install.sh` renews the cert and
-restarts caddy. Open 443 in the NSG. With a private CA, also add the CA to the
-VM trust store or the update health gate's certificate check will fail.
 
 To switch to a domain later: point the DNS A-record at the VM, edit `.env`
 (set `SITE_ADDRESS`, change `BETTER_AUTH_URL` to `https://…`), then re-run
@@ -120,11 +115,15 @@ describe the **same release**. `install.sh` auto-derives the artifact version
 from the image tag; set `DB_VERSION` explicitly when the tag is `:latest`.
 
 ```bash
-# deterministic, recommended for production (artifacts at db/1.4.0/):
-APP_IMAGE=ghcr.io/lpanigrahi/nxpi_dev:1.4.0    NXPI_HASH_IMAGE=ghcr.io/lpanigrahi/nxpi-hash:1.4.0
+# deterministic, recommended for production (immutable per-commit tag):
+APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:sha-80c736a   DB_VERSION=1.9.0
 # newest build — pin the artifact version explicitly:
-APP_IMAGE=ghcr.io/lpanigrahi/nxpi_dev:latest   DB_VERSION=1.4.0
+APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:latest        DB_VERSION=1.9.0
 ```
+
+Moving/suffixed tags (`latest`, `main`, `sha-<short>`, `<pkgver>-main.<sha>`)
+never auto-derive a DB version — `DB_VERSION` is required with them and the
+scripts fail fast when it is missing.
 
 ## Updating
 
@@ -167,6 +166,30 @@ check — `migrate.sh` says so and exits 0; roll the matching image with
 `./update.sh` right after. For an adopted or freshly-restored database whose
 migration marker is empty, set `ADOPT_SCHEMA_VERSION=<its release>` so
 already-present migrations are stamped instead of re-applied.
+
+Each migration file is applied in a **single transaction** (a mid-file
+failure rolls the whole file back — the database is never left half-migrated),
+and after a successful migration run the release's `grants.sql` is
+**re-applied** (idempotent) so the app role picks up grants that only newer
+releases carry.
+
+### Upgrading to db 1.9.0 (REQUIRES-REVIEW)
+
+`db/1.9.0/migrate-1.9.0.sql` bundles app migrations 0071–0076 (governance
+policy versioning, the append-only audit trigger, the cron single-claim
+index, queue idempotency tables, the audit hash chain, agent-deployment
+ownership). It is flagged REQUIRES-REVIEW because 0073 re-creates the
+`document_chunk` organization FK as `ON DELETE CASCADE` — deleting an
+organization then deletes its RAG corpus instead of re-homing it. Runbook:
+
+```bash
+# 1. review the delta:  less db/1.9.0/migrate-1.9.0.sql
+# 2. set DB_VERSION=1.9.0 in ./.env
+# 3. backup-first, deliberate maintenance path (update.sh refuses this delta):
+ALLOW_DESTRUCTIVE_MIGRATION=1 ./migrate.sh
+# 4. roll the matching image:
+./update.sh
+```
 
 ## Backup
 
@@ -212,10 +235,12 @@ never resets passwords).
 
 Destructive: validates both archives up front, takes a **safety backup of the
 current state first** (skip with `--no-backup`; the uploads safety archive is
-mandatory when `--uploads` is used), stops the app, `pg_restore --clean`s the
-database back to the dump, verifies the result, **re-runs the additive schema
-sync** (so a dump older than the current release cannot leave the schema
-behind the code), **flushes Redis** (queued jobs from the post-dump timeline
+mandatory when `--uploads` is used), stops the app, **drops the schema and
+restores exactly the dump** (a plain `--clean` restore would leave objects the
+dump doesn't know about, silently mixing releases), re-applies `grants.sql`,
+verifies the result, **re-runs the additive schema sync** (so a dump older
+than the current release cannot leave the schema behind the code), **flushes
+Redis** (queued jobs from the post-dump timeline
 would reference rows that no longer exist), restarts, and health-gates — so
 even restoring the wrong dump is recoverable.
 
@@ -233,7 +258,7 @@ previously-running image, pin the digest it prints in `.env`:
 
 ```bash
 # .env
-APP_IMAGE=ghcr.io/lpanigrahi/nxpi_dev@sha256:…
+APP_IMAGE=ghcr.io/negentrophi/nxpi_dev@sha256:…
 ```
 
 then `./compose.sh up -d app`. Schema syncs are additive-only, so an older
@@ -289,8 +314,9 @@ docker run --rm -v "$PWD":/pkg:ro ubuntu:24.04 \
 | Symptom | Cause / fix |
 |---|---|
 | `install.sh` dies at image pull with auth error | The GHCR package is private: `echo $PAT \| docker login ghcr.io -u <user> --password-stdin` (PAT scope `read:packages`), re-run. |
+| `install.sh` dies: "APP_IMAGE tag is X but DB_VERSION=Y" | `assert_version_alignment` refuses a mismatch on purpose — it only fires for an exact `X.Y.Z` image tag (moving tags like `latest`/`main`/`sha-…`/`<ver>-main.<sha>` skip it and rely on `DB_VERSION`). Note the app version and the DB artifact version advance INDEPENDENTLY — `package.json` is at 1.2.0 while `db/` reaches 1.9.0, because a release that ships no migration does not add a `db/<ver>/` folder. Set `DB_VERSION` explicitly rather than letting it derive from the tag. |
 | `install.sh` dies: "no SQL artifacts found under ./db" | The `db/<version>/` folder for your image tag isn't present. Set `DB_VERSION` in `.env` to a version that exists under `db/`, or pull the matching release of this repo. |
-| Seed step: "could not compute the admin hash" | The `nxpi-hash` helper image isn't pullable. `docker pull ghcr.io/lpanigrahi/nxpi-hash:<ver>` (or set `NXPI_HASH_IMAGE`), then re-run. |
+| Seed step: "could not compute the admin hash" | The `nxpi-hash` helper image isn't pullable. `docker pull ghcr.io/negentrophi/nxpi-hash:latest` (published by the app repo's ci.yml; or set `NXPI_HASH_IMAGE`), then re-run. |
 | `install.sh` dies: "existing data volume found but no secrets" | You are adopting data from a previous deployment — copy its `secrets/` directory here (new random secrets can't open old data), or `docker compose down -v` to start fresh (destroys all data). |
 | App logs: `FATAL: … not readable by uid 1001` | Secret file permissions drifted. `sudo chown 1001 secrets/{postgres_url,redis_url,better_auth_secret} && sudo chmod 400` same files, then `docker compose up -d app`. |
 | Sign-in loops back to the login page (IP mode) | `BETTER_AUTH_COOKIE_SECURE=false` missing from `.env.app`, or `BETTER_AUTH_URL` doesn't exactly match what the browser uses (scheme + host, no trailing slash). |
@@ -301,15 +327,25 @@ docker run --rm -v "$PWD":/pkg:ro ubuntu:24.04 \
 
 ## Relationship to the application repository
 
-This package deploys the NXPi application, whose source lives in a separate,
-private repository (`nxpi_dev`). **Neither the source nor git access to it is
-needed to deploy.** The application is consumed only as a pre-built container
-image from GHCR, and the database is provisioned from static SQL
-(`db/<version>/`) that the app repo's CI generates per release and publishes
-into this repo — applied on the VM with plain `psql`. The admin password is
-hashed locally by the public `nxpi-hash` helper image. See
-[`docs/SOURCELESS-DEPLOYMENT-PLAN.md`](docs/SOURCELESS-DEPLOYMENT-PLAN.md) for
-the full design.
+This package deploys the NXPi application, whose source lives in a separate
+repository (`github.com/negentrophi/nxpi_dev`, folder `azure-deployment/`
+there — that repo now carries its own copy of this same package).
+**Neither the source nor git access to it is needed to deploy from here.**
+The application is consumed only as a pre-built container image from GHCR
+(`ghcr.io/negentrophi/nxpi_dev`), and the database is provisioned from static
+SQL (`db/<version>/`) shipped in this repo — applied on the VM with plain
+`psql`. The admin password is hashed locally by the public `nxpi-hash` helper
+image.
+
+The app repo's CI (`ci.yml`) publishes three artifacts per build: the app
+image, the SQL bundle as an ORAS OCI artifact
+(`ghcr.io/negentrophi/nxpi_dev/db`), and the `nxpi-hash` helper — but it does
+not push into this repo automatically (the earlier cross-repo auto-publish
+design is obsolete; see the note at the top of
+[`docs/SOURCELESS-DEPLOYMENT-PLAN.md`](docs/SOURCELESS-DEPLOYMENT-PLAN.md)).
+New `db/<version>/` folders and deployment-tooling fixes land in the app
+repo's embedded copy first and are carried over here by hand — check that
+copy periodically if a release you need isn't under `db/` yet.
 
 Keep `APP_IMAGE` and the `db/<version>/` artifacts pointing at the **same
 release** — the [Version pinning](#version-pinning) section explains the

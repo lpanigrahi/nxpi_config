@@ -138,7 +138,7 @@ PROJECT="${COMPOSE_PROJECT_NAME:-$(env_get .env COMPOSE_PROJECT_NAME neogen)}"
 
 # Default public admin-password hash helper image (override via NXPI_HASH_IMAGE
 # in ./.env). Single source of truth — used by admin_hash and install.sh.
-NXPI_HASH_DEFAULT="ghcr.io/lpanigrahi/nxpi-hash:latest"
+NXPI_HASH_DEFAULT="ghcr.io/negentrophi/nxpi-hash:latest"
 
 # ── Health helpers ───────────────────────────────────────────────────────────
 # wait_healthy SERVICE TIMEOUT_SECONDS — polls the container health status.
@@ -379,9 +379,29 @@ flush_redis() {
 # migrations do not occur — do not create pre-release-named db folders.
 ver_le() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]; }
 
+# is_exact_semver — true only for a bare X.Y.Z release version (digits and dots,
+# exactly three components). CI also publishes suffixed moving tags
+# (`latest`, `main`, `sha-<short>`, `<pkgver>-main.<shortsha>`) — none of those
+# identify a db/ package, so version alignment/derivation must ignore them.
+# NOTE: a single glob like [0-9]*.[0-9]*.[0-9]* is NOT enough — each `*`
+# matches anything, so `1.2.0-main.80c736af` would pass. Hence the two stages.
+is_exact_semver() {
+  case "$1" in
+    *[!0-9.]*) return 1 ;;            # only digits and dots allowed
+    *.*.*.*|.*|*.|*..*) return 1 ;;   # >3 components or an empty component
+  esac
+  case "$1" in
+    [0-9]*.[0-9]*.[0-9]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # assert_version_alignment — die if DB_VERSION (./.env) is set but disagrees
-# with a semver APP_IMAGE tag. Keeps the provisioning/migration target aligned
-# with the image being deployed (db_target_version gives DB_VERSION precedence).
+# with an EXACT-semver APP_IMAGE tag. Keeps the provisioning/migration target
+# aligned with the image being deployed (db_target_version gives DB_VERSION
+# precedence). Suffixed/moving tags (`latest`, `main`, `sha-<short>`,
+# `<pkgver>-main.<shortsha>`) skip enforcement — they don't name a db/ package,
+# so DB_VERSION alone is authoritative for them.
 assert_version_alignment() {
   local img tag dbv
   img=$(env_get .env APP_IMAGE "")
@@ -390,18 +410,19 @@ assert_version_alignment() {
   tag=${img##*:}
   case "$tag" in */*) return 0 ;; esac          # registry :port, no tag
   tag=${tag#v}                                   # strip leading v so :v1.2.0 matches
-  case "$tag" in
-    [0-9]*.[0-9]*.[0-9]*)
-      [ -z "$dbv" ] || [ "${dbv#v}" = "$tag" ] \
-        || die "APP_IMAGE tag is $tag but DB_VERSION=$dbv in ./.env — align them
-  (set DB_VERSION=$tag, or unset it to derive from the image tag) and re-run." ;;
-  esac
+  if is_exact_semver "$tag"; then
+    [ -z "$dbv" ] || [ "${dbv#v}" = "$tag" ] \
+      || die "APP_IMAGE tag is $tag but DB_VERSION=$dbv in ./.env — align them
+  (set DB_VERSION=$tag, or unset it to derive from the image tag) and re-run."
+  fi
 }
 
 # db_target_version — the bare semver this deployment targets, from DB_VERSION
 # or the APP_IMAGE tag. Prints the version, or NOTHING if it cannot be derived
-# (a digest pin `…@sha256:…`, `:latest`, or an untagged image — including one
-# whose registry has a `:port`).
+# (a digest pin `…@sha256:…`, an untagged image — including one whose registry
+# has a `:port` — or ANY non-exact-semver tag: `latest`, `main`, `sha-<short>`,
+# `<pkgver>-main.<shortsha>`; those are moving tags and never name a db/
+# package, so only DB_VERSION can resolve them).
 db_target_version() {
   local ver img
   ver=$(env_get .env DB_VERSION "")
@@ -411,7 +432,10 @@ db_target_version() {
     ver=${img##*:}
     # A '/' in the extracted segment means the last ':' was a registry PORT,
     # not a tag → the image is untagged (no derivable version).
-    case "$ver" in ""|latest|"$img"|*/*) ver="" ;; esac
+    case "$ver" in ""|"$img"|*/*) ver="" ;; esac
+    ver=${ver#v}
+    # Only an exact X.Y.Z tag identifies a db/ package.
+    if [ -n "$ver" ] && ! is_exact_semver "$ver"; then ver=""; fi
   fi
   printf '%s' "${ver#v}"   # db/ folders are named by bare semver
 }
@@ -595,12 +619,32 @@ apply_migrations() {
       APPLIED_DESTRUCTIVE=true
     fi
     log "applying migration: $base"
-    psql_admin < "$f" || die "migration $base FAILED — the app was NOT changed; inspect $f and retry"
+    # -1 (--single-transaction): a mid-file failure rolls the WHOLE file back —
+    # without it, a delta that drops+recreates constraints could die halfway
+    # and leave the schema mangled with NO marker row. NOTE: the frozen
+    # 1.3.0–1.8.0 files carry internal BEGIN/COMMIT blocks; under -1 psql
+    # warns "there is already a transaction in progress" and the inner COMMITs
+    # win — harmless noise, never "fix" the frozen files to silence it.
+    psql_admin -1 < "$f" || die "migration $base FAILED — the transaction was rolled back; inspect $f and retry"
     psql_admin -c "insert into public.deploy_schema_migrations (filename) values ('$base_sql') on conflict do nothing;" >/dev/null \
       || die "could not record migration $base in the marker table — re-run when the DB is stable"
     any=true
   done 3< <(migration_files_through "$target")
-  $any && return 0 || return 10
+  if $any; then
+    # Re-apply the target release's grants (idempotent): migrations can add
+    # schemas/objects whose grants only exist in the NEWEST grants.sql (e.g.
+    # the ADR-0038 drizzle-schema block, added in 1.9.0) — a VM provisioned at
+    # an older release would otherwise never receive them.
+    # set -e is DISABLED in here when the caller runs `if apply_migrations`,
+    # so every mutating command must carry an explicit || die.
+    local dbd
+    dbd=$(db_dir) || die "cannot resolve db/<version> for the grants re-apply — set DB_VERSION in ./.env"
+    log "re-applying ${dbd}/grants.sql (idempotent — grants for new objects)…"
+    psql_admin < "$dbd/grants.sql" \
+      || die "grants.sql failed after migrations — the app role may lack grants on new tables; re-run"
+    return 0
+  fi
+  return 10
 }
 
 # has_pending_destructive — prints the first UNAPPLIED REQUIRES-REVIEW migration

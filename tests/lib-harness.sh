@@ -75,6 +75,18 @@ ver_le 1.3.0 1.3.0  && r=y || r=n; t "ver_le equal" y "$r"
 ver_le 1.10.0 1.9.0 && r=y || r=n; t "ver_le 1.10.0<=1.9.0 is false" n "$r"
 ver_le 1.9.0 1.10.0 && r=y || r=n; t "ver_le 1.9.0<=1.10.0" y "$r"
 
+# ── is_exact_semver ──────────────────────────────────────────────────────────
+is_exact_semver 1.9.0 && r=y || r=n;               t "semver 1.9.0" y "$r"
+is_exact_semver 10.22.333 && r=y || r=n;           t "semver 10.22.333" y "$r"
+is_exact_semver 1.2.0-main.80c736af && r=y || r=n; t "semver rejects -main.<sha>" n "$r"
+is_exact_semver main && r=y || r=n;                t "semver rejects main" n "$r"
+is_exact_semver sha-80c736a && r=y || r=n;         t "semver rejects sha-<short>" n "$r"
+is_exact_semver latest && r=y || r=n;              t "semver rejects latest" n "$r"
+is_exact_semver 1.2 && r=y || r=n;                 t "semver rejects 1.2" n "$r"
+is_exact_semver 1.2.0.1 && r=y || r=n;             t "semver rejects 1.2.0.1" n "$r"
+is_exact_semver "1..0" && r=y || r=n;              t "semver rejects 1..0" n "$r"
+is_exact_semver "" && r=y || r=n;                  t "semver rejects empty" n "$r"
+
 # ── version resolution ───────────────────────────────────────────────────────
 mkdir -p db/1.2.0 db/1.3.0
 echo 'DB_VERSION=1.3.0' > .env
@@ -89,6 +101,19 @@ printf 'APP_IMAGE=ghcr.io/x/y@sha256:abc\n' > .env
 t "db_target_version digest -> empty" "" "$(db_target_version)"
 printf 'APP_IMAGE=reg.example:5000/x/y\n' > .env
 t "db_target_version registry-port untagged -> empty" "" "$(db_target_version)"
+# CI moving tags (main branch publishes <pkgver>-main.<sha>, main, sha-<short>):
+# none identify a db/ package, so derivation must yield empty, and DB_VERSION
+# must still resolve the folder when set alongside them.
+printf 'APP_IMAGE=ghcr.io/x/y:1.2.0-main.80c736af\n' > .env
+t "db_target_version <ver>-main.<sha> -> empty" "" "$(db_target_version)"
+printf 'APP_IMAGE=ghcr.io/x/y:main\n' > .env
+t "db_target_version main -> empty" "" "$(db_target_version)"
+printf 'APP_IMAGE=ghcr.io/x/y:sha-80c736a\n' > .env
+t "db_target_version sha-<short> -> empty" "" "$(db_target_version)"
+printf 'APP_IMAGE=ghcr.io/x/y:main\n' > .env
+db_dir >/dev/null 2>&1 && r=y || r=n; t "db_dir main-tag + 2 folders fails" n "$r"
+printf 'APP_IMAGE=ghcr.io/x/y:1.2.0-main.80c736af\nDB_VERSION=1.3.0\n' > .env
+t "db_dir suffixed tag + DB_VERSION resolves" "db/1.3.0" "$(db_dir)"
 printf 'DB_VERSION=9.9.9\n' > .env
 db_dir >/dev/null 2>&1 && r=y || r=n; t "db_dir explicit-missing-folder fails" n "$r"
 rm -rf db/1.2.0
@@ -106,6 +131,12 @@ printf 'APP_IMAGE=ghcr.io/x/y@sha256:abc\nDB_VERSION=1.2.0\n' > .env
 ( assert_version_alignment ) 2>/dev/null && r=pass || r=die; t "alignment digest skipped" pass "$r"
 printf 'APP_IMAGE=ghcr.io/x/y:latest\nDB_VERSION=1.2.0\n' > .env
 ( assert_version_alignment ) 2>/dev/null && r=pass || r=die; t "alignment latest skipped" pass "$r"
+printf 'APP_IMAGE=ghcr.io/x/y:1.2.0-main.80c736af\nDB_VERSION=1.9.0\n' > .env
+( assert_version_alignment ) 2>/dev/null && r=pass || r=die; t "alignment <ver>-main.<sha> skipped" pass "$r"
+printf 'APP_IMAGE=ghcr.io/x/y:main\nDB_VERSION=1.9.0\n' > .env
+( assert_version_alignment ) 2>/dev/null && r=pass || r=die; t "alignment main skipped" pass "$r"
+printf 'APP_IMAGE=ghcr.io/x/y:sha-80c736a\nDB_VERSION=1.9.0\n' > .env
+( assert_version_alignment ) 2>/dev/null && r=pass || r=die; t "alignment sha-<short> skipped" pass "$r"
 
 # ── migration_files_through (multi-version ordering + cap) ───────────────────
 mkdir -p db/1.4.0 db/1.10.0

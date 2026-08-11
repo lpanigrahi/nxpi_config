@@ -4,7 +4,8 @@ This directory is bind-mounted **read-only** into the caddy container at
 `/certs`. It is only used when you bring your own certificate instead of
 Caddy's automatic Let's Encrypt (corporate CA, wildcard cert, or a VM the
 ACME servers cannot reach). In IP-only and plain domain mode it stays
-empty. Real cert/key files here must never be committed.
+empty. Real cert/key files here must never be committed (the package's
+`.gitignore` excludes everything in this directory except this README).
 
 ## Usage
 
@@ -17,7 +18,7 @@ empty. Real cert/key files here must never be committed.
    cd ..                      # project root
    ./install.sh               # detects the .pfx and extracts it
    # or manually, outside an install run:
-   ./generate-certs.sh [your-bundle.pfx]   # defaults to wildcard_nbcbearings_in.pfx
+   ./generate-certs.sh your-bundle.pfx
    ```
 
    Extraction prompts for the PFX **export password** (press Enter if the
@@ -57,7 +58,8 @@ empty. Real cert/key files here must never be committed.
 **Renewal**: replace the `.pfx` with the newer bundle and re-run
 `../install.sh` — it re-extracts (the `.pfx` being newer than
 `fullchain.crt` triggers it) and restarts caddy automatically. The manual
-flow still works: `../generate-certs.sh`, then `../compose.sh restart caddy`.
+flow still works: `../generate-certs.sh your-bundle.pfx`, then
+`../compose.sh restart caddy`.
 **Disable the mode**: delete `tls.caddy` here (and the root `.pfx`, or the
 next install re-creates it) and restart caddy.
 

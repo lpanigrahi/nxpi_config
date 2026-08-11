@@ -486,7 +486,8 @@ compose up -d
 #     failed later (e.g. at the health gate) — the re-run then skips
 #     extraction, but the running caddy still serves the pre-snippet config
 #     and keeps attempting ACME for the domain. Ask caddy's admin API (same
-#     endpoint the healthcheck probes) whether the loaded config references
+#     endpoint the healthcheck probes — the IPv4 literal, busybox wget
+#     resolves `localhost` to ::1 first) whether the loaded config references
 #     the /certs/ paths; if not (or the API is unreachable), restart. A
 #     restart is harmless either way — the health gate below re-verifies.
 NEED_CADDY_RESTART="$CERTS_REGENERATED"

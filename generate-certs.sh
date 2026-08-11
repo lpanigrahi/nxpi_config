@@ -1,15 +1,25 @@
 #!/bin/bash
 set -e
 
+# generate-certs.sh — extract a PKCS#12 (.pfx) certificate bundle into the
+# ./certs directory for Caddy's custom-certificate mode. Normally invoked by
+# ./install.sh (which auto-detects a *.pfx at the project root); manual use:
+#   ./generate-certs.sh your-bundle.pfx
+# See certs/README.md for the full flow.
+
 # Do not inherit the caller's umask: install.sh runs under umask 077 (secrets
 # phase), which would create ./certs as 0700 — the caddy container drops ALL
 # capabilities (no CAP_DAC_OVERRIDE), so even container-root then cannot
 # traverse the directory and fails with "permission denied" on the cert.
 umask 022
 
-# Configuration — the PFX path may be passed as $1 (install.sh auto-detects
-# any *.pfx at the project root and passes it); default kept for manual runs.
-PFX_FILE="${1:-wildcard_nbcbearings_in.pfx}"
+# The PFX path is passed as $1 (install.sh auto-detects any *.pfx at the
+# project root and passes it). Required for manual runs too.
+PFX_FILE="${1:-}"
+if [ -z "$PFX_FILE" ]; then
+    echo "usage: $0 <bundle.pfx>   (install.sh passes this automatically)"
+    exit 1
+fi
 CERTS_DIR="certs"
 
 # PFX export password: taken from the PFX_PASSWORD environment variable when
@@ -37,7 +47,6 @@ mkdir -p "$CERTS_DIR"
 chmod 755 "$CERTS_DIR"
 
 echo "Step 3: Entering certs directory..."
-# Entering the directory just like you would manually
 cd "$CERTS_DIR"
 
 # Remove previous outputs first: install.sh root-owns server.key after
