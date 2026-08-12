@@ -37,7 +37,7 @@ on the VM by the public `nxpi-hash` helper. Nothing clones or builds the app.
 | `install.sh` | Single-command idempotent installer / converger |
 | `update.sh` | Pull latest image → schema sync → roll → health gate → auto-rollback |
 | `migrate.sh` | Schema-ONLY migration of the existing database — never initializes, never touches data rows |
-| `upgrade-to-1.9.sh` | Guided multi-release upgrade of an existing database to db 1.9.0: pre-checks, row-count snapshot, `migrate.sh`, then verifies every expected object and that nothing was lost |
+| `upgrade-db.sh` | Guided multi-release upgrade of an existing database to a shipped `db/<version>` (newest by default): pre-checks, row-count snapshot, `migrate.sh`, then verifies every expected object and that nothing was lost |
 | `backup.sh` | `pg_dump` + uploads-volume archive + retention (cron-able) |
 | `restore.sh` | Restore a backup (destructive, `--yes`-gated, health-gated) |
 | `compose.sh` | Pin-honoring `docker compose` wrapper — use it for all manual compose operations |
@@ -117,9 +117,9 @@ from the image tag; set `DB_VERSION` explicitly when the tag is `:latest`.
 
 ```bash
 # deterministic, recommended for production (immutable per-commit tag):
-APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:sha-80c736a   DB_VERSION=1.9.0
+APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:sha-80c736a   DB_VERSION=1.10.0
 # newest build — pin the artifact version explicitly:
-APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:latest        DB_VERSION=1.9.0
+APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:latest        DB_VERSION=1.10.0
 ```
 
 Moving/suffixed tags (`latest`, `main`, `sha-<short>`, `<pkgver>-main.<sha>`)
@@ -174,6 +174,37 @@ and after a successful migration run the release's `grants.sql` is
 **re-applied** (idempotent) so the app role picks up grants that only newer
 releases carry.
 
+### Upgrading to db 1.10.0 (additive — rolling path)
+
+`db/1.10.0/migrate-1.10.0.sql` bundles app migration 0077: one nullable column,
+`session.mfa_verified_at`, recording that the IdP (Entra) asserted MFA for a
+sign-in. Additive, no backfill, no default — deliberately **not**
+REQUIRES-REVIEW, so the rolling `./update.sh` path applies it with no
+maintenance window.
+
+**Apply this BEFORE (or with) any image carrying app migration 0077.** Better
+Auth's drizzle adapter names every column explicitly, so an image ahead of this
+delta `42703`s inside `auth.api.getSession()` — that is a total login outage,
+not a degraded page. It is the fourth incident of this class (after 1.5.0's
+`lifecycle_status`, 1.6.0's `qa_baseline_hash` and 1.8.0's `deployed`) and the
+first to take authentication down rather than one page.
+
+```bash
+# 1. set DB_VERSION=1.10.0 in ./.env
+# 2. rolling, additive-only path (auto-rollback intact):
+./update.sh
+```
+
+If you are still on 1.8.0 or earlier, `update.sh` will want to apply 1.9.0 first
+and will refuse — that one is REQUIRES-REVIEW. Either take the guided path,
+which handles both in one run:
+
+```bash
+./upgrade-db.sh            # walks 1.5.0 → 1.10.0, gating 1.9.0 for review
+```
+
+…or take 1.9.0 through the maintenance path below, then re-run `./update.sh`.
+
 ### Upgrading to db 1.9.0 (REQUIRES-REVIEW)
 
 `db/1.9.0/migrate-1.9.0.sql` bundles app migrations 0071–0076 (governance
@@ -183,12 +214,13 @@ ownership). It is flagged REQUIRES-REVIEW because 0073 re-creates the
 `document_chunk` organization FK as `ON DELETE CASCADE` — deleting an
 organization then deletes its RAG corpus instead of re-homing it. Runbook:
 
-**Recommended — the guided path.** `./upgrade-to-1.9.sh` drives the same
+**Recommended — the guided path.** `./upgrade-db.sh` drives the same
 machinery with the pre- and post-checks a multi-release jump needs:
 
 ```bash
-./upgrade-to-1.9.sh --dry-run     # report what would happen, change nothing
-./upgrade-to-1.9.sh               # backup → migrate → verify
+./upgrade-db.sh --dry-run         # report what would happen, change nothing
+./upgrade-db.sh                   # backup → migrate → verify (newest shipped db/)
+./upgrade-db.sh 1.9.0             # or stop at a specific release
 ./update.sh                       # then roll the matching image
 ```
 
@@ -199,7 +231,7 @@ It adds no migration logic of its own — it calls `./migrate.sh` — but it:
   *executed* before you confirm. This matters: guessing too low re-runs
   `db/1.3.0/migrate-1.3.0.sql`, which `DELETE`s `org_role_permission` and
   `org_permission_group_item` rows. Use
-  `./upgrade-to-1.9.sh --adopt-schema-version <X.Y.Z>` once you have confirmed
+  `./upgrade-db.sh --adopt-schema-version <X.Y.Z>` once you have confirmed
   the schema's actual release;
 * **pre-checks `cron_run_log` for duplicate `running` rows.**
   `migrate-1.9.0.sql` downgrades that collision to a `NOTICE`, so psql still
@@ -314,7 +346,7 @@ pinned to the last-good image where raw compose would redeploy the broken one.
 ./compose.sh logs -f caddy               # ingress logs
 curl -s localhost/api/health/ready       # readiness through Caddy
 ./migrate.sh                             # schema-only migration (data preserved)
-./upgrade-to-1.9.sh --dry-run            # what a 1.9.0 upgrade would do (no changes)
+./upgrade-db.sh --dry-run                # what an upgrade would do (no changes)
 ./compose.sh exec postgres psql -U neogen_admin -d neogen   # SQL console
 ```
 

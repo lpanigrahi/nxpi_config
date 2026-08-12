@@ -1,33 +1,35 @@
 #!/usr/bin/env bash
 # =============================================================================
-# upgrade-to-1.9.sh — guided, LOSSLESS upgrade of an EXISTING database to 1.9.0.
+# upgrade-db.sh — guided, LOSSLESS upgrade of an EXISTING database to a shipped
+# db/<version>. Defaults to the newest version this package carries.
 #
-#   ./upgrade-to-1.9.sh                              # interactive
-#   ./upgrade-to-1.9.sh --dry-run                    # report only, change nothing
-#   ./upgrade-to-1.9.sh --yes                        # non-interactive
-#   ./upgrade-to-1.9.sh --adopt-schema-version 1.4.0 # adopted/restored DB
+#   ./upgrade-db.sh                          # newest shipped db/<version>
+#   ./upgrade-db.sh 1.9.0                    # stop at a specific release
+#   ./upgrade-db.sh --dry-run                # report only, change nothing
+#   ./upgrade-db.sh --yes                    # non-interactive
+#   ./upgrade-db.sh --adopt-schema-version 1.4.0   # adopted/restored DB
 #
 # This script adds NO migration logic of its own — it drives ./migrate.sh (and
-# through it apply_migrations in lib.sh) with the pre-checks and post-checks
-# that a 1.4.0 → 1.9.0 jump needs but that no single-release upgrade did:
+# through it apply_migrations in lib.sh) with the pre-checks and post-checks a
+# multi-release jump needs but that no single-release upgrade did:
 #
 #   • PRE:  refuses to guess ADOPT_SCHEMA_VERSION. Getting it too LOW re-runs
 #           db/1.3.0/migrate-1.3.0.sql, which DELETEs org_role_permission and
 #           org_permission_group_item rows. That is the single largest risk in
-#           this upgrade and it lives in a release you already have.
-#   • PRE:  checks cron_run_log for duplicate 'running' rows. migrate-1.9.0.sql
-#           downgrades that collision to a NOTICE, so psql exits 0, the file is
-#           stamped applied, and its unique index is SILENTLY never created —
-#           the app then fails at runtime on ON CONFLICT with no trace in the
-#           marker table.
+#           any upgrade and it lives in a release you already have.
+#   • PRE:  when 1.9.0 is pending, checks cron_run_log for duplicate 'running'
+#           rows. migrate-1.9.0.sql downgrades that collision to a NOTICE, so
+#           psql exits 0, the file is stamped applied, and its unique index is
+#           SILENTLY never created — the app then fails at runtime on
+#           ON CONFLICT with no trace in the marker table.
 #   • PRE:  snapshots row counts, so "no data was lost" is verified, not assumed.
-#   • POST: asserts every object 1.5.0–1.9.0 should have created, that grants
-#           reached the new tables, and that no table shrank.
+#   • POST: asserts every object each release in scope should have created,
+#           that grants reached the new tables, and that no table shrank.
 #
-# The 1.9.0 delta is flagged REQUIRES-REVIEW because migration 0073 re-creates
-# the document_chunk → organization FK as ON DELETE CASCADE (was SET NULL):
-# deleting an organization will thereafter DELETE its RAG corpus instead of
-# re-homing it. No rows are destroyed by the migration itself.
+# A REQUIRES-REVIEW delta in scope (currently 1.9.0's document_chunk FK cascade)
+# is surfaced with its own header text and needs an explicit confirmation; the
+# rolling ./update.sh path refuses those by design. Purely additive targets
+# (e.g. 1.10.0) need no such gate.
 #
 # Afterwards, roll the matching app image with ./update.sh.
 # =============================================================================
@@ -37,11 +39,10 @@ cd "$SCRIPT_DIR"
 # shellcheck source=lib.sh
 . ./lib.sh
 
-TARGET_VER="1.9.0"
-SNAPSHOT="backups/pre-${TARGET_VER}-rowcounts.txt"
 ASSUME_YES=false
 DRY_RUN=false
 ADOPT=""
+TARGET_VER=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -49,15 +50,33 @@ while [ $# -gt 0 ]; do
     --dry-run)               DRY_RUN=true ;;
     --adopt-schema-version)  shift; [ $# -gt 0 ] || die "--adopt-schema-version needs a value (e.g. 1.4.0)"; ADOPT="${1#v}" ;;
     --adopt-schema-version=*) ADOPT="${1#*=}"; ADOPT="${ADOPT#v}" ;;
-    -h|--help)               grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,34p'; exit 0 ;;
-    *) die "unknown flag: $1 (see --help)" ;;
+    -h|--help)               grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,36p'; exit 0 ;;
+    -*)                      die "unknown flag: $1 (see --help)" ;;
+    *)                       [ -z "$TARGET_VER" ] || die "give at most one target version (got '$TARGET_VER' and '$1')"
+                             TARGET_VER="${1#v}" ;;
   esac
   shift
 done
 
+# Default target: the newest db/<version> this package ships. `sort -V` is the
+# same ordering apply_migrations uses, so 1.10.0 correctly follows 1.9.0.
+if [ -z "$TARGET_VER" ]; then
+  TARGET_VER=$(find db -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | sort -V | tail -n1)
+  [ -n "$TARGET_VER" ] || die "no db/<version> directories found in this package"
+fi
+is_exact_semver "$TARGET_VER" || die "target must be a bare X.Y.Z release (got: $TARGET_VER)"
+[ -d "db/$TARGET_VER" ] || die "db/$TARGET_VER is not shipped in this package.
+  Available: $(find db -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort -V | tr '\n' ' ')"
+
+SNAPSHOT="backups/pre-${TARGET_VER}-rowcounts.txt"
+
 # An operator-supplied version reaches SQL string context and picks a db/ folder.
 [ -z "$ADOPT" ] || is_exact_semver "$ADOPT" \
   || die "--adopt-schema-version must be a bare X.Y.Z release (got: $ADOPT)"
+
+# at_least VER — true when VER is within the upgrade's scope, i.e. the target is
+# at or beyond it. Gates the per-release verification blocks below.
+at_least() { ver_le "$1" "$TARGET_VER"; }
 
 # confirm PROMPT WORD — require WORD to be typed. --yes bypasses; a dry run
 # never reaches a mutation, and a non-tty without --yes must not hang.
@@ -83,7 +102,6 @@ acquire_lock
 # ── 1. Preflight and state report ───────────────────────────────────────────
 hdr "Preflight"
 [ -f .env ] || die "no ./.env here — run ./install.sh first"
-[ -d "db/$TARGET_VER" ] || die "db/$TARGET_VER is missing from this package — you are on an older release of the deployment package; update it before upgrading."
 PG_CID=$(compose ps -q postgres 2>/dev/null | head -n1 || true)
 [ -n "$PG_CID" ] || die "postgres is not running — start the stack first (./install.sh)"
 wait_healthy postgres 60 >/dev/null || die "postgres is not healthy"
@@ -98,9 +116,20 @@ fi
 
 CUR_DB_VERSION=$(env_get .env DB_VERSION "")
 CUR_APP_IMAGE=$(env_get .env APP_IMAGE "")
+log "target db version       : $TARGET_VER"
 log "current .env DB_VERSION : ${CUR_DB_VERSION:-<unset>}"
 log "current .env APP_IMAGE  : ${CUR_APP_IMAGE:-<unset>}"
 log "database                : $TABLES tables in schema public"
+
+# Refuse to move DB_VERSION BACKWARDS. Without this, running the script with an
+# older explicit target after ./.env has advanced would cap the migration below
+# the image's schema — the silent-downgrade footgun.
+if [ -n "$CUR_DB_VERSION" ] && ! ver_le "$CUR_DB_VERSION" "$TARGET_VER"; then
+  die "./.env already targets DB_VERSION=$CUR_DB_VERSION, which is NEWER than $TARGET_VER.
+  Refusing to lower it — that would cap migrations below the running image's
+  schema. Re-run without a version argument to target the newest shipped
+  release, or pass a target at or above $CUR_DB_VERSION."
+fi
 
 ensure_migration_marker
 MARKER_N=$(marker_row_count)
@@ -116,6 +145,9 @@ while IFS= read -r f <&3; do
     || PENDING="${PENDING}${base}"$'\n'
 done 3< <(migration_files_through "$TARGET_VER")
 PENDING=${PENDING%$'\n'}
+
+# pending_has FILE — true when FILE is in the pending set.
+pending_has() { printf '%s\n' "$PENDING" | grep -qx "$1"; }
 
 hdr "Plan"
 if [ -z "$PENDING" ]; then
@@ -136,14 +168,16 @@ if [ "$MARKER_N" = "0" ]; then
   warn "the migration marker is EMPTY — this schema was not provisioned by this harness."
   [ -n "$ADOPT" ] || die "refusing to guess the schema's actual release.
   Confirm which release this database's schema ALREADY matches and re-run:
-      ./upgrade-to-1.9.sh --adopt-schema-version <X.Y.Z>
+      ./upgrade-db.sh --adopt-schema-version <X.Y.Z>
   Too HIGH silently skips migrations the schema still needs.
   Too LOW re-runs db/1.3.0/migrate-1.3.0.sql, which DELETEs rows from
   org_role_permission and org_permission_group_item — real data loss.
-  If unsure, check for a table added by a known release, e.g.:
-      skill_scan     exists ⇒ schema is at least 1.5.0
-      skill_qa_run   exists ⇒ at least 1.6.0
-      skill.deployed exists ⇒ at least 1.8.0"
+  If unsure, check for a column/table added by a known release, e.g.:
+      skill_scan          exists ⇒ schema is at least 1.5.0
+      skill_qa_run        exists ⇒ at least 1.6.0
+      skill.deployed      exists ⇒ at least 1.8.0
+      job_execution       exists ⇒ at least 1.9.0
+      session.mfa_verified_at    ⇒ at least 1.10.0"
 
   STAMPED=""; EXECUTED=""
   while IFS= read -r f <&3; do
@@ -162,33 +196,35 @@ if [ "$MARKER_N" = "0" ]; then
   export ADOPT_SCHEMA_VERSION="$ADOPT"
 fi
 
-# ── 3. cron_run_log pre-check (the silent-skip landmine) ────────────────────
+# ── 3. cron_run_log pre-check (only when 1.9.0 is actually pending) ─────────
 # migrate-1.9.0.sql creates a partial UNIQUE index on cron_run_log(cron_job_id)
 # WHERE status='running', wrapped in `EXCEPTION WHEN unique_violation THEN
 # RAISE NOTICE`. A NOTICE is not an error: psql exits 0, lib.sh stamps the file
 # applied, and the index is never created and never retried. Catch it BEFORE.
-hdr "Pre-check: cron_run_log"
-if [ "$(q "select to_regclass('public.cron_run_log') is null")" = "t" ]; then
-  log "cron_run_log does not exist yet — nothing to check"
-else
-  DUPES=$(q "select count(*) from (select cron_job_id from cron_run_log where status='running' group by cron_job_id having count(*) > 1) d")
-  assert_numeric "$DUPES" "the cron_run_log duplicate count"
-  if [ "$DUPES" != "0" ]; then
-    warn "$DUPES cron job(s) have MORE THAN ONE 'running' row:"
-    psql_admin -c "select cron_job_id, count(*) from cron_run_log where status='running' group by cron_job_id having count(*) > 1;" || true
-    die "migrate-1.9.0.sql would SILENTLY skip creating
+if pending_has "migrate-1.9.0.sql"; then
+  hdr "Pre-check: cron_run_log (migrate-1.9.0.sql is pending)"
+  if [ "$(q "select to_regclass('public.cron_run_log') is null")" = "t" ]; then
+    log "cron_run_log does not exist yet — nothing to check"
+  else
+    DUPES=$(q "select count(*) from (select cron_job_id from cron_run_log where status='running' group by cron_job_id having count(*) > 1) d")
+    assert_numeric "$DUPES" "the cron_run_log duplicate count"
+    if [ "$DUPES" != "0" ]; then
+      warn "$DUPES cron job(s) have MORE THAN ONE 'running' row:"
+      psql_admin -c "select cron_job_id, count(*) from cron_run_log where status='running' group by cron_job_id having count(*) > 1;" </dev/null || true
+      die "migrate-1.9.0.sql would SILENTLY skip creating
   cron_run_log_one_running_per_job (it downgrades the collision to a NOTICE, so
   the migration still reports success). The app would then fail at runtime with
   'no unique or exclusion constraint matching the ON CONFLICT specification'.
   Let the app's cleanupStaleLogs sweep finish, or resolve the duplicates by hand
   (keep the newest per job), then re-run this script."
+    fi
+    ok "no duplicate 'running' rows — the 1.9.0 claim index can be created"
   fi
-  ok "no duplicate 'running' rows — the 1.9.0 claim index can be created"
 fi
 
 # ── 4. Losslessness snapshot ────────────────────────────────────────────────
-# Exact counts for the tables 1.5.0–1.9.0 touch, plus every user table, so the
-# post-check can prove nothing shrank. Written BEFORE any mutation.
+# Exact counts for every user table, so the post-check can prove nothing shrank.
+# Written BEFORE any mutation.
 hdr "Row-count snapshot"
 snapshot_to() {
   psql_admin -tAF$'\t' -c "
@@ -198,7 +234,7 @@ snapshot_to() {
                                false, true, '')))[1]::text::bigint
     from information_schema.tables
     where table_schema = 'public' and table_type = 'BASE TABLE'
-    order by table_name;" 2>/dev/null
+    order by table_name;" </dev/null 2>/dev/null
 }
 if $DRY_RUN; then
   log "(dry run) would write $SNAPSHOT"
@@ -231,7 +267,7 @@ if [ "$CUR_DB_VERSION" != "$TARGET_VER" ]; then
     printf '\nDB_VERSION=%s\n' "$TARGET_VER" >> .env
   fi
   [ "$(env_get .env DB_VERSION "")" = "$TARGET_VER" ] || die "failed to set DB_VERSION in ./.env — set it by hand and re-run"
-  ok "DB_VERSION=$TARGET_VER (previous ./.env saved alongside)"
+  ok "DB_VERSION=$TARGET_VER (previous ./.env saved as $ENV_BAK)"
 else
   ok "DB_VERSION is already $TARGET_VER"
 fi
@@ -240,36 +276,40 @@ fi
 # tags (latest/main/sha-…) legitimately skip it and rely on DB_VERSION.
 assert_version_alignment
 
-# ── 6. Explain the semantic change, then migrate ────────────────────────────
-hdr "Review: what 1.9.0 changes beyond adding objects"
-cat <<'EOF'
-  db/1.9.0/migrate-1.9.0.sql is flagged REQUIRES-REVIEW. Reviewed:
+# ── 6. Surface any REQUIRES-REVIEW delta, then migrate ──────────────────────
+# lib.sh's has_pending_destructive prints the first flagged file apply_migrations
+# would run. Only then do we arm the override — a purely additive upgrade
+# (e.g. 1.9.0 → 1.10.0) never asks for it.
+DESTRUCTIVE_FILE=$(has_pending_destructive || true)
+if [ -n "$DESTRUCTIVE_FILE" ]; then
+  hdr "Review required: $(basename "$DESTRUCTIVE_FILE")"
+  warn "this delta is flagged REQUIRES-REVIEW — its own rationale follows:"
+  sed -n '1,12p' "$DESTRUCTIVE_FILE" | sed 's/^/  /'
+  cat <<'EOF'
 
-    • It DELETES NO ROWS. There is no DROP TABLE, DROP COLUMN, TRUNCATE, or
-      unguarded DELETE anywhere in 1.5.0 → 1.9.0. Both NOT NULL columns added
-      carry defaults, so existing rows are grandfathered without a rewrite.
-
-    • It DOES change future behaviour: migration 0073 re-creates the
-      document_chunk → organization foreign key as ON DELETE CASCADE
-      (previously ON DELETE SET NULL). From then on, DELETING AN ORGANIZATION
-      DELETES ITS ENTIRE RAG CORPUS instead of re-homing those chunks as
-      personal/global. This is the reason for the flag.
-
-    • It installs the admin_audit_log immutability trigger for the first time.
-      Set AUDIT_SIGNING_KEY in ./.env.app BEFORE the first post-1.9.0 audit row
-      is written — the hash chain starts from whatever key is active.
+  Reviewed for data loss across 1.5.0 → 1.10.0: there is no DROP TABLE, DROP
+  COLUMN, TRUNCATE or unguarded DELETE anywhere in that range. Every NOT NULL
+  column added carries a default, so existing rows are grandfathered without a
+  table rewrite. The flag is about CHANGED BEHAVIOUR, not migration-time loss.
 
   ./migrate.sh will take its own mandatory backup before touching anything.
 EOF
-confirm "Proceed with the upgrade to $TARGET_VER." "UPGRADE"
+  confirm "Proceed, accepting the reviewed change above." "UPGRADE"
+  export ALLOW_DESTRUCTIVE_MIGRATION=1
+else
+  hdr "Review"
+  ok "no REQUIRES-REVIEW delta in scope — this upgrade is additive-only"
+  log "(the same set is what ./update.sh's rolling path would apply)"
+  confirm "Proceed with the upgrade to $TARGET_VER." "UPGRADE"
+fi
 
 hdr "Migration"
 # migrate.sh takes the safety backup, re-checks the marker, applies every
 # pending delta in semver order inside a single transaction per file, and
-# re-applies db/1.9.0/grants.sql afterwards.
-# Its post-migration health gate is EXPECTED to fail here: the running app
-# image predates the schema. migrate.sh exits 0 in that case by design.
-ALLOW_DESTRUCTIVE_MIGRATION=1 ./migrate.sh \
+# re-applies db/<target>/grants.sql afterwards.
+# Its post-migration health gate may fail here when a running app image
+# predates the schema; migrate.sh exits 0 in that case by design.
+./migrate.sh \
   || die "migration failed — the database was rolled back to its pre-migration state.
   Your backup is in ./backups. Inspect the error above, then re-run."
 
@@ -281,61 +321,82 @@ chk() { # chk DESCRIPTION EXPECTED ACTUAL REMEDY
   else warn "FAILED: $1 (expected '$2', got '$3')
   $4"; FAILED=$((FAILED + 1)); fi
 }
-
-# The landmine from step 3 — verify the index actually exists.
-chk "cron claim index present" "1" \
-  "$(q "select 1 from pg_class where relname='cron_run_log_one_running_per_job'")" \
-  "migrate-1.9.0.sql skipped it via its NOTICE handler. Resolve duplicate
-  'running' rows in cron_run_log, then create it by hand:
-    CREATE UNIQUE INDEX CONCURRENTLY cron_run_log_one_running_per_job
-      ON cron_run_log (cron_job_id) WHERE status = 'running';"
-
-chk "audit immutability trigger active" "1" \
-  "$(q "select 1 from pg_trigger where tgname='admin_audit_log_immutable_trg' and not tgisinternal")" \
-  "re-apply the 0071 section of db/1.9.0/migrate-1.9.0.sql."
-
-for t in org_policy_version job_execution event_outbox audit_chain_head \
-         skill_scan skill_attestation skill_qa_run skill_qa_check_result \
-         skill_qa_certification skill_qa_recording; do
-  chk "table $t exists" "1" \
-    "$(q "select 1 from information_schema.tables where table_schema='public' and table_name='$t'")" \
-    "a migration between 1.5.0 and 1.9.0 did not fully apply — check the marker table."
-done
-
-check_col() {
+chk_table() {
+  chk "table $1 exists" "1" \
+    "$(q "select 1 from information_schema.tables where table_schema='public' and table_name='$1'")" \
+    "the migration that creates it did not fully apply — check the marker table."
+}
+chk_col() {
   chk "column $1.$2 exists" "1" \
     "$(q "select 1 from information_schema.columns where table_schema='public' and table_name='$1' and column_name='$2'")" \
     "the migration that adds it did not apply — check the marker table."
 }
-check_col skill deployed
-check_col skill lifecycle_status
-check_col skill qa_baseline_hash
-check_col skill_qa_run fingerprint
-check_col agent_deployment owner_user_id
-check_col admin_audit_log prev_signature
 
-chk "document_chunk org FK is ON DELETE CASCADE" "c" \
-  "$(q "select confdeltype from pg_constraint where conname='document_chunk_organization_id_organization_id_fk' and conrelid='public.document_chunk'::regclass")" \
-  "the 0073 section did not apply."
+if at_least 1.5.0; then
+  chk_table skill_scan; chk_table skill_attestation
+  chk_col skill lifecycle_status
+fi
+if at_least 1.6.0; then
+  chk_table skill_qa_run; chk_table skill_qa_check_result; chk_table skill_qa_certification
+  chk_col skill qa_baseline_hash
+fi
+if at_least 1.7.0; then
+  chk_table skill_qa_recording
+  chk_col skill_qa_run fingerprint
+fi
+if at_least 1.8.0; then
+  chk_col skill deployed
+fi
+if at_least 1.9.0; then
+  chk_table org_policy_version; chk_table job_execution
+  chk_table event_outbox;      chk_table audit_chain_head
+  chk_col agent_deployment owner_user_id
+  chk_col admin_audit_log prev_signature
 
-chk "audit chain head seeded" "1" \
-  "$(q "select 1 from audit_chain_head where id=1")" \
-  "insert it: INSERT INTO audit_chain_head (id, head_signature) VALUES (1,'') ON CONFLICT DO NOTHING;"
+  # The landmine from step 3 — verify the index actually exists.
+  chk "cron claim index present" "1" \
+    "$(q "select 1 from pg_class where relname='cron_run_log_one_running_per_job'")" \
+    "migrate-1.9.0.sql skipped it via its NOTICE handler. Resolve duplicate
+  'running' rows in cron_run_log, then create it by hand:
+    CREATE UNIQUE INDEX CONCURRENTLY cron_run_log_one_running_per_job
+      ON cron_run_log (cron_job_id) WHERE status = 'running';"
 
-# Grants: the reason apply_migrations re-runs grants.sql. A VM provisioned at an
-# older release would otherwise have no privileges on tables created since.
-chk "neo_gen can write job_execution" "t" \
-  "$(q "select has_table_privilege('neo_gen','public.job_execution','INSERT')")" \
-  "re-apply grants:  ./compose.sh exec -T postgres psql -U neogen_admin -d neogen < db/$TARGET_VER/grants.sql"
-chk "neo_gen can read the drizzle schema" "t" \
-  "$(q "select has_schema_privilege('neo_gen','drizzle','USAGE')")" \
-  "re-apply grants (see above) — the ADR-0038 block lives in db/$TARGET_VER/grants.sql."
+  chk "audit immutability trigger active" "1" \
+    "$(q "select 1 from pg_trigger where tgname='admin_audit_log_immutable_trg' and not tgisinternal")" \
+    "re-apply the 0071 section of db/1.9.0/migrate-1.9.0.sql."
 
-for v in 1.5.0 1.6.0 1.7.0 1.8.0 1.9.0; do
-  chk "migrate-$v.sql recorded" "1" \
-    "$(q "select 1 from public.deploy_schema_migrations where filename='migrate-$v.sql'")" \
+  chk "document_chunk org FK is ON DELETE CASCADE" "c" \
+    "$(q "select confdeltype from pg_constraint where conname='document_chunk_organization_id_organization_id_fk' and conrelid='public.document_chunk'::regclass")" \
+    "the 0073 section did not apply."
+
+  chk "audit chain head seeded" "1" \
+    "$(q "select 1 from audit_chain_head where id=1")" \
+    "insert it: INSERT INTO audit_chain_head (id, head_signature) VALUES (1,'') ON CONFLICT DO NOTHING;"
+
+  # Grants: the reason apply_migrations re-runs grants.sql. A VM provisioned at
+  # an older release would otherwise have no privileges on tables created since.
+  chk "neo_gen can write job_execution" "t" \
+    "$(q "select has_table_privilege('neo_gen','public.job_execution','INSERT')")" \
+    "re-apply grants:  ./compose.sh exec -T postgres psql -U neogen_admin -d neogen < db/$TARGET_VER/grants.sql"
+  chk "neo_gen can read the drizzle schema" "t" \
+    "$(q "select has_schema_privilege('neo_gen','drizzle','USAGE')")" \
+    "re-apply grants (see above) — the ADR-0038 block lives in db/$TARGET_VER/grants.sql."
+fi
+if at_least 1.10.0; then
+  # Better Auth names this column in its explicit select list, so an image
+  # carrying 0077 without this column 42703s inside getSession() — a total
+  # login outage, not a degraded page.
+  chk_col session mfa_verified_at
+fi
+
+# Every migration in scope must now be recorded.
+while IFS= read -r f <&3; do
+  [ -n "$f" ] || continue
+  base=$(basename "$f")
+  chk "$base recorded" "1" \
+    "$(q "select 1 from public.deploy_schema_migrations where filename='${base//\'/\'\'}'")" \
     "re-run ./migrate.sh."
-done
+done 3< <(migration_files_through "$TARGET_VER")
 
 # ── The losslessness assertion ──────────────────────────────────────────────
 hdr "Data preservation"
@@ -376,5 +437,9 @@ ok "database schema is at $TARGET_VER ($(table_count) tables); all data preserve
 log "baseline kept for reference: $SNAPSHOT (and ${SNAPSHOT}.after)"
 log ""
 log "NEXT:"
-log "  1. set AUDIT_SIGNING_KEY in ./.env.app (before the first audit row is written)"
-log "  2. roll the app onto the matching image:  ./update.sh"
+if at_least 1.9.0 && pending_has "migrate-1.9.0.sql"; then
+  log "  1. set AUDIT_SIGNING_KEY in ./.env.app (before the first audit row is written)"
+  log "  2. roll the app onto the matching image:  ./update.sh"
+else
+  log "  roll the app onto the matching image:  ./update.sh"
+fi
