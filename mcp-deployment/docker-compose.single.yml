@@ -1,0 +1,101 @@
+# =============================================================================
+# SharePoint MCP — ONE container, all eleven sites.
+#
+# The eleven-container stack in `docker-compose.yml` exists because the site
+# was baked into each container's environment. It no longer has to be: the
+# site registry is a list, and in delegated mode the caller's identity arrives
+# per request rather than being a property of the process. So one container
+# serves every site.
+#
+# BOTH FILES ARE KEPT ON PURPOSE. The rollout runs them side by side:
+#
+#   1. bring this up beside the eleven, on port 8000
+#   2. register it in the NXPi MCP Configuration UI as a twelfth server
+#   3. verify against it (see docs/auth_guide.md for the negative control)
+#   4. re-point the app at it and retire the other eleven
+#
+# Retiring them is `docker compose -f docker-compose.yml down` and deleting
+# that file plus `envs/mcp-*.env`; nothing here depends on them.
+#
+#   docker compose -f docker-compose.single.yml up -d
+#
+# WHY THIS IS CHEAPER THAN ELEVEN, beyond the obvious:
+#
+#   * `MAX_CONCURRENT_SEARCHES` finally binds. It is a per-PROCESS ceiling of
+#     6, so eleven containers could put 66 concurrent searches on one tenant —
+#     against a tenant that already answers TenantRequestThrottled. One
+#     container makes 6 mean 6.
+#   * A default `search_documents` used to cost 2 searches per site, so 22 for
+#     eleven sites. The sites are unioned into one KQL query now: 2, whatever
+#     the site count.
+#   * One warm cache, one authentication backoff, one readiness probe.
+#
+# SCALING THIS IS A CORRECTNESS DECISION, NOT ONLY A CAPACITY ONE. The gates
+# are per process, so N replicas make `MAX_CONCURRENT_SEARCHES` 6N at one
+# tenant and reintroduce exactly what consolidation removes. If you need
+# replicas, divide the gate settings by the replica count.
+#
+# AUTHENTICATION. `AUTH_MODE` in ./.env decides whose permissions the server
+# reads with, and it is read once at startup — never per request.
+#
+#   app        (default) the application's own credentials. Every caller sees
+#              whatever the app registration can see. Endpoints are
+#              UNAUTHENTICATED: keep the port closed inbound in the Azure NSG.
+#   delegated  the signed-in user's. Requires MCP_RESOURCE_AUDIENCE and
+#              MCP_RESOURCE_URL; the server then refuses any call that does
+#              not carry a token issued for it. See docs/auth_guide.md.
+# =============================================================================
+name: sharepoint-mcp-single
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  mcp-sharepoint:
+    image: ghcr.io/negentrophi/ms-sharepoint-mcp:${MCP_IMAGE_TAG:-latest}
+    container_name: mcp-sharepoint
+    # ./.env first, so the per-site file wins on any overlap — the same
+    # layering the eleven-container stack uses.
+    env_file: [./.env, envs/mcp-all.env]
+    environment:
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8000
+    ports:
+      - "${MCP_BIND_IP:-0.0.0.0}:8000:8000"
+    restart: unless-stopped
+    logging: *logging
+    security_opt:
+      - "no-new-privileges:true"
+    # Non-root python process (uid 1001, set in the Dockerfile) on an
+    # unprivileged port — no Linux capabilities needed.
+    cap_drop:
+      - ALL
+    # python:3.11-slim has neither wget nor curl, so this uses urllib.
+    # /ready answers from cached state and makes no Graph call, for the reason
+    # it always has: a probe must not become the load source it is watching
+    # for. In delegated mode it checks the tenant's cached token-signing keys
+    # instead of an application token, since there is no longer one to check.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+    # Eleven containers had 512m each (finance 3g) — 8.6 GB of limits for a
+    # fleet whose per-request cost this consolidation does not change. What
+    # changes is the request RATE one process carries.
+    #
+    # 2g is a starting point, not a measurement. The bound that decides it is
+    # MAX_CONCURRENT_DOWNLOADS (8) x STREAM_TO_DISK_MB (10) for resident
+    # download bytes, plus the CPU pool's parse working set. Set it from
+    # `sharepoint_mcp_peak_inflight_calls` and the RSS the load suite reports
+    # once this is carrying real traffic; the eleven containers are already
+    # exporting that figure today.
+    deploy:
+      resources:
+        limits:
+          memory: ${MCP_MEMORY_LIMIT:-2g}

@@ -4,7 +4,7 @@
 # same registry image; only the per-site env file differs.
 #
 # The image is PULLED from the registry (never built on the VM):
-#   ghcr.io/lpanigrahi/ms-sharepoint-mcp  — pin a tag via MCP_IMAGE_TAG in ./.env
+#   ghcr.io/negentrophi/ms-sharepoint-mcp  — pin a tag via MCP_IMAGE_TAG in ./.env
 # It is built and pushed by GitHub Actions CI (.github/workflows/ci.yml):
 #   merges to main   → :latest and :sha-<commit>
 #   git tags vX.Y.Z  → :X.Y.Z and :X.Y
@@ -67,7 +67,7 @@ x-security: &security
 # [shared, per-site] pair explicitly.
 # ---------------------------------------------------------------------------
 x-mcp-common: &mcp-common
-  image: ghcr.io/lpanigrahi/ms-sharepoint-mcp:${MCP_IMAGE_TAG:-latest}
+  image: ghcr.io/negentrophi/ms-sharepoint-mcp:${MCP_IMAGE_TAG:-latest}
   environment:
     MCP_TRANSPORT: streamable-http
     MCP_HOST: 0.0.0.0

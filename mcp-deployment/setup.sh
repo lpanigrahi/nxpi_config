@@ -10,7 +10,7 @@
 #   1. creates ./.env from .env.example (never overwrites), chmod 600
 #   2. detects the VM's PRIVATE IP and writes MCP_ALLOWED_HOSTS into ./.env
 #      (the app's requests get HTTP 421 without it)
-#   3. pulls ghcr.io/lpanigrahi/ms-sharepoint-mcp and starts the stack
+#   3. pulls ghcr.io/negentrophi/ms-sharepoint-mcp and starts the stack
 #      (never builds — pin a tag via MCP_IMAGE_TAG in ./.env)
 #   4. prints the per-site URLs to paste into the app's MCP Configuration UI
 #
@@ -79,7 +79,7 @@ else
   die "cannot talk to the Docker daemon (is Docker installed and running?)"
 fi
 
-log "pulling ghcr.io/lpanigrahi/ms-sharepoint-mcp…"
+log "pulling ghcr.io/negentrophi/ms-sharepoint-mcp…"
 $DOCKER compose pull || die "image pull failed. If the GHCR package is private, log in first:
     echo \$GHCR_TOKEN | $DOCKER login ghcr.io -u <github-user> --password-stdin
   (PAT with read:packages), then re-run ./setup.sh"
