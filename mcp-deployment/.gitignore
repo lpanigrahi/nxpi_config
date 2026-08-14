@@ -1,2 +1,4 @@
 # Live credentials never leave the VM.
 .env
+# Delegated-mode variant also holds the live client secret — never commit.
+.env.delegated
