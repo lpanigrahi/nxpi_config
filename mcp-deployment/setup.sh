@@ -3,22 +3,32 @@
 # setup.sh — single-command, idempotent setup for the standalone SharePoint
 # MCP stack (fully isolated from the NXPi app stack next door).
 #
-#   ./setup.sh              # env file + IP detection + pull + up + prints URLs
+#   ./setup.sh              # env file + IP detection + pull + up + prints URL
 #   MCP_IP=10.0.0.4 ./setup.sh   # override the auto-detected private IP
+#
+# NEW DESIGN: ONE container serves all eleven sites (docker-compose.single.yml
+# + envs/mcp-all.env). The old eleven-container stack (docker-compose.yml) is
+# retired — this script brings it DOWN if it is still running, so the VM
+# converges to exactly one mcp-sharepoint container on port 8000.
 #
 # What it does (each step skips itself when already done):
 #   1. creates ./.env from .env.example (never overwrites), chmod 600
 #   2. detects the VM's PRIVATE IP and writes MCP_ALLOWED_HOSTS into ./.env
 #      (the app's requests get HTTP 421 without it)
-#   3. pulls ghcr.io/negentrophi/ms-sharepoint-mcp and starts the stack
+#   3. retires the legacy eleven-container stack if it is running
+#   4. pulls ghcr.io/negentrophi/ms-sharepoint-mcp and starts the container
 #      (never builds — pin a tag via MCP_IMAGE_TAG in ./.env)
-#   4. prints the per-site URLs to paste into the app's MCP Configuration UI
+#   5. prints the ONE URL to paste into the app's MCP Configuration UI
 #
 # The app stack (azure-deployment/) is NEVER touched by this script.
 # =============================================================================
 set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR"
+
+# The consolidated stack. Every compose call names the file explicitly so the
+# legacy docker-compose.yml (kept for rollback) is never picked up by default.
+COMPOSE_FILE="docker-compose.single.yml"
 
 # ── Logging (same conventions as azure-deployment/lib.sh) ────────────────────
 if [ -t 1 ]; then
@@ -62,14 +72,12 @@ else
 fi
 ok "MCP_ALLOWED_HOSTS=${ALLOWED}"
 
-# ── 2b. Per-site env files ───────────────────────────────────────────────────
-# compose refuses to start ANY service if one listed env_file is missing.
-for site in rd manufacturing qa sales hr finance logistics gm ir scm nei; do
-  [ -f "envs/mcp-${site}.env" ] || die "envs/mcp-${site}.env is missing — restore it (it is tracked in git) before starting the stack"
-done
-ok "all 11 envs/mcp-*.env files present"
+# ── 2b. Site registry ────────────────────────────────────────────────────────
+# compose refuses to start the service if a listed env_file is missing.
+[ -f envs/mcp-all.env ] || die "envs/mcp-all.env is missing — restore it (it is tracked in git) before starting the stack"
+ok "envs/mcp-all.env present (all eleven sites, one container)"
 
-# ── 3. Pull + start ──────────────────────────────────────────────────────────
+# ── 3. Docker + retire the legacy eleven-container stack ─────────────────────
 # docker | sudo docker (fresh installs: the docker group needs a re-login)
 if docker info >/dev/null 2>&1; then DOCKER="docker"
 elif sudo -n true 2>/dev/null && sudo docker info >/dev/null 2>&1; then
@@ -79,48 +87,51 @@ else
   die "cannot talk to the Docker daemon (is Docker installed and running?)"
 fi
 
+# The old stack ran eleven mcp-* containers under project `sharepoint-mcp`.
+# One process now carries the whole load, and the concurrency gates assume it
+# is alone (see docker-compose.single.yml) — so the two must not run together.
+LEGACY=$($DOCKER ps -aq --filter "label=com.docker.compose.project=sharepoint-mcp" | wc -l | tr -d ' ')
+if [ "$LEGACY" -gt 0 ]; then
+  log "retiring the legacy eleven-container stack (${LEGACY} containers)…"
+  if [ -f docker-compose.yml ]; then
+    $DOCKER compose -f docker-compose.yml down
+  else
+    $DOCKER ps -aq --filter "label=com.docker.compose.project=sharepoint-mcp" | xargs -r $DOCKER rm -f
+  fi
+  ok "legacy stack retired"
+fi
+
+# ── 4. Pull + start ──────────────────────────────────────────────────────────
 log "pulling ghcr.io/negentrophi/ms-sharepoint-mcp…"
-$DOCKER compose pull || die "image pull failed. If the GHCR package is private, log in first:
+$DOCKER compose -f "$COMPOSE_FILE" pull || die "image pull failed. If the GHCR package is private, log in first:
     echo \$GHCR_TOKEN | $DOCKER login ghcr.io -u <github-user> --password-stdin
   (PAT with read:packages), then re-run ./setup.sh"
-log "starting the stack…"
-$DOCKER compose up -d
-ok "stack is up"
+log "starting the container…"
+$DOCKER compose -f "$COMPOSE_FILE" up -d
+ok "stack is up (one container: mcp-sharepoint)"
 
-# ── 4. Summary ───────────────────────────────────────────────────────────────
+# ── 5. Summary ───────────────────────────────────────────────────────────────
 printf '\n'
 MISSING=""
 for key in TENANT_ID CLIENT_ID CLIENT_SECRET; do
   grep -Eq "^${key}=.+" .env || MISSING="${MISSING} ${key}"
 done
 if [ -n "$MISSING" ]; then
-  warn "Graph credentials are NOT fully set (missing:${MISSING}) — the servers"
-  warn "are up but every tool call will fail. Edit ./.env, then"
-  warn "restart:  $DOCKER compose up -d"
+  warn "Graph credentials are NOT fully set (missing:${MISSING}) — the server"
+  warn "is up but every tool call will fail. Edit ./.env, then"
+  warn "restart:  $DOCKER compose -f $COMPOSE_FILE up -d"
   printf '\n'
 fi
-ok "MCP Configuration UI → add ONE server PER SITE:"
-while IFS='|' read -r port site; do
-  ok "    ${site}"
-  ok "        { \"url\": \"http://${IP}:${port}/mcp\" }"
-done <<EOF
-8001|SharePoint R&D
-8002|SharePoint Manufacturing
-8003|SharePoint QA
-8004|SharePoint Sales
-8005|SharePoint HR
-8006|SharePoint Finance
-8007|SharePoint Logistics
-8008|SharePoint GM
-8009|SharePoint IR
-8010|SharePoint SCM
-8011|SharePoint NEI
-EOF
+ok "MCP Configuration UI → register ONE server (it serves all eleven sites;"
+ok "the model picks a department via the site_name argument):"
+ok "    SharePoint"
+ok "        { \"url\": \"http://${IP}:8000/mcp\" }"
 printf '\n'
 log "Verify:"
-log "  $DOCKER compose ps                            # all 11 healthy?"
-log "  $DOCKER compose logs mcp-hr | grep -i auth    # 'Authentication successful' (per site)"
+log "  $DOCKER compose -f $COMPOSE_FILE ps                          # healthy?"
+log "  $DOCKER compose -f $COMPOSE_FILE logs mcp-sharepoint | grep -i auth"
+log "  # list_available_sites should return all eleven site names"
 printf '\n'
-warn "Azure NSG: keep ports 8001-8011 CLOSED inbound (default-deny). The"
-warn "endpoints are unauthenticated — the NSG and MCP_ALLOWED_HOSTS are the"
-warn "only guards."
+warn "Azure NSG: keep port 8000 CLOSED inbound (default-deny). In app mode the"
+warn "endpoint is unauthenticated — the NSG and MCP_ALLOWED_HOSTS are the only"
+warn "guards. (Delegated mode adds bearer-token auth; see .env.delegated.)"
