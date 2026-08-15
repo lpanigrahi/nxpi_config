@@ -37,7 +37,7 @@ on the VM by the public `nxpi-hash` helper. Nothing clones or builds the app.
 | `install.sh` | Single-command idempotent installer / converger |
 | `update.sh` | Pull latest image → schema sync → roll → health gate → auto-rollback |
 | `migrate.sh` | Schema-ONLY migration of the existing database — never initializes, never touches data rows |
-| `upgrade-db.sh` | Guided multi-release upgrade of an existing database to a shipped `db/<version>` (newest by default): pre-checks, row-count snapshot, `migrate.sh`, then verifies every expected object and that nothing was lost |
+| `upgrade-db.sh` | Guided multi-release upgrade of an existing database to a shipped `db/<version>` (newest by default): data pre-checks, row-count snapshot, `migrate.sh`, then verifies every expected object and that nothing was lost |
 | `backup.sh` | `pg_dump` + uploads-volume archive + retention (cron-able) |
 | `restore.sh` | Restore a backup (destructive, `--yes`-gated, health-gated) |
 | `compose.sh` | Pin-honoring `docker compose` wrapper — use it for all manual compose operations |
@@ -117,9 +117,9 @@ from the image tag; set `DB_VERSION` explicitly when the tag is `:latest`.
 
 ```bash
 # deterministic, recommended for production (immutable per-commit tag):
-APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:sha-80c736a   DB_VERSION=1.10.0
+APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:sha-80c736a   DB_VERSION=1.11.0
 # newest build — pin the artifact version explicitly:
-APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:latest        DB_VERSION=1.10.0
+APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:latest        DB_VERSION=1.11.0
 ```
 
 Moving/suffixed tags (`latest`, `main`, `sha-<short>`, `<pkgver>-main.<sha>`)
@@ -174,6 +174,38 @@ and after a successful migration run the release's `grants.sql` is
 **re-applied** (idempotent) so the app role picks up grants that only newer
 releases carry.
 
+### Upgrading to db 1.11.0 (additive — rolling path)
+
+`db/1.11.0/migrate-1.11.0.sql` bundles app migrations 0078 and 0079: the
+`organization_entitlement` table (per-org entitlement override that can *raise*
+a cap above the plan's, ADR-0073) and two partial UNIQUE indexes that make the
+billing webhook and org invites idempotent. Additive, no backfill, arrives
+empty — deliberately **not** REQUIRES-REVIEW, so `./update.sh` applies it with
+no maintenance window.
+
+**Apply this BEFORE (or with) any image carrying app migration 0078.**
+`resolveOrgEntitlement` sits on the org-quota path that *every inference
+request* walks, so an image ahead of this delta `42P01`s there.
+
+```bash
+# 1. set DB_VERSION=1.11.0 in ./.env
+# 2. rolling, additive-only path (auto-rollback intact):
+./update.sh
+```
+
+**If the migration stops on duplicate data** — `org_invite_pending_email_uq` or
+`invoice_org_external_id_uq` "cannot be created" — that is this delta's own
+pre-flight guard, not a failure. Nothing was applied: the whole file rolls back
+in one transaction and is not stamped. The delta refuses to delete rows to make
+an index fit, because `migrate.sh` is additive-only by contract, so the data is
+yours to resolve deliberately. Duplicate *pending* invites are expected on a VM
+with invite churn — re-inviting after an invite expired leaves both rows
+pending. The error names the query that lists the offending groups.
+
+`./upgrade-db.sh` checks both tables during **preflight** instead, so
+`./upgrade-db.sh --dry-run` reports the problem before anything is backed up,
+migrated, or written to `./.env`.
+
 ### Upgrading to db 1.10.0 (additive — rolling path)
 
 `db/1.10.0/migrate-1.10.0.sql` bundles app migration 0077: one nullable column,
@@ -200,7 +232,7 @@ and will refuse — that one is REQUIRES-REVIEW. Either take the guided path,
 which handles both in one run:
 
 ```bash
-./upgrade-db.sh            # walks 1.5.0 → 1.10.0, gating 1.9.0 for review
+./upgrade-db.sh            # walks 1.5.0 → newest, gating 1.9.0 for review
 ```
 
 …or take 1.9.0 through the maintenance path below, then re-run `./update.sh`.
@@ -239,11 +271,15 @@ It adds no migration logic of its own — it calls `./migrate.sh` — but it:
   never created — the app then fails at runtime with *"no unique or exclusion
   constraint matching the ON CONFLICT specification"* and nothing in the marker
   table hints at it;
-* **snapshots every table's row count** to `backups/pre-1.9.0-rowcounts.txt`
-  before migrating and re-compares afterwards, so "no data was lost" is
-  verified rather than assumed;
+* **pre-checks `invoice` and `org_invite` for duplicates** when
+  `migrate-1.11.0.sql` is pending. That delta fails *closed* on them rather
+  than deleting rows to make its UNIQUE indexes fit, so without this check the
+  stop arrives only after a full backup has been taken;
+* **snapshots every table's row count** to
+  `backups/pre-<version>-rowcounts.txt` before migrating and re-compares
+  afterwards, so "no data was lost" is verified rather than assumed;
 * **verifies the result** — every table, column, index, trigger and FK the
-  1.5.0–1.9.0 deltas should have produced, plus that `grants.sql` actually
+  deltas in scope should have produced, plus that `grants.sql` actually
   reached the new tables — and refuses to declare success if any check fails.
 
 **Manual equivalent**, if you prefer to drive it yourself:
@@ -385,7 +421,7 @@ docker run --rm -v "$PWD":/pkg:ro ubuntu:24.04 \
 | Symptom | Cause / fix |
 |---|---|
 | `install.sh` dies at image pull with auth error | The GHCR package is private: `echo $PAT \| docker login ghcr.io -u <user> --password-stdin` (PAT scope `read:packages`), re-run. |
-| `install.sh` dies: "APP_IMAGE tag is X but DB_VERSION=Y" | `assert_version_alignment` refuses a mismatch on purpose — it only fires for an exact `X.Y.Z` image tag (moving tags like `latest`/`main`/`sha-…`/`<ver>-main.<sha>` skip it and rely on `DB_VERSION`). Note the app version and the DB artifact version advance INDEPENDENTLY — `package.json` is at 1.2.0 while `db/` reaches 1.9.0, because a release that ships no migration does not add a `db/<ver>/` folder. Set `DB_VERSION` explicitly rather than letting it derive from the tag. |
+| `install.sh` dies: "APP_IMAGE tag is X but DB_VERSION=Y" | `assert_version_alignment` refuses a mismatch on purpose — it only fires for an exact `X.Y.Z` image tag (moving tags like `latest`/`main`/`sha-…`/`<ver>-main.<sha>` skip it and rely on `DB_VERSION`). Note the app version and the DB artifact version advance INDEPENDENTLY — `package.json` is at 1.2.0 while `db/` reaches 1.11.0, because a release that ships no migration does not add a `db/<ver>/` folder. Set `DB_VERSION` explicitly rather than letting it derive from the tag. |
 | `install.sh` dies: "no SQL artifacts found under ./db" | The `db/<version>/` folder for your image tag isn't present. Set `DB_VERSION` in `.env` to a version that exists under `db/`, or pull the matching release of this repo. |
 | Seed step: "could not compute the admin hash" | The `nxpi-hash` helper image isn't pullable. `docker pull ghcr.io/negentrophi/nxpi-hash:latest` (published by the app repo's ci.yml; or set `NXPI_HASH_IMAGE`), then re-run. |
 | `install.sh` dies: "existing data volume found but no secrets" | You are adopting data from a previous deployment — copy its `secrets/` directory here (new random secrets can't open old data), or `docker compose down -v` to start fresh (destroys all data). |
