@@ -35,7 +35,7 @@
 # A REQUIRES-REVIEW delta in scope (currently 1.9.0's document_chunk FK cascade)
 # is surfaced with its own header text and needs an explicit confirmation; the
 # rolling ./update.sh path refuses those by design. Purely additive targets
-# (e.g. 1.10.0, 1.11.0) need no such gate.
+# (e.g. 1.10.0, 1.11.0, 1.12.0) need no such gate.
 #
 # Afterwards, roll the matching app image with ./update.sh.
 # =============================================================================
@@ -56,7 +56,7 @@ while [ $# -gt 0 ]; do
     --dry-run)               DRY_RUN=true ;;
     --adopt-schema-version)  shift; [ $# -gt 0 ] || die "--adopt-schema-version needs a value (e.g. 1.4.0)"; ADOPT="${1#v}" ;;
     --adopt-schema-version=*) ADOPT="${1#*=}"; ADOPT="${ADOPT#v}" ;;
-    -h|--help)               grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,36p'; exit 0 ;;
+    -h|--help)               grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,40p'; exit 0 ;;
     -*)                      die "unknown flag: $1 (see --help)" ;;
     *)                       [ -z "$TARGET_VER" ] || die "give at most one target version (got '$TARGET_VER' and '$1')"
                              TARGET_VER="${1#v}" ;;
@@ -184,7 +184,8 @@ if [ "$MARKER_N" = "0" ]; then
       skill.deployed      exists ⇒ at least 1.8.0
       job_execution       exists ⇒ at least 1.9.0
       session.mfa_verified_at    ⇒ at least 1.10.0
-      organization_entitlement   ⇒ at least 1.11.0"
+      organization_entitlement   ⇒ at least 1.11.0
+      user.locked_until          ⇒ at least 1.12.0"
 
   STAMPED=""; EXECUTED=""
   while IFS= read -r f <&3; do
@@ -359,7 +360,7 @@ if [ -n "$DESTRUCTIVE_FILE" ]; then
   sed -n '1,12p' "$DESTRUCTIVE_FILE" | sed 's/^/  /'
   cat <<'EOF'
 
-  Reviewed for data loss across 1.5.0 → 1.11.0: there is no DROP TABLE, DROP
+  Reviewed for data loss across 1.5.0 → 1.12.0: there is no DROP TABLE, DROP
   COLUMN, TRUNCATE or unguarded DELETE anywhere in that range. Every NOT NULL
   column added carries a default, so existing rows are grandfathered without a
   table rewrite. The flag is about CHANGED BEHAVIOUR, not migration-time loss.
@@ -481,6 +482,16 @@ if at_least 1.11.0; then
   chk "neo_gen can write organization_entitlement" "t" \
     "$(q "select has_table_privilege('neo_gen','public.organization_entitlement','INSERT')")" \
     "re-apply grants:  ./compose.sh exec -T postgres psql -U neogen_admin -d neogen < db/$TARGET_VER/grants.sql"
+fi
+if at_least 1.12.0; then
+  # Account lockout (0080). Once an admin enables the policy the sign-in route
+  # reads user.locked_until on EVERY attempt, so an image carrying 0080 without
+  # these columns 42703s there — a total login outage, as with 1.10.0's
+  # session.mfa_verified_at. No grants check: these are columns on an existing
+  # table, so they inherit "user"'s privileges rather than needing new ones.
+  chk_col user failed_login_attempts
+  chk_col user last_failed_login_at
+  chk_col user locked_until
 fi
 
 # Every migration in scope must now be recorded.

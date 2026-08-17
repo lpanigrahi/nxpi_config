@@ -64,10 +64,14 @@ on the VM by the public `nxpi-hash` helper. Nothing clones or builds the app.
    ```bash
    ssh azureuser@<vm-ip>
    git clone https://github.com/lpanigrahi/nxpi_config.git
-   cd nxpi_config/azure-deployment
+   cd nxpi_config
    cp .env.example .env
    ```
-   Update  .env file with machine IP , userid and password
+   Update the `.env` file with the machine IP, admin email, and (optionally)
+   password. The per-release SQL bundle is also published as an OCI artifact —
+   `oras pull ghcr.io/negentrophi/nxpi_dev/db:<version>` fetches
+   `schema.sql`/`grants.sql`/`seed.sql` for a version this repo doesn't carry
+   (the day-2 `migrate-*.sql` deltas ship only here).
 
 3. **Run the installer:**
 
@@ -87,9 +91,10 @@ on the VM by the public `nxpi-hash` helper. Nothing clones or builds the app.
    ./compose.sh up -d app
    ```
 
-5. **Log in** at the URL the installer printed. The super admin email defaults
-   to `admin@example.com` (set `SUPER_ADMIN_EMAIL` in `.env` to your own
-   address before the first install). Leave `SUPER_ADMIN_PASSWORD` unset and
+5. **Log in** at the URL the installer printed. `.env.example` ships
+   `SUPER_ADMIN_EMAIL=admin@negentrophi.com` — set it to your own address
+   before the first install (if the key is absent entirely, `install.sh` falls
+   back to `admin@example.com`). Leave `SUPER_ADMIN_PASSWORD` unset and
    the installer **generates a strong password and prints it once** in its
    summary — capture it, then change it after first login.
 
@@ -117,9 +122,9 @@ from the image tag; set `DB_VERSION` explicitly when the tag is `:latest`.
 
 ```bash
 # deterministic, recommended for production (immutable per-commit tag):
-APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:sha-80c736a   DB_VERSION=1.11.0
+APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:sha-80c736a   DB_VERSION=1.12.0
 # newest build — pin the artifact version explicitly:
-APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:latest        DB_VERSION=1.11.0
+APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:latest        DB_VERSION=1.12.0
 ```
 
 Moving/suffixed tags (`latest`, `main`, `sha-<short>`, `<pkgver>-main.<sha>`)
@@ -173,6 +178,38 @@ failure rolls the whole file back — the database is never left half-migrated),
 and after a successful migration run the release's `grants.sql` is
 **re-applied** (idempotent) so the app role picks up grants that only newer
 releases carry.
+
+### Upgrading to db 1.12.0 (additive — rolling path)
+
+`db/1.12.0/migrate-1.12.0.sql` bundles app migration 0080: three columns on
+`"user"` (`failed_login_attempts`, `last_failed_login_at`, `locked_until`)
+backing account lockout after repeated failed sign-ins. Additive, no backfill,
+metadata-only (the `DEFAULT 0` is a constant, so PostgreSQL 11+ records it in
+the catalog and never rewrites the table) — deliberately **not**
+REQUIRES-REVIEW, so `./update.sh` applies it with no maintenance window.
+
+**Apply this BEFORE (or with) any image carrying app migration 0080.** Once an
+admin enables lockout, the sign-in route reads `user.locked_until` on *every*
+attempt, so an image ahead of this delta `42703`s there — a total login outage,
+the same blast radius as 1.10.0's `session.mfa_verified_at`.
+
+The columns are deliberately **not** part of the Better Auth user model, so an
+*older* image is unaffected by them: this delta is safe to apply ahead of the
+image roll with `./migrate.sh`. The feature stays inert until it is switched on
+— the stored policy defaults to disabled, and `ACCOUNT_LOCKOUT_ENABLED=false`
+in `./.env.app` is a hard kill switch that overrides the stored setting (and
+the break-glass route back in if a lock on your only super admin is what is
+keeping you out of the console).
+
+```bash
+# 1. set DB_VERSION=1.12.0 in ./.env
+# 2. rolling, additive-only path (auto-rollback intact):
+./update.sh
+```
+
+This delta creates no unique index, so unlike 1.11.0 it has no live-data
+pre-check to fail on — an `ADD COLUMN` with a constant default cannot conflict
+with existing rows. `./upgrade-db.sh` still verifies all three columns landed.
 
 ### Upgrading to db 1.11.0 (additive — rolling path)
 
@@ -421,7 +458,7 @@ docker run --rm -v "$PWD":/pkg:ro ubuntu:24.04 \
 | Symptom | Cause / fix |
 |---|---|
 | `install.sh` dies at image pull with auth error | The GHCR package is private: `echo $PAT \| docker login ghcr.io -u <user> --password-stdin` (PAT scope `read:packages`), re-run. |
-| `install.sh` dies: "APP_IMAGE tag is X but DB_VERSION=Y" | `assert_version_alignment` refuses a mismatch on purpose — it only fires for an exact `X.Y.Z` image tag (moving tags like `latest`/`main`/`sha-…`/`<ver>-main.<sha>` skip it and rely on `DB_VERSION`). Note the app version and the DB artifact version advance INDEPENDENTLY — `package.json` is at 1.2.0 while `db/` reaches 1.11.0, because a release that ships no migration does not add a `db/<ver>/` folder. Set `DB_VERSION` explicitly rather than letting it derive from the tag. |
+| `install.sh` dies: "APP_IMAGE tag is X but DB_VERSION=Y" | `assert_version_alignment` refuses a mismatch on purpose — it only fires for an exact `X.Y.Z` image tag (moving tags like `latest`/`main`/`sha-…`/`<ver>-main.<sha>` skip it and rely on `DB_VERSION`). Note the app version and the DB artifact version advance INDEPENDENTLY — `package.json` is at 1.2.0 while `db/` reaches 1.12.0, because a release that ships no migration does not add a `db/<ver>/` folder. Set `DB_VERSION` explicitly rather than letting it derive from the tag. |
 | `install.sh` dies: "no SQL artifacts found under ./db" | The `db/<version>/` folder for your image tag isn't present. Set `DB_VERSION` in `.env` to a version that exists under `db/`, or pull the matching release of this repo. |
 | Seed step: "could not compute the admin hash" | The `nxpi-hash` helper image isn't pullable. `docker pull ghcr.io/negentrophi/nxpi-hash:latest` (published by the app repo's ci.yml; or set `NXPI_HASH_IMAGE`), then re-run. |
 | `install.sh` dies: "existing data volume found but no secrets" | You are adopting data from a previous deployment — copy its `secrets/` directory here (new random secrets can't open old data), or `docker compose down -v` to start fresh (destroys all data). |

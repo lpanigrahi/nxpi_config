@@ -4,7 +4,9 @@
 # Timestamped ./.env copies taken by upgrade-db.sh before it edits DB_VERSION
 # — same live config, same secrecy.
 .env.bak-*
-# Certificate bundles (contain the private key) — consumed by generate-certs.sh.
+# Certificate material (custom-cert mode). The .pfx bundle contains the private
+# key and is consumed by generate-certs.sh; the extracted key/cert land in
+# certs/, which carries its own .gitignore so only its README is tracked.
 *.pfx
 backups/*
 !backups/.gitkeep
