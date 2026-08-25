@@ -354,5 +354,38 @@ t "argv always carries the stanza" "--stanza=neogen backup --type=full" \
 t "argv with no extra args still names the stanza" "--stanza=neogen info" \
   "$(pgbackrest_argv neogen info)"
 
+# ── volume_device(): Docker's "<no value>" must normalize to EMPTY ───────────
+# The bug this guards: `--format '{{.Options.device}}'` renders an unpinned
+# volume's absent Options map as the literal string "<no value>". Compared
+# against a compose file that declares no device, placement_verdict saw
+# "" != "<no value>" and returned `mismatch` — so install.sh refused to
+# converge on EVERY deployment that had not opted into the pinned layout.
+# $DOCKER is a plain variable, so a shell function substitutes for the binary.
+t "volume_device is defined" "function" "$(type -t volume_device 2>/dev/null || echo MISSING)"
+
+fake_docker_noopts() { printf '\n'; }                       # {{if .Options}} false → empty
+fake_docker_literal() { printf '<no value>\n'; }            # a docker that renders it anyway
+fake_docker_pinned() { printf '/srv/pgdata/data\n'; }
+fake_docker_fails()  { return 1; }
+
+DOCKER=fake_docker_noopts
+t "unpinned volume yields empty"            "" "$(volume_device anything)"
+DOCKER=fake_docker_literal
+t "a literal <no value> normalizes to empty" "" "$(volume_device anything)"
+DOCKER=fake_docker_pinned
+t "a pinned volume still yields its device" "/srv/pgdata/data" "$(volume_device anything)"
+DOCKER=fake_docker_fails
+t "a failed inspect yields empty, not an error" "" "$(volume_device anything)"
+
+# The verdict this all feeds, end to end: an unpinned volume against an
+# unpinned compose file is `adopt` — an ordinary existing deployment.
+DOCKER=fake_docker_noopts
+t "unpinned volume + unpinned file = adopt" "adopt" \
+  "$(placement_verdict yes "" "$(volume_device anything)")"
+# …but an unpinned volume against a file that DOES pin must still refuse.
+t "unpinned volume + pinned file = mismatch" "mismatch" \
+  "$(placement_verdict yes /srv/pgdata/data "$(volume_device anything)")"
+unset -f fake_docker_noopts fake_docker_literal fake_docker_pinned fake_docker_fails
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 exit $((FAIL > 0))

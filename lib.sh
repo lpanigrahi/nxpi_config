@@ -509,7 +509,23 @@ placement_verdict() {
 # Impure wrappers — the halves that touch the machine.
 disk_avail_kb()  { parse_kb_avail "$(df -Pk "$1" 2>/dev/null)"; }
 mount_info()     { findmnt -no TARGET,SOURCE,FSTYPE,OPTIONS "$1" 2>/dev/null | head -n1; }
-volume_device()  { $DOCKER volume inspect "$1" --format '{{.Options.device}}' 2>/dev/null || true; }
+# volume_device NAME — the host path an existing volume is bind-pinned to, or
+# empty when it is an ordinary Docker-managed volume.
+#
+# `--format '{{.Options.device}}'` is WRONG here and the way it is wrong is
+# quiet: Docker renders an empty or absent Options map as the literal string
+# "<no value>". That is not a path and it is not empty either, so
+# placement_verdict compares "" against "<no value>", calls it a `mismatch`,
+# and install.sh refuses to converge — on EVERY unpinned deployment, which is
+# every deployment that has not opted into the dedicated-disk layout. Guard on
+# .Options (an empty map is falsy in Go templates) and `index` it, then
+# normalize defensively in case another docker version renders it differently.
+volume_device() {
+  local d
+  d=$($DOCKER volume inspect "$1" --format '{{if .Options}}{{index .Options "device"}}{{end}}' 2>/dev/null) || d=""
+  case "$d" in "<no value>"|"<nil>") d="" ;; esac
+  printf '%s' "$d"
+}
 is_pgdata_dir()  { [ -s "$1/PG_VERSION" ]; }
 
 # The redis tiers, queue first. Two servers with OPPOSITE eviction policies:
