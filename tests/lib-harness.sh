@@ -327,6 +327,17 @@ t "an all-old set still keeps the protected ones" "backups/neogen-1.dump" \
 t "protection is exact, not substring" "backups/neogen-1.dump" \
   "$(prune_keeping $'backups/neogen-1.dump' $'backups/neogen-11.dump')"
 
+# A backup is a dump AND its uploads archive. backup.sh's keep-list once held
+# only neogen-*.dump, so retention kept a database it could restore and deleted
+# the uploads-*.tar.gz that belonged with it — restore.sh --uploads then had
+# nothing to pair with the dump it was handed. The keep-list must carry both
+# kinds; this asserts prune_keeping honours a mixed one.
+PAIRED_CANDIDATES=$'backups/neogen-2.dump\nbackups/uploads-2.tar.gz\nbackups/neogen-1.dump\nbackups/uploads-1.tar.gz'
+PAIRED_KEEP=$'backups/neogen-2.dump\nbackups/uploads-2.tar.gz'
+t "a kept dump keeps its uploads archive too" \
+  "$(printf 'backups/neogen-1.dump\nbackups/uploads-1.tar.gz')" \
+  "$(prune_keeping "$PAIRED_CANDIDATES" "$PAIRED_KEEP")"
+
 # ── pgbackrest helpers ───────────────────────────────────────────────────────
 # PITR is only real once a RESTORE has been rehearsed, so the guardrails here
 # are about refusing to look ready when it is not.

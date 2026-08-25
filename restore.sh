@@ -30,7 +30,7 @@ while [ $# -gt 0 ]; do
     --yes)       CONFIRMED=true ;;
     --no-backup) DO_BACKUP=false ;;
     --uploads)   shift; UPLOADS_TAR="${1:-}"; [ -n "$UPLOADS_TAR" ] || die "--uploads needs a file argument" ;;
-    -h|--help)   grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,15p'; exit 0 ;;
+    -h|--help)   sed -n '2,/^# ===/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
     -*)          die "unknown flag: $1 (see --help)" ;;
     *)           DUMP="$1" ;;
   esac

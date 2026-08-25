@@ -32,7 +32,7 @@ FORCE=false
 for arg in "$@"; do
   case "$arg" in
     --force)      FORCE=true ;;
-    -h|--help)    grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,25p'; exit 0 ;;
+    -h|--help)    sed -n '2,/^# ===/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown flag: $arg (see --help)" ;;
   esac
 done

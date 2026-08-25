@@ -36,7 +36,7 @@ STANZA="$(env_get .env PGBACKREST_STANZA neogen)"
 IMAGE="$(env_get .env POSTGRES_IMAGE '')"
 ARCHIVE_MODE="$(env_get .env POSTGRES_ARCHIVE_MODE off)"
 
-usage() { sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,/^# ===/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit "${1:-0}"; }
 [ $# -ge 1 ] || usage 1
 # Help before init_docker: asking what a script does must not require a working
 # Docker daemon.

@@ -60,7 +60,7 @@ while [ $# -gt 0 ]; do
     --dry-run)               DRY_RUN=true ;;
     --adopt-schema-version)  shift; [ $# -gt 0 ] || die "--adopt-schema-version needs a value (e.g. 1.4.0)"; ADOPT="${1#v}" ;;
     --adopt-schema-version=*) ADOPT="${1#*=}"; ADOPT="${ADOPT#v}" ;;
-    -h|--help)               grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,44p'; exit 0 ;;
+    -h|--help)               sed -n '2,/^# ===/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
     -*)                      die "unknown flag: $1 (see --help)" ;;
     *)                       [ -z "$TARGET_VER" ] || die "give at most one target version (got '$TARGET_VER' and '$1')"
                              TARGET_VER="${1#v}" ;;

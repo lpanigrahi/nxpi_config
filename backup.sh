@@ -33,7 +33,7 @@ for arg in "$@"; do
     # Used by restore.sh when it is about to WIPE the uploads volume: the
     # uploads safety archive must then be a hard requirement, not best-effort.
     --require-uploads) REQUIRE_UPLOADS=true ;;
-    -h|--help)  grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,19p'; exit 0 ;;
+    -h|--help)  sed -n '2,/^# ===/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown flag: $arg (see --help)" ;;
   esac
 done
@@ -109,7 +109,18 @@ if $PRUNE; then
   # delete your LAST dump after a quiet month — age is not a retention policy.
   MIN_KEEP=$(env_get .env BACKUP_MIN_KEEP 3)
   case "$MIN_KEEP" in *[!0-9]*|"") MIN_KEEP=3 ;; esac
-  KEEP_LIST=$(ls -1t backups/neogen-*.dump 2>/dev/null | head -n "$MIN_KEEP" || true)
+  # Keep at least N of EACH artifact kind, not just the dumps. Protecting only
+  # `neogen-*.dump` keeps a database you can restore and deletes the
+  # `uploads-*.tar.gz` that belongs with it — `restore.sh --uploads` then has
+  # nothing to pair with the dump it was handed, which is the same
+  # "your last backup quietly went missing" failure MIN_KEEP exists to stop,
+  # just applied to the attachments instead of the rows. backup.sh writes both
+  # in one run under the same timestamp, so newest-N-of-each IS the paired set.
+  # The `|| true` matters: pipefail makes an unmatched glob fail the pipeline.
+  KEEP_LIST=$(
+    { ls -1t backups/neogen-*.dump    2>/dev/null | head -n "$MIN_KEEP"
+      ls -1t backups/uploads-*.tar.gz 2>/dev/null | head -n "$MIN_KEEP"; } || true
+  )
   CANDIDATES=$(find backups -maxdepth 1 \( -name 'neogen-*.dump' -o -name 'uploads-*.tar.gz' -o -name 'restore-*.log' -o -name 'cron-*.log' \) -mtime +"$RETENTION" 2>/dev/null)
   PRUNED=0
   while IFS= read -r f; do
