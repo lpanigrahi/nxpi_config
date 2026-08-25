@@ -235,6 +235,12 @@ and the app stays down until you run `./install.sh`. The schema sync is
 additive-only, so no data is at risk; it is an availability problem, not a
 correctness one.
 
+One cosmetic consequence, so it does not read as a hang: until `install.sh` has
+created the cache tier, `./update.sh` spends ~30s in its preflight waiting for
+`redis-cache` before warning and proceeding. The wait is warn-only by design —
+an update must never fail because a cache is down — but it is silent while it
+counts down.
+
 Nothing else here is required. The pgvector tuning, memory ceilings and PITR
 switches all default to today's behaviour, and the dedicated-disk layout stays
 opt-in (see [Prerequisites](#prerequisites)).
@@ -521,6 +527,13 @@ retention is `BACKUP_RETENTION_DAYS` (default 7, set in `.env`) with a COUNT
 floor, `BACKUP_MIN_KEEP` (default 3): age alone is not a retention policy, and
 `find -mtime` would otherwise delete your last dump after a quiet month.
 
+The floor keeps the newest N of **each** artifact kind, not N dumps. A backup is
+a dump *and* the uploads archive taken with it — protecting only the dump would
+leave you a database you can restore and nothing for `./restore.sh --uploads` to
+pair with it. Both are written in the same run under the same timestamp, so
+newest-N-of-each is the paired set. Dated `restore-*.log` / `cron-*.log` files
+are age-pruned with no floor, which is what you want for logs.
+
 Set `BACKUP_BLOB_ACCOUNT` + `BACKUP_BLOB_CONTAINER` in `.env` to ship each dump
 off the VM automatically. It uses `--auth-mode login` (the VM's managed
 identity), so no account key sits on disk, and a shipping failure makes the run
@@ -531,7 +544,7 @@ Daily cron:
 
 ```bash
 crontab -e
-# 0 3 * * *  cd $HOME/azure-deployment && ./backup.sh >> "backups/cron-$(date +\%F).log" 2>&1
+# 0 3 * * *  cd $HOME/nxpi_config && ./backup.sh >> "backups/cron-$(date +\%F).log" 2>&1
 ```
 
 Exit codes for cron/automation: `backup.sh` exits **1** when the database
@@ -716,6 +729,8 @@ docker run --rm -v "$PWD":/pkg:ro ubuntu:24.04 \
 | `install.sh` dies: "APP_IMAGE tag is X but DB_VERSION=Y" | `assert_version_alignment` refuses a mismatch on purpose — it only fires for an exact `X.Y.Z` image tag (moving tags like `latest`/`main`/`sha-…`/`<ver>-main.<sha>` skip it and rely on `DB_VERSION`). Note the app version and the DB artifact version advance INDEPENDENTLY — `package.json` is at 1.2.0 while `db/` reaches 1.15.0, because a release that ships no migration does not add a `db/<ver>/` folder. Set `DB_VERSION` explicitly rather than letting it derive from the tag. |
 | `install.sh` dies: "no SQL artifacts found under ./db" | The `db/<version>/` folder for your image tag isn't present. Set `DB_VERSION` in `.env` to a version that exists under `db/`, or pull the matching release of this repo. |
 | Seed step: "could not compute the admin hash" | The `nxpi-hash` helper image isn't pullable. `docker pull ghcr.io/negentrophi/nxpi-hash:latest` (published by the app repo's ci.yml; or set `NXPI_HASH_IMAGE`), then re-run. |
+| `install.sh` dies with a `mismatch` verdict | The volume's actual device disagrees with what `docker-compose.yml` declares. Docker never re-points an existing volume — it refuses on conflicting options — so converging would not move your data. Only reachable once you have uncommented the `driver_opts` blocks; follow [`docs/CUTOVER-RUNBOOK.md`](docs/CUTOVER-RUNBOOK.md). If you have *not* opted in, both sides should read empty — check with `bash -c '. ./lib.sh; compose_volume_device docker-compose.yml postgres-data'`. |
+| Container create fails: `bind source path does not exist: …/secrets/redis_cache_url` | The cache-tier secret was never generated. Run `./install.sh` (idempotent). See [Upgrading THIS PACKAGE](#upgrading-this-package-one-required-step-once) — this surfaces at container *create*, so `compose config` and `--dry-run` do not catch it. |
 | `install.sh` dies: "existing data volume found but no secrets" | You are adopting data from a previous deployment — copy its `secrets/` directory here (new random secrets can't open old data), or `docker compose down -v` to start fresh (destroys all data). |
 | App logs: `FATAL: … not readable by uid 1001` | Secret file permissions drifted. `sudo chown 1001 secrets/{postgres_url,redis_url,redis_cache_url,better_auth_secret} && sudo chmod 400` same files, then `docker compose up -d app`. |
 | Sign-in loops back to the login page (IP mode) | `BETTER_AUTH_COOKIE_SECURE=false` missing from `.env.app`, or `BETTER_AUTH_URL` doesn't exactly match what the browser uses (scheme + host, no trailing slash). |

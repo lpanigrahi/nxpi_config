@@ -14,7 +14,7 @@
 #     az storage blob upload --account-name <acct> -c backups \
 #       -f backups/neogen-<ts>.dump -n neogen-<ts>.dump
 #   Suggested cron (daily 03:00; dated log files are pruned by retention):
-#     0 3 * * *  cd /path/to/azure-deployment && ./backup.sh >> "backups/cron-$(date +\%F).log" 2>&1
+#     0 3 * * *  cd /path/to/nxpi_config && ./backup.sh >> "backups/cron-$(date +\%F).log" 2>&1
 # =============================================================================
 set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)

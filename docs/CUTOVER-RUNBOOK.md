@@ -132,7 +132,7 @@ OS disk, and everything works — on the wrong disk. The `--check` gate in
 ## 4 — Copy secrets FIRST, then install and restore
 
 ```bash
-scp -r secrets/ azureuser@<new-ip>:~/azure-deployment/     # BEFORE install.sh
+scp -r secrets/ azureuser@<new-ip>:~/nxpi_config/          # BEFORE install.sh
 ```
 
 This ordering is not a nicety. `gen_secret` is keep-if-present, so copied
