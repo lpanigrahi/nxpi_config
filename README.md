@@ -767,4 +767,11 @@ mapping.
 
 ## License
 
-Apache License 2.0 — see [`LICENSE`](../LICENSE) at the repository root.
+**Proprietary — all rights reserved.** Copyright (c) 2025 Negentrophi Private
+Limited. See [`LICENSE`](LICENSE).
+
+No license, right, or permission is granted by the presence of this repository.
+Use, execution, copying, modification and redistribution each require prior
+written permission from Negentrophi Private Limited. That applies to the
+deployment scripts and the SQL artifacts under `db/` here, as well as to the
+application image they provision.
