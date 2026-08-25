@@ -7,6 +7,11 @@ documentation, assets, and related materials (collectively, the "Software"),
 are the exclusive intellectual property of Negentrophi Private Limited
 ("Negentrophi"), a company incorporated under the laws of India.
 
+THIS REPOSITORY IS PUBLISHED DELIBERATELY AND CARRIES A LIMITED GRANT. The
+terms below are modified, for the contents of this repository only, by
+ADDENDUM A - DEPLOYMENT PACKAGE GRANT at the end of this file. Read Addendum A
+first: it is what permits an authorized operator to run these scripts.
+
 ================================================================================
 TERMS AND CONDITIONS
 ================================================================================
@@ -101,3 +106,92 @@ To obtain a license or for any other inquiries, contact:
 ================================================================================
 
 Unauthorized use of this Software is strictly prohibited.
+
+
+================================================================================
+ADDENDUM A - DEPLOYMENT PACKAGE GRANT
+================================================================================
+
+This Addendum applies ONLY to the contents of this repository
+(github.com/lpanigrahi/nxpi_config) and prevails over the terms above to the
+extent of any conflict. Anything it does not cover remains subject to those
+terms without modification.
+
+A.1 DEFINITIONS
+
+   "Deployment Package" means the contents of this repository: the shell
+   scripts, the Docker Compose and Caddy configuration, the pgBackRest
+   configuration, the documentation, and the static SQL artifacts under db/.
+
+   "Application Software" means the NXPi application itself, including the
+   container images it is distributed as (ghcr.io/negentrophi/nxpi_dev and
+   related images), its source code, and everything else covered by the terms
+   above. The Application Software is NOT part of the Deployment Package, and
+   nothing in this Addendum grants any right in it.
+
+   "Authorized Operator" means a person or entity holding a current, valid
+   written agreement with Negentrophi permitting it to operate an instance of
+   the Application Software, or acting on such a party's behalf and at its
+   direction.
+
+A.2 GRANT
+
+   Negentrophi grants each Authorized Operator a limited, non-exclusive,
+   non-transferable, non-sublicensable, revocable, royalty-free license to:
+
+   a) use, execute and run the Deployment Package;
+   b) reproduce it internally as needed to deploy and operate the Application
+      Software, including copying it onto the machines it provisions; and
+   c) modify its configuration and its scripts for that party's own internal
+      deployment and operational purposes.
+
+   Paragraph (c) is deliberate and necessary: operating this package REQUIRES
+   editing files within it - creating .env and .env.app from their examples,
+   enabling the dedicated-disk volume options in docker-compose.yml, and
+   completing pgbackrest.conf, among others. Section 2(c) above does not
+   restrict those acts for an Authorized Operator.
+
+   This grant extends to deploying, operating and maintaining the Application
+   Software, and to no other purpose.
+
+A.3 CONFIDENTIALITY DOES NOT APPLY
+
+   Negentrophi publishes the Deployment Package openly. Section 4 above does
+   NOT apply to it: the Deployment Package is not confidential, is not
+   asserted as a trade secret, and no obligation of secrecy attaches to it.
+   Section 4 continues to apply in full to the Application Software.
+
+   The Deployment Package deliberately contains no credentials. The files that
+   would - .env, .env.app, secrets/, certificate material, backups - are
+   excluded from version control and are the operator's own confidential
+   material, never Negentrophi's to publish.
+
+A.4 RESERVATIONS
+
+   Nothing in this Addendum permits any party to:
+
+   a) redistribute, publish, sell, sublicense, rent, lease or otherwise
+      transfer the Deployment Package, or any modified version of it, to a
+      third party;
+   b) remove, alter or obscure any copyright, license or proprietary notice in
+      it, including this file;
+   c) use it to develop, operate or support a product or service that competes
+      with Negentrophi; or
+   d) use, obtain, run or reverse engineer the Application Software. Access to
+      the Application Software is governed solely by the terms above and by any
+      separate written agreement.
+
+A.5 UNCHANGED TERMS
+
+   Sections 3 (Ownership), 5 (No Warranty), 6 (Limitation of Liability),
+   7 (Enforcement), 8 (Termination) and 9 (Governing Law) apply to the
+   Deployment Package in full. In particular, the Deployment Package is
+   provided "AS IS"; it provisions, migrates and can destroy production data;
+   and Negentrophi accepts no liability arising from its use.
+
+A.6 REVOCATION
+
+   Negentrophi may revoke or amend this grant at any time. Revocation is not
+   retroactive as to deployments already made under it in good faith.
+
+================================================================================

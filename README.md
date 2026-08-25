@@ -767,11 +767,28 @@ mapping.
 
 ## License
 
-**Proprietary — all rights reserved.** Copyright (c) 2025 Negentrophi Private
-Limited. See [`LICENSE`](LICENSE).
+**Proprietary.** Copyright (c) 2025 Negentrophi Private Limited. See
+[`LICENSE`](LICENSE) — and read **Addendum A** at the end of it, which is what
+applies to this repository.
 
-No license, right, or permission is granted by the presence of this repository.
-Use, execution, copying, modification and redistribution each require prior
-written permission from Negentrophi Private Limited. That applies to the
-deployment scripts and the SQL artifacts under `db/` here, as well as to the
-application image they provision.
+This package is published openly and carries a limited grant. If you hold a
+current written agreement with Negentrophi to operate NXPi — or you are acting
+for someone who does — you may **use, run, copy and modify** everything in this
+repository for the purpose of deploying and operating your own instance. That
+last one matters and is deliberate: running this package *requires* editing
+files inside it (`.env`, `.env.app`, the volume options in
+`docker-compose.yml`, `pgbackrest.conf`).
+
+The grant covers this repository only — the scripts, the compose and Caddy
+configuration, the docs, and the SQL under `db/`. It does **not** extend to the
+NXPi application itself or its container images, which stay fully proprietary
+under the terms above. It also does not permit redistributing this package to
+third parties, stripping its notices, or using it to build something that
+competes with Negentrophi.
+
+Nothing here is confidential — Addendum A §A.3 says so explicitly, since a
+public repository cannot also be a trade secret. Your own `.env`, `.env.app`,
+`secrets/`, certificates and backups are a different matter: they are yours,
+they are gitignored, and they never belong in this repository.
+
+Licensing questions: legal@negentrophi.com
