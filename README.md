@@ -210,6 +210,15 @@ eviction policy to the queue tier — and the app service now consumes a
 `install.sh` never re-seeds and never regenerates an existing secret
 (`gen_secret` is create-if-missing), so this is safe to run on a live deployment.
 
+**Run it BEFORE you touch `DB_VERSION`.** `install.sh` converges the stack but
+deliberately does not upgrade schemas: if a migration is pending for the version
+`.env` names, it dies with *"the database is at an OLDER release than
+APP_IMAGE"*. So leave `.env` on its current version, run `./install.sh`, and let
+`./upgrade-db.sh` move `DB_VERSION` afterwards (it backs `.env` up to
+`.env.bak-<timestamp>` first). The same applies with `DB_VERSION` unset and
+`APP_IMAGE` pinned to an exact `X.Y.Z` tag — the version is then derived from the
+tag, so bumping the tag first has the same effect.
+
 **Do not skip it, and do not trust a dry run to catch it.** A missing secret
 file is not a parse error: `docker compose config`, `--dry-run` and
 `./compose.sh ps` all succeed, and `update.sh`'s preflight passes. The failure
