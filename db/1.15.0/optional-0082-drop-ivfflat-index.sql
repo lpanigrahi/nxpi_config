@@ -1,0 +1,25 @@
+-- optional-0082-drop-ivfflat-index.sql — OPTIONAL operator step, NOT applied
+-- by ./update.sh or ./migrate.sh (they only pick up `migrate-*.sql`).
+--
+-- Source migration 0082: drop the redundant IVFFlat index on
+-- knowledge_embeddings.embedding. 0026 created TWO approximate-nearest-
+-- neighbour indexes on the same column with the same opclass; the planner only
+-- ever uses one for a `<=>` search, so the IVFFlat twin was never read — it
+-- only cost an extra index write on every embedding insert/update plus its own
+-- storage, on the largest table in the schema. HNSW is the one kept.
+--
+-- Kept OUT of migrate-1.15.0.sql because the rolling update path is
+-- additive-only by contract and a DROP — however safe — is not additive.
+-- A plain DROP INDEX is metadata-only and holds ACCESS EXCLUSIVE on
+-- knowledge_embeddings for milliseconds; it is safe at any time of day.
+-- Fresh installs from db/1.15.0/schema.sql never have the index at all, so
+-- this step is what brings an UPGRADED VM to the same state.
+--
+-- Apply with the privileged role, e.g. from the deployment folder:
+--   ./compose.sh exec -T postgres psql -U "$POSTGRES_ADMIN_USER" -d "$POSTGRES_DB" \
+--     -v ON_ERROR_STOP=1 < db/1.15.0/optional-0082-drop-ivfflat-index.sql
+-- Re-running is a no-op. Rollback (recreate, if ever wanted):
+--   CREATE INDEX IF NOT EXISTS knowledge_embeddings_embedding_ivfflat_idx
+--     ON knowledge_embeddings USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+
+DROP INDEX IF EXISTS knowledge_embeddings_embedding_ivfflat_idx;

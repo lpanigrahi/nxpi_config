@@ -35,7 +35,11 @@
 # A REQUIRES-REVIEW delta in scope (currently 1.9.0's document_chunk FK cascade)
 # is surfaced with its own header text and needs an explicit confirmation; the
 # rolling ./update.sh path refuses those by design. Purely additive targets
-# (e.g. 1.10.0, 1.11.0, 1.12.0) need no such gate.
+# (e.g. 1.10.0, 1.11.0, 1.12.0, 1.13.0, 1.14.0, 1.15.0) need no such gate.
+#
+# 1.15.0 also ships optional-0082-drop-ivfflat-index.sql. It is NOT matched by
+# the migrate-*.sql glob, so nothing here ever applies it — dropping the unused
+# IVFFlat twin of the HNSW index is an operator step (see README.md).
 #
 # Afterwards, roll the matching app image with ./update.sh.
 # =============================================================================
@@ -56,7 +60,7 @@ while [ $# -gt 0 ]; do
     --dry-run)               DRY_RUN=true ;;
     --adopt-schema-version)  shift; [ $# -gt 0 ] || die "--adopt-schema-version needs a value (e.g. 1.4.0)"; ADOPT="${1#v}" ;;
     --adopt-schema-version=*) ADOPT="${1#*=}"; ADOPT="${ADOPT#v}" ;;
-    -h|--help)               grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,40p'; exit 0 ;;
+    -h|--help)               grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,44p'; exit 0 ;;
     -*)                      die "unknown flag: $1 (see --help)" ;;
     *)                       [ -z "$TARGET_VER" ] || die "give at most one target version (got '$TARGET_VER' and '$1')"
                              TARGET_VER="${1#v}" ;;
@@ -185,7 +189,10 @@ if [ "$MARKER_N" = "0" ]; then
       job_execution       exists ⇒ at least 1.9.0
       session.mfa_verified_at    ⇒ at least 1.10.0
       organization_entitlement   ⇒ at least 1.11.0
-      user.locked_until          ⇒ at least 1.12.0"
+      user.locked_until          ⇒ at least 1.12.0
+      org_role_permission.denied ⇒ at least 1.13.0
+      plugin_source       exists ⇒ at least 1.14.0
+      plugin_bundle.deleted_at   ⇒ at least 1.15.0"
 
   STAMPED=""; EXECUTED=""
   while IFS= read -r f <&3; do
@@ -360,10 +367,17 @@ if [ -n "$DESTRUCTIVE_FILE" ]; then
   sed -n '1,12p' "$DESTRUCTIVE_FILE" | sed 's/^/  /'
   cat <<'EOF'
 
-  Reviewed for data loss across 1.5.0 → 1.12.0: there is no DROP TABLE, DROP
+  Reviewed for data loss across 1.5.0 → 1.15.0: there is no DROP TABLE, DROP
   COLUMN, TRUNCATE or unguarded DELETE anywhere in that range. Every NOT NULL
   column added carries a default, so existing rows are grandfathered without a
   table rewrite. The flag is about CHANGED BEHAVIOUR, not migration-time loss.
+
+  Two nuances in that range, neither a loss: migrate-1.15.0.sql runs ONE
+  UPDATE (nav_visibility_override), which reconciles rows whose scope and
+  organization_id already disagree before it adds the CHECK that forbids the
+  combination — row-count preserving, so the snapshot comparison still holds.
+  And 1.15.0's DROP INDEX ships OUTSIDE the migrate-*.sql glob, as
+  optional-0082-drop-ivfflat-index.sql, so it is never applied from here.
 
   ./migrate.sh will take its own mandatory backup before touching anything.
 EOF
@@ -492,6 +506,57 @@ if at_least 1.12.0; then
   chk_col user failed_login_attempts
   chk_col user last_failed_login_at
   chk_col user locked_until
+fi
+if at_least 1.13.0; then
+  # Org RBAC denials (0081). Read on every load of Organizations → Roles &
+  # Permissions, so an image carrying ADR-0083 without it 42703s on that screen.
+  chk_col org_role_permission denied
+
+  # PARTIAL index — invisible to information_schema, so probe pg_indexes, the
+  # same way the 1.11.0 checks above do.
+  chk "org_role_permission denied index present" "1" \
+    "$(q "select 1 from pg_indexes where schemaname='public' and indexname='org_role_permission_denied_idx'")" \
+    "re-run ./migrate.sh."
+fi
+if at_least 1.14.0; then
+  # Plugin acquisition (0090-0092). plugin_bundle.origin is selected on EVERY
+  # render of the Plugins tab, list and detail alike, so an image ahead of this
+  # delta 42703s there.
+  chk_table plugin_source; chk_table plugin_source_entry
+  chk_col plugin_bundle source_id
+  chk_col plugin_bundle origin
+  chk_col plugin_source last_sync_notes
+
+  # New TABLES need new privileges — unlike 1.12.0's columns, which inherited
+  # their table's. The delta GRANTs them itself and grants.sql re-asserts it;
+  # this is the check that proves one of the two actually reached the role.
+  chk "neo_gen can write plugin_source" "t" \
+    "$(q "select has_table_privilege('neo_gen','public.plugin_source','INSERT')")" \
+    "re-apply grants:  ./compose.sh exec -T postgres psql -U neogen_admin -d neogen < db/$TARGET_VER/grants.sql"
+  chk "neo_gen can write plugin_source_entry" "t" \
+    "$(q "select has_table_privilege('neo_gen','public.plugin_source_entry','INSERT')")" \
+    "re-apply grants (see above)."
+fi
+if at_least 1.15.0; then
+  # 0083-0089, the releases 1.13.0 and 1.14.0 both skipped. deleted_at is the
+  # soft-delete filter on EVERY Plugins query, which is why a VM at 1.14.0
+  # running the matching image fails that tab.
+  chk_col plugin_bundle deleted_at
+  chk_col skill_install enabled
+  chk_col plugin_bundle_install enabled
+  chk_col plugin_bundle_install reconciled_items
+  chk_col model_pricing cached_input_cost_per_1m
+  chk_col model_pricing cache_write_cost_per_1m
+
+  # 0084 and 0088 add CHECK constraints keyed on pg_constraint BY NAME, so a
+  # database that already had one takes a no-op — meaning absence here means
+  # the delta did not run, not that it was skipped as redundant.
+  chk "nav_visibility_override scope/org check present" "1" \
+    "$(q "select 1 from pg_constraint where conname='nav_visibility_override_scope_org_check'")" \
+    "re-run ./migrate.sh."
+  chk "plugin_bundle status check present" "1" \
+    "$(q "select 1 from pg_constraint where conname='plugin_bundle_status_check'")" \
+    "re-run ./migrate.sh (0088 skips cleanly when plugin_bundle is absent — check that it exists)."
 fi
 
 # Every migration in scope must now be recorded.

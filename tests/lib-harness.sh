@@ -186,5 +186,173 @@ t "compose() .yml wins over .yaml (Compose discovery order)" \
   "compose -f docker-compose.yml -f docker-compose.override.yml -f .rollback-image.yml ps" "$(compose ps)"
 rm -f .rollback-image.yml docker-compose.override.yml docker-compose.override.yaml
 
+# ── redis_flush_one(): the per-service flush the two tiers share ─────────────
+# Since the queue/cache split there are TWO redis servers with opposite
+# eviction policies. The flush must target the service it was ASKED for, and
+# must skip a service that is not running (redis-cache is optional, and a
+# warning on every install would be noise). `compose` is stubbed to RECORD its
+# argv, because the real function sends compose output to /dev/null.
+ARGV_LOG="$WORK/compose-argv.log"
+: > "$ARGV_LOG"
+compose() {
+  printf '%s\n' "$*" >> "$ARGV_LOG"
+  # `ps -q` must report a container id or the caller treats the service as down.
+  case "$1 $2" in "ps -q") printf 'deadbeefc0de\n' ;; esac
+  return 0
+}
+
+redis_flush_one redis-cache >/dev/null 2>&1
+case "$(cat "$ARGV_LOG")" in
+  *"exec -T redis-cache "*) FLUSH_TARGET=yes ;;
+  *)                        FLUSH_TARGET=no ;;
+esac
+t "redis_flush_one targets the service it was given" "yes" "$FLUSH_TARGET"
+case "$(cat "$ARGV_LOG")" in
+  *FLUSHALL*) FLUSH_CMD=yes ;;
+  *)          FLUSH_CMD=no ;;
+esac
+t "redis_flush_one still issues FLUSHALL" "yes" "$FLUSH_CMD"
+
+# A service that is not running must be skipped, not warned about.
+compose() { printf '%s\n' "$*" >> "$ARGV_LOG"; return 0; }   # ps -q → empty
+: > "$ARGV_LOG"
+redis_flush_one redis-cache >/dev/null 2>&1
+case "$(cat "$ARGV_LOG")" in
+  *FLUSHALL*) SKIPPED=no ;;
+  *)          SKIPPED=yes ;;
+esac
+t "redis_flush_one skips a service that is not running" "yes" "$SKIPPED"
+
+t "REDIS_SERVICES lists the queue first, then the cache" \
+  "redis redis-cache" "${REDIS_SERVICES:-UNSET}"
+unset -f compose
+
+# ── Data placement: mount + fstab deciders (fixtures only, no real disks) ────
+# Nothing in this package validated a mount, a filesystem or a volume's device
+# before. These are the pure halves of prepare-disks.sh's preflight, so the
+# checks that gate a data-tier start are themselves testable.
+
+# EXISTENCE FIRST. Without this the negative cases below pass vacuously: an
+# undefined function also exits non-zero, so `fn ... && echo yes || echo no`
+# prints "no" whether the decider said false or never ran at all.
+for fn in fstab_has_mount mount_ok has_free_kb parse_kb_avail; do
+  t "$fn is defined" "function" "$(type -t "$fn" 2>/dev/null || echo MISSING)"
+done
+
+# fstab_has_mount: a COMMENTED line must not count as configured, or a VM that
+# boots without the disk looks correctly configured right up until it reboots.
+FSTAB_OK=$'UUID=abc /srv/pgdata ext4 defaults,noatime,nofail 0 2\n'
+FSTAB_COMMENTED=$'# UUID=abc /srv/pgdata ext4 defaults 0 2\n'
+t "fstab_has_mount finds a real entry"        "yes" "$(fstab_has_mount "$FSTAB_OK" /srv/pgdata && echo yes || echo no)"
+t "fstab_has_mount ignores a commented entry" "no"  "$(fstab_has_mount "$FSTAB_COMMENTED" /srv/pgdata && echo yes || echo no)"
+t "fstab_has_mount does not match a prefix"   "no"  "$(fstab_has_mount "$FSTAB_OK" /srv/pg && echo yes || echo no)"
+
+# mount_ok: empty input means "not a mount at all"; a read-only mount must fail
+# too, since Postgres cannot start on one.
+t "mount_ok accepts a rw mount" "yes" \
+  "$(mount_ok '/srv/pgdata /dev/sdc ext4 rw,noatime' && echo yes || echo no)"
+t "mount_ok rejects a ro mount" "no" \
+  "$(mount_ok '/srv/pgdata /dev/sdc ext4 ro,noatime' && echo yes || echo no)"
+t "mount_ok rejects empty input (not mounted)" "no" \
+  "$(mount_ok '' && echo yes || echo no)"
+
+# has_free_kb: fail CLOSED on unparseable input, mirroring assert_numeric.
+t "has_free_kb passes when there is room"   "yes" "$(has_free_kb 100000 50000 && echo yes || echo no)"
+t "has_free_kb fails when there is not"     "no"  "$(has_free_kb 10000 50000 && echo yes || echo no)"
+t "has_free_kb fails closed on garbage"     "no"  "$(has_free_kb "" 50000 && echo yes || echo no)"
+
+# parse_kb_avail: lifted out of update.sh's inline awk so it can be asserted.
+DF_OUT=$'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sdc 103080888 1234 97612345 2% /srv/pgdata'
+t "parse_kb_avail reads the Available column" "97612345" "$(parse_kb_avail "$DF_OUT")"
+
+# ── compose_volume_device(): read a volume's declared device from the FILE ────
+# The verdict compares what the compose file DECLARES against what the volume
+# actually has, so the file side has to be readable without docker.
+t "compose_volume_device is defined" "function" "$(type -t compose_volume_device 2>/dev/null || echo MISSING)"
+cat > cvd.yml <<'YML'
+volumes:
+  postgres-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /srv/pgdata/data
+  redis-data:
+  uploads-data:
+    driver: local
+    driver_opts:
+      device: /srv/other/data
+YML
+t "device of a pinned volume"          "/srv/pgdata/data" "$(compose_volume_device cvd.yml postgres-data)"
+t "device of an unpinned volume"       ""                 "$(compose_volume_device cvd.yml redis-data)"
+t "device of a volume that is absent"  ""                 "$(compose_volume_device cvd.yml nope)"
+t "does not leak the NEXT volume's device" "/srv/other/data" "$(compose_volume_device cvd.yml uploads-data)"
+
+# ── placement_verdict(): fresh vs adopt vs mismatch ──────────────────────────
+# install.sh detected an existing deployment BY VOLUME NAME only — it never
+# inspected Mountpoint, Driver or Options. Two ways that bites:
+#   • on a REBUILT VM the volume does not exist yet but the DISK carries PGDATA,
+#     so the guard reports "fresh", regenerates better_auth_secret, and every
+#     stored integration credential becomes undecryptable — permanently;
+#   • if a volume's declared device changes, Docker REFUSES to re-point it, so
+#     converging silently does nothing useful.
+t "placement_verdict is defined" "function" "$(type -t placement_verdict 2>/dev/null || echo MISSING)"
+
+t "no volume, no data on the disk = fresh"        "fresh"    "$(placement_verdict no  /srv/pgdata/data '')"
+t "volume pinned where the file says = adopt"     "adopt"    "$(placement_verdict yes /srv/pgdata/data /srv/pgdata/data)"
+t "unpinned volume but the file pins = mismatch"  "mismatch" "$(placement_verdict yes /srv/pgdata/data '')"
+t "pinned volume but the file does not = mismatch" "mismatch" "$(placement_verdict yes '' /srv/pgdata/data)"
+t "pinned somewhere else entirely = mismatch"     "mismatch" "$(placement_verdict yes /srv/pgdata/data /var/lib/docker/volumes/x/_data)"
+t "no volume but the DISK already holds PGDATA = adopt" "adopt" "$(placement_verdict no /srv/pgdata/data '' has-pgdata)"
+t "neither volume nor device declared = fresh"    "fresh"    "$(placement_verdict no '' '')"
+
+# ── prune_keeping(): retention that cannot delete your last backup ───────────
+# `find -mtime` alone will delete the LAST dump after a quiet month — age is not
+# a retention policy. This decides WHICH candidates may go, given the newest N
+# that must survive regardless of age.
+t "prune_keeping is defined" "function" "$(type -t prune_keeping 2>/dev/null || echo MISSING)"
+
+CANDIDATES=$'backups/neogen-3.dump\nbackups/neogen-2.dump\nbackups/neogen-1.dump'
+KEEP=$'backups/neogen-3.dump\nbackups/neogen-2.dump'
+t "keeps the protected newest, prunes the rest" "backups/neogen-1.dump" \
+  "$(prune_keeping "$CANDIDATES" "$KEEP")"
+t "prunes nothing when every candidate is protected" "" \
+  "$(prune_keeping "$KEEP" "$KEEP")"
+t "prunes nothing when there are no candidates" "" \
+  "$(prune_keeping "" "$KEEP")"
+# The case that matters: everything is old, but the keep-list still saves them.
+t "an all-old set still keeps the protected ones" "backups/neogen-1.dump" \
+  "$(prune_keeping "$CANDIDATES" "$KEEP")"
+# A substring name must not be protected by a longer one (neogen-1 vs neogen-11).
+t "protection is exact, not substring" "backups/neogen-1.dump" \
+  "$(prune_keeping $'backups/neogen-1.dump' $'backups/neogen-11.dump')"
+
+# ── pgbackrest helpers ───────────────────────────────────────────────────────
+# PITR is only real once a RESTORE has been rehearsed, so the guardrails here
+# are about refusing to look ready when it is not.
+for fn in pgbackrest_ready pgbackrest_argv; do
+  t "$fn is defined" "function" "$(type -t "$fn" 2>/dev/null || echo MISSING)"
+done
+
+# pgbackrest_ready IMAGE ARCHIVE_MODE — both must be right, and the failure
+# modes differ: the stock image has no binary (archive_command fails and WAL
+# piles up until the disk fills), archive_mode=off means nothing is archived at
+# all (backups exist but PITR between them does not).
+t "stock image + archiving on = not ready" "no" \
+  "$(pgbackrest_ready 'pgvector/pgvector:pg17' on && echo yes || echo no)"
+t "pitr image + archiving on = ready" "yes" \
+  "$(pgbackrest_ready 'ghcr.io/x/nxpi-postgres:1.0.0' on && echo yes || echo no)"
+t "pitr image + archiving off = not ready" "no" \
+  "$(pgbackrest_ready 'ghcr.io/x/nxpi-postgres:1.0.0' off && echo yes || echo no)"
+t "empty image = not ready (fail closed)" "no" \
+  "$(pgbackrest_ready '' on && echo yes || echo no)"
+
+# pgbackrest_argv STANZA SUBCOMMAND… — the stanza must always be passed, or
+# pgbackrest operates on whatever the config happens to name first.
+t "argv always carries the stanza" "--stanza=neogen backup --type=full" \
+  "$(pgbackrest_argv neogen backup --type=full)"
+t "argv with no extra args still names the stanza" "--stanza=neogen info" \
+  "$(pgbackrest_argv neogen info)"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 exit $((FAIL > 0))

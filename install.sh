@@ -100,13 +100,49 @@ chmod 700 secrets backups 2>/dev/null || true
 # and a new better_auth_secret invalidates sessions AND makes stored
 # integration credentials (encrypted under the old secret) permanently
 # undecryptable. Require the COMPLETE original set when adopting.
-if $DOCKER volume inspect "${PROJECT}_postgres-data" >/dev/null 2>&1; then
+# WHEN the compose file bind-pins its stateful volumes to dedicated disks (the
+# driver_opts blocks are shipped commented out, so this is opt-in), verify
+# they are actually formatted, mounted and persisted BEFORE converging —
+# otherwise the failure surfaces as an opaque container-start error halfway
+# through provisioning, with the secrets already generated.
+if [ -n "$(compose_volume_device docker-compose.yml postgres-data)" ]; then
+  ./prepare-disks.sh --check \
+    || die "data disks are not ready — run ./prepare-disks.sh (see the messages above). Nothing has been changed."
+fi
+
+# Three signals, not one. The old check was `docker volume inspect` alone, which
+# cannot see a REBUILT VM whose volume does not exist yet but whose attached
+# disk already holds PGDATA — that reads as "fresh", regenerates
+# better_auth_secret, and permanently breaks stored integration credentials.
+VOL_EXISTS=no
+$DOCKER volume inspect "${PROJECT}_postgres-data" >/dev/null 2>&1 && VOL_EXISTS=yes
+DECLARED_DEVICE="$(compose_volume_device docker-compose.yml postgres-data)"
+ACTUAL_DEVICE=""
+[ "$VOL_EXISTS" = "yes" ] && ACTUAL_DEVICE="$(volume_device "${PROJECT}_postgres-data")"
+DISK_HAS_PGDATA=""
+if [ "$VOL_EXISTS" = "no" ] && [ -n "$DECLARED_DEVICE" ] && is_pgdata_dir "$DECLARED_DEVICE"; then
+  DISK_HAS_PGDATA=has-pgdata
+fi
+VERDICT="$(placement_verdict "$VOL_EXISTS" "$DECLARED_DEVICE" "$ACTUAL_DEVICE" "$DISK_HAS_PGDATA")"
+
+if [ "$VERDICT" = "mismatch" ]; then
+  die "volume ${PROJECT}_postgres-data is pinned somewhere other than docker-compose.yml declares.
+    declared: ${DECLARED_DEVICE:-<none>}
+    actual:   ${ACTUAL_DEVICE:-<none>}
+  Docker NEVER re-points an existing volume — it refuses on conflicting options,
+  so converging would not move your data even though the file says otherwise.
+  Follow the cutover runbook in README.md: copy the data to the new device and
+  verify it, THEN remove the old volume so Docker recreates it pinned.
+  Nothing has been changed."
+fi
+
+if [ "$VERDICT" = "adopt" ]; then
   MISSING=""
   for s in postgres_password redis_password postgres_url redis_url better_auth_secret; do
     [ -s "secrets/$s" ] || MISSING="$MISSING $s"
   done
   if [ -n "$MISSING" ]; then
-    die "found an existing data volume (${PROJECT}_postgres-data) but incomplete secrets in ./secrets (missing:$MISSING).
+    die "found an existing database (${PROJECT}_postgres-data${DECLARED_DEVICE:+ on $DECLARED_DEVICE}) but incomplete secrets in ./secrets (missing:$MISSING).
   An adopted database only works with its ORIGINAL secrets — newly generated
   ones cannot open it (and a new better_auth_secret would permanently break
   stored integration credentials). Copy the COMPLETE secrets/ directory from
@@ -132,11 +168,16 @@ gen_secret redis_password            rand_hex 24
 # TCP URL / git token is needed anymore (sourceless provisioning).
 gen_secret postgres_url            sh -c "printf 'postgres://neo_gen:%s@postgres:5432/neogen' \"\$(openssl rand -hex 24)\""
 gen_secret redis_url               sh -c "printf 'redis://:%s@redis:6379' \"\$(cat secrets/redis_password)\""
+# Same password, second server. NOT added to the required-secrets check above:
+# that list means "these must be the ORIGINAL secrets or the data is
+# unreadable"; a cache URL is freely regenerable, and requiring it would make
+# every existing deployment die on its next install.sh run.
+gen_secret redis_cache_url         sh -c "printf 'redis://:%s@redis-cache:6379' \"\$(cat secrets/redis_password)\""
 # Compose file-secrets are bind mounts that keep HOST permissions. The app
 # container runs as uid 1001 (nextjs) and must be able to read its three
 # secrets; the root-read files stay owned by the invoking user, mode 600.
-as_root chown 1001 secrets/postgres_url secrets/redis_url secrets/better_auth_secret
-as_root chmod 400  secrets/postgres_url secrets/redis_url secrets/better_auth_secret
+as_root chown 1001 secrets/postgres_url secrets/redis_url secrets/redis_cache_url secrets/better_auth_secret
+as_root chmod 400  secrets/postgres_url secrets/redis_url secrets/redis_cache_url secrets/better_auth_secret
 chmod 600 secrets/postgres_password secrets/redis_password 2>/dev/null \
   || as_root chmod 600 secrets/postgres_password secrets/redis_password
 ok "secret permissions set (app secrets → uid 1001 / 400, rest → 600)"
@@ -334,9 +375,13 @@ ok "images pulled"
 
 # ── 6. Data tier ─────────────────────────────────────────────────────────────
 hdr "Data tier"
-compose up -d postgres redis
+compose up -d postgres redis redis-cache
 wait_healthy postgres 120 || die "Postgres did not become healthy"
 wait_healthy redis 60     || die "Redis did not become healthy"
+# The CACHE tier is not fatal: lib/cache falls back to an in-process
+# MemoryCache and keeps probing, so a cache outage is degradation.
+wait_healthy redis-cache 60 >/dev/null \
+  || warn "redis-cache did not become healthy — the app will degrade to in-process caching"
 
 # ── 7. Database provisioning (sourceless, idempotency fork) ──────────────────
 hdr "Database provisioning"

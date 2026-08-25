@@ -105,7 +105,19 @@ fi
 if $PRUNE; then
   RETENTION=$(env_get .env BACKUP_RETENTION_DAYS 7)
   case "$RETENTION" in *[!0-9]*|"") RETENTION=7 ;; esac
-  PRUNED=$(find backups -maxdepth 1 \( -name 'neogen-*.dump' -o -name 'uploads-*.tar.gz' -o -name 'restore-*.log' -o -name 'cron-*.log' \) -mtime +"$RETENTION" -print -delete | wc -l | tr -d ' ')
+  # Keep at least N dumps regardless of age. `find -mtime` alone will happily
+  # delete your LAST dump after a quiet month — age is not a retention policy.
+  MIN_KEEP=$(env_get .env BACKUP_MIN_KEEP 3)
+  case "$MIN_KEEP" in *[!0-9]*|"") MIN_KEEP=3 ;; esac
+  KEEP_LIST=$(ls -1t backups/neogen-*.dump 2>/dev/null | head -n "$MIN_KEEP" || true)
+  CANDIDATES=$(find backups -maxdepth 1 \( -name 'neogen-*.dump' -o -name 'uploads-*.tar.gz' -o -name 'restore-*.log' -o -name 'cron-*.log' \) -mtime +"$RETENTION" 2>/dev/null)
+  PRUNED=0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    rm -f "$f" && PRUNED=$((PRUNED + 1))
+  done <<EOF
+$(prune_keeping "$CANDIDATES" "$KEEP_LIST")
+EOF
   [ "$PRUNED" != "0" ] && log "pruned $PRUNED backup file(s) older than ${RETENTION} days"
 else
   log "retention pruning skipped (--no-prune)"
@@ -113,8 +125,33 @@ fi
 
 hdr "Backup complete"
 ok "latest: $DUMP"
-log "ship it OFF the VM (single-VM disk is not a durability story):"
-log "  az storage blob upload --account-name <acct> -c backups -f $DUMP -n $(basename "$DUMP")"
+# ── Off-VM shipping ──────────────────────────────────────────────────────────
+# A single VM's disk is not a durability story: losing the machine loses the
+# database AND every dump sitting beside it. Automated when BACKUP_BLOB_CONTAINER
+# is set; a shipping failure is DEGRADED (nonzero exit) so cron notices, and it
+# does not change any caller's exit-code contract.
+BLOB_CONTAINER=$(env_get .env BACKUP_BLOB_CONTAINER "")
+BLOB_ACCOUNT=$(env_get .env BACKUP_BLOB_ACCOUNT "")
+if [ -n "$BLOB_CONTAINER" ] && [ -n "$BLOB_ACCOUNT" ]; then
+  if ! command -v az >/dev/null 2>&1; then
+    warn "BACKUP_BLOB_CONTAINER is set but the az CLI is not installed — dump NOT shipped off-VM"
+    BACKUP_DEGRADED=true
+  else
+    log "shipping $(basename "$DUMP") to blob container ${BLOB_CONTAINER}…"
+    # --auth-mode login uses the VM's managed identity: no account key on disk.
+    if az storage blob upload --auth-mode login --account-name "$BLOB_ACCOUNT" \
+         -c "$BLOB_CONTAINER" -f "$DUMP" -n "$(basename "$DUMP")" --overwrite false >/dev/null 2>&1; then
+      ok "shipped off-VM"
+    else
+      warn "could not ship $(basename "$DUMP") to ${BLOB_ACCOUNT}/${BLOB_CONTAINER} — the dump exists ONLY on this VM"
+      BACKUP_DEGRADED=true
+    fi
+  fi
+else
+  log "ship it OFF the VM (single-VM disk is not a durability story):"
+  log "  set BACKUP_BLOB_ACCOUNT + BACKUP_BLOB_CONTAINER in ./.env to automate this, or run:"
+  log "  az storage blob upload --account-name <acct> -c backups -f $DUMP -n $(basename "$DUMP")"
+fi
 if $BACKUP_DEGRADED; then
   warn "backup completed WITHOUT the uploads archive (database dump is good) — exiting nonzero for cron/automation."
   exit 1

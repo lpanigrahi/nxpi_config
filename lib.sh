@@ -364,11 +364,177 @@ psql_admin() {
 # — and the seed's DETERMINISTIC UUIDs (e.g. the super-admin id) make stale
 # `user-<id>` cache entries COLLIDE with, not just miss, the new rows.
 # Never fatal: a failed flush degrades to a manual-command warning.
+# ── Data placement ───────────────────────────────────────────────────────────
+# The compose file CAN bind-pin postgres-data, postgres-wal and redis-data to
+# dedicated managed disks (opt-in — the driver_opts blocks ship commented out).
+# Nothing here validated a mount, a filesystem or a volume's device before, and
+# the failure that matters is silent: an unmounted disk used to mean Postgres
+# initdb'ing an empty cluster that passes every health check while serving zero
+# rows. Binding a SUBDIRECTORY of each mountpoint makes Docker refuse instead —
+# these deciders are the preflight that explains WHY before the container start
+# fails.
+#
+# Each is pure (text in, verdict out) so tests/lib-harness.sh can assert it; the
+# impure one-line wrappers that shell out live below them.
+
+# fstab_has_mount FSTAB_TEXT MOUNTPOINT — is the mount persisted across reboot?
+# A commented line must NOT count: a VM that boots without the disk looks
+# correctly configured right up until it reboots.
+fstab_has_mount() {
+  printf '%s\n' "$1" | grep -vE '^[[:space:]]*#' | awk -v mp="$2" '$2 == mp { found = 1 } END { exit !found }'
+}
+
+# mount_ok FINDMNT_LINE — "<target> <source> <fstype> <options>". Empty input
+# means the path is not a mount at all; a read-only mount fails too, because
+# Postgres cannot start on one.
+mount_ok() {
+  [ -n "${1:-}" ] || return 1
+  case " $(printf '%s' "$1" | awk '{print $4}' | tr ',' ' ') " in
+    *" ro "*) return 1 ;;
+  esac
+  return 0
+}
+
+# has_free_kb HAVE NEED — fails CLOSED on empty or non-numeric input, mirroring
+# assert_numeric: an unreadable df must never read as "plenty of room".
+has_free_kb() {
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  case "${2:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$1" -ge "$2" ]
+}
+
+# parse_kb_avail DF_OUTPUT — the Available column of `df -Pk`. Lifted out of
+# update.sh's inline awk so the arithmetic is assertable.
+parse_kb_avail() {
+  printf '%s\n' "$1" | awk 'NR==2 {print $4}'
+}
+
+# ── pgBackRest (point-in-time recovery) ──────────────────────────────────────
+
+# pgbackrest_ready IMAGE ARCHIVE_MODE — is this deployment actually archiving?
+# Both halves are required and they fail differently:
+#   • the STOCK pgvector image has no pgbackrest binary, so archive_command
+#     fails on every segment and Postgres retains WAL until the disk fills and
+#     writes stop — worse than not archiving at all;
+#   • archive_mode=off means backups exist but nothing bridges the gaps between
+#     them, so "we have PITR" is false while every command still exits 0.
+# Fails CLOSED on empty input, like assert_numeric.
+pgbackrest_ready() {
+  image="${1:-}" mode="${2:-}"
+  [ -n "$image" ] || return 1
+  [ "$mode" = "on" ] || return 1
+  case "$image" in
+    *nxpi-postgres*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# pgbackrest_argv STANZA SUBCOMMAND… — always carries --stanza. Without it
+# pgbackrest silently operates on whichever stanza the config names first,
+# which on a multi-stanza repository is someone else's database.
+pgbackrest_argv() {
+  stanza="$1"; shift
+  printf '%s' "--stanza=$stanza"
+  for a in "$@"; do printf ' %s' "$a"; done
+}
+
+# prune_keeping CANDIDATES KEEP_LIST — newline-separated paths in, the subset
+# that may be DELETED out. Age alone is not a retention policy: `find -mtime`
+# will happily remove the last dump after a quiet month, and a backup set you
+# can lose to inactivity is not a backup set. Matching is EXACT per line, so
+# `neogen-11.dump` never protects `neogen-1.dump`.
+# Passed through the ENVIRONMENT, not `awk -v`: -v runs escape processing and
+# chokes on a literal newline ("awk: newline in string"), which silently emptied
+# the result — i.e. it pruned nothing rather than pruning wrongly, but a
+# retention policy that quietly stops working is still a broken one.
+prune_keeping() {
+  printf '%s\n' "$1" | KEEP_LIST="$2" awk '
+    BEGIN {
+      n = split(ENVIRON["KEEP_LIST"], k, "\n")
+      for (i = 1; i <= n; i++) if (k[i] != "") protected[k[i]] = 1
+    }
+    $0 != "" && !($0 in protected) { print }
+  '
+}
+
+# compose_volume_device FILE VOLNAME — the `device:` a named volume is pinned
+# to in the compose FILE, or empty. Scoped to that volume's own block: reading
+# the next volume's device instead would make the adoption guard compare the
+# wrong pair and report a mismatch that is not there.
+compose_volume_device() {
+  awk -v want="$2" '
+    /^volumes:[[:space:]]*$/ { in_vols = 1; next }
+    in_vols && /^[^[:space:]#]/ { in_vols = 0 }          # next top-level key ends it
+    !in_vols { next }
+    /^[[:space:]]{2}[^[:space:]#][^:]*:[[:space:]]*$/ {  # a volume key
+      name = $0; sub(/^[[:space:]]+/, "", name); sub(/:.*$/, "", name)
+      here = (name == want)
+      next
+    }
+    here && /^[[:space:]]*device:[[:space:]]*/ {
+      sub(/^[[:space:]]*device:[[:space:]]*/, ""); gsub(/^["'"'"']|["'"'"']$/, "")
+      print; exit
+    }
+  ' "$1" 2>/dev/null
+}
+
+# placement_verdict VOLUME_EXISTS DECLARED_DEVICE ACTUAL_DEVICE [DISK_HAS_PGDATA]
+#   → fresh | adopt | mismatch
+#
+# The whole adoption decision, with no docker in it. Replaces install.sh's
+# name-only check, which could not tell these apart:
+#   • rebuilt VM: no volume yet, but the attached disk already holds PGDATA.
+#     Name-only says "fresh" → new secrets generated against live data →
+#     stored integration credentials permanently undecryptable.
+#   • re-pointed volume: the file declares a device the existing volume does not
+#     have (or vice versa). Docker refuses to change a volume's options, so
+#     converging silently fails to do what the operator believes it did.
+placement_verdict() {
+  vol_exists="$1" declared="${2:-}" actual="${3:-}" disk_has_pgdata="${4:-}"
+
+  if [ "$vol_exists" = "yes" ]; then
+    # Disagreement in EITHER direction is a mismatch — including "the volume has
+    # no device but the file pins one", which is the case where an operator
+    # believes they are on the new disk and are in fact on the OS disk.
+    [ "$declared" = "$actual" ] && { printf 'adopt'; return 0; }
+    printf 'mismatch'; return 0
+  fi
+
+  # No volume yet. If the declared device already carries a cluster, this is a
+  # rebuilt/re-attached machine and its ORIGINAL secrets are required.
+  [ -n "$disk_has_pgdata" ] && { printf 'adopt'; return 0; }
+  printf 'fresh'
+}
+
+# Impure wrappers — the halves that touch the machine.
+disk_avail_kb()  { parse_kb_avail "$(df -Pk "$1" 2>/dev/null)"; }
+mount_info()     { findmnt -no TARGET,SOURCE,FSTYPE,OPTIONS "$1" 2>/dev/null | head -n1; }
+volume_device()  { $DOCKER volume inspect "$1" --format '{{.Options.device}}' 2>/dev/null || true; }
+is_pgdata_dir()  { [ -s "$1/PG_VERSION" ]; }
+
+# The redis tiers, queue first. Two servers with OPPOSITE eviction policies:
+# `redis` is BullMQ's (noeviction, AOF) and `redis-cache` is the app cache's
+# (allkeys-lru, no persistence). Both must be flushed on a generation change.
+REDIS_SERVICES="redis redis-cache"
+
+# redis_flush_one SVC — FLUSHALL one redis service. Never fatal; the warning
+# names the SERVICE so an operator cannot paste a command that flushes the
+# other tier. A service that is not running is skipped silently: `redis-cache`
+# is optional, and warning about it on every install would be noise.
+redis_flush_one() {
+  svc="$1"
+  [ -n "$(compose ps -q "$svc" 2>/dev/null)" ] || return 0
+  compose exec -T "$svc" sh -c 'REDISCLI_AUTH=$(cat /run/secrets/redis_password) redis-cli FLUSHALL' >/dev/null \
+    && ok "$svc flushed" \
+    || warn "could not flush $svc — flush manually: ./compose.sh exec $svc sh -c 'REDISCLI_AUTH=\$(cat /run/secrets/redis_password) redis-cli FLUSHALL'"
+  return 0
+}
+
 flush_redis() {
   log "flushing Redis (cache/queues from the previous database generation)…"
-  compose exec -T redis sh -c 'REDISCLI_AUTH=$(cat /run/secrets/redis_password) redis-cli FLUSHALL' >/dev/null \
-    && ok "redis flushed" \
-    || warn "could not flush redis — flush manually: ./compose.sh exec redis sh -c 'REDISCLI_AUTH=\$(cat /run/secrets/redis_password) redis-cli FLUSHALL'"
+  for svc in $REDIS_SERVICES; do
+    redis_flush_one "$svc"
+  done
   return 0
 }
 

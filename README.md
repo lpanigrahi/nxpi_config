@@ -19,7 +19,17 @@ build tag, and `DB_VERSION` in `.env` is authoritative alongside it.
 ## Prerequisites
 
 - An **Azure Ubuntu VM** (22.04+), ≥2 vCPU / 8 GB, with inbound **22
-  (restricted), 80, 443** open and nothing else.
+  (restricted), 80, 443** open and nothing else. `Standard_D4ds_v6`
+  (4 vCPU / 16 GB) is the recommended production size — B-series is burstable
+  and credit exhaustion throttles CPU **and** disk under sustained vector search.
+- **Dedicated data disks are optional here.** The stack ships with plain
+  Docker-managed volumes on the OS disk. The hardened layout — PGDATA, WAL and
+  the Redis AOF each bind-pinned to their own Premium SSD v2 at `/srv/pgdata`,
+  `/srv/pgwal`, `/srv/redis` — is opt-in: run `./prepare-disks.sh`, uncomment the
+  `driver_opts` blocks in `docker-compose.yml`, and read
+  [`docs/CUTOVER-RUNBOOK.md`](docs/CUTOVER-RUNBOOK.md) first if the deployment is
+  already live. Note the VM must be **zonal** for Premium SSD v2 and a zone
+  cannot be added after creation, which is why the runbook is a rebuild.
 - Ability to **pull two public GHCR images**: the application image and the
   `nxpi-hash` helper. (If either is a private package, `docker login ghcr.io`
   with a `read:packages` token first.)
@@ -38,16 +48,21 @@ on the VM by the public `nxpi-hash` helper. Nothing clones or builds the app.
 | `update.sh` | Pull latest image → schema sync → roll → health gate → auto-rollback |
 | `migrate.sh` | Schema-ONLY migration of the existing database — never initializes, never touches data rows |
 | `upgrade-db.sh` | Guided multi-release upgrade of an existing database to a shipped `db/<version>` (newest by default): data pre-checks, row-count snapshot, `migrate.sh`, then verifies every expected object and that nothing was lost |
-| `backup.sh` | `pg_dump` + uploads-volume archive + retention (cron-able) |
+| `backup.sh` | `pg_dump` + uploads-volume archive + retention with a keep-N floor + optional off-VM shipping to Blob (cron-able) |
 | `restore.sh` | Restore a backup (destructive, `--yes`-gated, health-gated) |
+| `pgbackrest.sh` | Point-in-time recovery: stanza, WAL archive, full/diff/incr backups, restore drill. **Adds to** `backup.sh`, does not replace it |
+| `pgbackrest.conf` | pgBackRest repository/stanza config, mounted read-only into the postgres container (that is where `archive_command` runs) |
+| `prepare-disks.sh` | Format / mount / persist the optional dedicated data disks; `--check` verifies without changing anything |
+| `migrate-legacy-deployment.sh` | One-way, orchestrated move of a LEGACY checkout's data onto a fresh install of this one (destructive for the old stack) |
 | `compose.sh` | Pin-honoring `docker compose` wrapper — use it for all manual compose operations |
 | `lib.sh` | Shared helpers sourced by the scripts above |
-| `docker-compose.yml` | The full production stack (app, Caddy, Postgres+pgvector, Redis) |
+| `docker-compose.yml` | The full production stack (app, Caddy, Postgres+pgvector, two Redis tiers) |
 | `Caddyfile` | Reverse proxy: auto-HTTPS (domain mode), custom-cert import, security headers, SSE-safe compression |
 | `generate-certs.sh` | Extract a `.pfx` bundle into `certs/` for custom-certificate mode (see `certs/README.md`) |
 | `certs/` | Bring-your-own certificate material (bind-mounted read-only into Caddy) |
 | `secrets-entrypoint.sh` | Bridges Docker file-secrets → env for the app container |
 | `init.sql` | Enables the pgvector extension on first Postgres boot |
+| `docs/CUTOVER-RUNBOOK.md` | Moving a LIVE deployment onto the dedicated data disks — read before touching disks |
 | `db/<version>/` | Static provisioning SQL: `schema.sql` + `grants.sql` + `seed.sql` (+ `migrate-<version>.sql` for upgrades), published per release |
 | `.env.example` | Compose interpolation values (image refs, URLs, admin seed, `DB_VERSION`) |
 | `.env.app.example` | App runtime env (LLM provider keys, storage, cookies) |
@@ -56,8 +71,9 @@ on the VM by the public `nxpi-hash` helper. Nothing clones or builds the app.
 
 ## Fresh installation
 
-1. **Provision a VM** — Ubuntu 22.04+, 16 GB ,
-   NSG allowing inbound **22 (restricted), 80, 443** and nothing else.
+1. **Provision a VM** — Ubuntu 22.04+, ≥2 vCPU / 8 GB (16 GB recommended —
+   see [Prerequisites](#prerequisites)), NSG allowing inbound **22
+   (restricted), 80, 443** and nothing else.
 
 2. **Get this package onto the VM** and enter the deployment folder:
 
@@ -122,9 +138,9 @@ from the image tag; set `DB_VERSION` explicitly when the tag is `:latest`.
 
 ```bash
 # deterministic, recommended for production (immutable per-commit tag):
-APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:sha-80c736a   DB_VERSION=1.12.0
+APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:sha-9b5c610   DB_VERSION=1.15.0
 # newest build — pin the artifact version explicitly:
-APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:latest        DB_VERSION=1.12.0
+APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:latest        DB_VERSION=1.15.0
 ```
 
 Moving/suffixed tags (`latest`, `main`, `sha-<short>`, `<pkgver>-main.<sha>`)
@@ -178,6 +194,142 @@ failure rolls the whole file back — the database is never left half-migrated),
 and after a successful migration run the release's `grants.sql` is
 **re-applied** (idempotent) so the app role picks up grants that only newer
 releases carry.
+
+### Upgrading THIS PACKAGE (one required step, once)
+
+This revision adds a second Redis — a dedicated cache tier with the opposite
+eviction policy to the queue tier — and the app service now consumes a
+`redis_cache_url` **file secret**. That file is generated by `./install.sh`, not
+by `./update.sh`, and Compose refuses to start a service whose declared secret
+file is missing. So on an existing deployment adopting this version:
+
+```bash
+./install.sh          # idempotent converger; generates secrets/redis_cache_url
+./update.sh           # only now
+```
+
+`install.sh` never re-seeds and never regenerates an existing secret
+(`gen_secret` is create-only-if-missing), so this is safe to run on a live
+deployment. Running `./update.sh` first fails on the missing secret file.
+
+Nothing else here is required. The pgvector tuning, memory ceilings and PITR
+switches all default to today's behaviour, and the dedicated-disk layout stays
+opt-in (see [Prerequisites](#prerequisites)).
+
+### Upgrading to db 1.15.0 (additive — rolling path)
+
+`db/1.15.0/migrate-1.15.0.sql` bundles app migrations 0083–0089, which landed
+between the cut of 1.13.0 (0081) and the cut of 1.14.0 (0090–0092) and were
+packaged by **neither** — so a VM sitting at db 1.14.0 is already behind the
+image built from the same tree. Six columns
+(`model_pricing.cached_input_cost_per_1m` / `cache_write_cost_per_1m`,
+`skill_install.enabled`, `plugin_bundle_install.enabled` / `reconciled_items`,
+`plugin_bundle.deleted_at`) and five CHECK constraints (the plugin enums at the
+database, and `nav_visibility_override` scope/organization agreement). Additive
+only — every column is nullable or constant-defaulted, every constraint is keyed
+on `pg_constraint` by name — so `./update.sh` applies it on the rolling path with
+no maintenance window. Apply it twice and the second run is a no-op.
+
+**Apply this BEFORE (or with) any image carrying app migration 0089.**
+`plugin_bundle.deleted_at` is the soft-delete filter read on *every* Plugins
+list/detail query, so an image ahead of this delta fails that tab with
+`column "deleted_at" does not exist` (`42703`); the two `enabled` bits are read
+on chat-toolkit resolution once an installer has toggled anything. The app's
+boot-time schema sentinels now probe all of them, so a mismatched VM says so at
+startup rather than at the first request.
+
+The delta runs one `UPDATE` (`nav_visibility_override`), which reconciles rows
+whose `scope` and `organization_id` disagree *before* adding the CHECK that
+forbids the combination. It changes no row counts, so `./upgrade-db.sh`'s
+snapshot comparison still holds.
+
+**Optional, not automatic.** Source migration 0082 drops the redundant IVFFlat
+index on `knowledge_embeddings.embedding` — an unused twin of the HNSW index:
+write cost and storage, no read path. A `DROP` is not additive, and `migrate.sh`
+is additive-only by contract, so it ships *outside* the `migrate-*.sql` glob as
+`db/1.15.0/optional-0082-drop-ivfflat-index.sql`. Neither `./update.sh`,
+`./migrate.sh` nor `./upgrade-db.sh` will ever apply it. Run it yourself whenever
+convenient (metadata-only, milliseconds). Fresh installs from
+`db/1.15.0/schema.sql` never have the index.
+
+```bash
+# 1. set DB_VERSION=1.15.0 in ./.env
+# 2. rolling, additive-only path (auto-rollback intact):
+./update.sh
+# 3. (optional, any time) drop the redundant IVFFlat index:
+./compose.sh exec -T postgres psql -U neogen_admin -d neogen \
+  -v ON_ERROR_STOP=1 < db/1.15.0/optional-0082-drop-ivfflat-index.sql
+```
+
+Network note for the acquisition surfaces that arrived with 1.14.0: GitHub /
+git-URL plugin import and marketplace-source sync fetch from `github.com` (and
+the registered marketplace hosts) over outbound HTTPS from the `app` container,
+which sits on the non-internal `frontend` network — allow that egress. Public
+repositories only; no token is read.
+
+### Upgrading to db 1.14.0 (additive — rolling path)
+
+`db/1.14.0/migrate-1.14.0.sql` bundles app migrations 0090–0092 (plugin
+acquisition, ADR-0105): two new tables (`plugin_source`, `plugin_source_entry` —
+registered GitHub / git-URL / hosted-marketplace sources and their synced
+entries), two nullable columns on `plugin_bundle` (`source_id`, `origin` — the
+acquisition provenance a bundle records) and one nullable column on
+`plugin_source` (`last_sync_notes`), with their indexes and FKs. Nothing is
+dropped, narrowed or rewritten, so `./update.sh` applies it on the rolling path
+with no maintenance window.
+
+**Apply this BEFORE (or with) any image carrying app migration 0090** — this is
+the *sixth* occurrence of this incident class (after 1.6.0's `qa_baseline_hash`,
+1.8.0's `deployed`, 1.10.0's `session.mfa_verified_at` and 1.11.0's
+`organization_entitlement`). Every render of the Plugins tab, list and detail,
+selects `plugin_bundle.origin`, so an image ahead of this delta fails that
+screen with `column "origin" does not exist` (`42703`). `./update.sh` migrates
+before switching the image, which is the correct order; a manual image swap is
+how to get it wrong.
+
+Inert on arrival: the new tables start empty and the new columns are nullable
+with no default, so nothing changes until an admin registers a plugin source or
+imports a plugin. The acquisition surfaces ship **default ON** as platform
+flags; each has an operator kill switch in `./.env.app` (`PLUGIN_IMPORT_V1`,
+`PLUGIN_MARKETPLACES_V1`, `PLUGIN_GENERATOR_V1` — see `.env.app.example`).
+
+Because these are new **tables**, they need new privileges rather than
+inheriting an existing table's. The delta grants them and `grants.sql` re-asserts
+them; `./upgrade-db.sh` verifies the role actually got them.
+
+```bash
+# 1. set DB_VERSION=1.14.0 in ./.env
+# 2. rolling, additive-only path (auto-rollback intact):
+./update.sh
+```
+
+### Upgrading to db 1.13.0 (additive — rolling path)
+
+`db/1.13.0/migrate-1.13.0.sql` bundles app migration 0081: one boolean column
+(`org_role_permission.denied`, `DEFAULT false`) plus a partial index. Additive
+only, so `./update.sh` applies it on the rolling path with no maintenance window.
+
+**Apply this BEFORE (or with) any image carrying ADR-0083.** The app queries
+`denied` on every read of Organizations → Roles & Permissions, so an image ahead
+of this delta fails that screen with `column "denied" does not exist`.
+
+Inert on arrival: org RBAC was a pure union of a role's own rows, its ancestors'
+and its groups', with no way to subtract — which is why the Permission Matrix
+rendered inherited cells locked. This column represents the missing state (no
+row = no statement, `denied = false` = granted, `denied = true` = refused,
+outranking inheritance). The default preserves every existing row's meaning and
+permission resolution stays byte-identical until an admin unticks an inherited
+cell for the first time.
+
+The index is **partial** (`WHERE denied`), so `information_schema` cannot see it
+— `./upgrade-db.sh` probes `pg_indexes` for it, the same way it does for 1.11.0's
+two partial UNIQUE indexes.
+
+```bash
+# 1. set DB_VERSION=1.13.0 in ./.env
+# 2. rolling, additive-only path (auto-rollback intact):
+./update.sh
+```
 
 ### Upgrading to db 1.12.0 (additive — rolling path)
 
@@ -342,7 +494,15 @@ it starts from whatever key is active at the first write.
 
 Produces `backups/neogen-<timestamp>.dump` (`pg_dump -Fc`, integrity-checked)
 plus `backups/uploads-<timestamp>.tar.gz` when file storage is local. Local
-retention is `BACKUP_RETENTION_DAYS` (default 7, set in `.env`).
+retention is `BACKUP_RETENTION_DAYS` (default 7, set in `.env`) with a COUNT
+floor, `BACKUP_MIN_KEEP` (default 3): age alone is not a retention policy, and
+`find -mtime` would otherwise delete your last dump after a quiet month.
+
+Set `BACKUP_BLOB_ACCOUNT` + `BACKUP_BLOB_CONTAINER` in `.env` to ship each dump
+off the VM automatically. It uses `--auth-mode login` (the VM's managed
+identity), so no account key sits on disk, and a shipping failure makes the run
+exit non-zero so cron notices. Give the container versioning and a time-based
+immutability policy — a backup a compromised VM can delete is not a backup.
 
 Daily cron:
 
@@ -368,6 +528,42 @@ and keep a copy of the `secrets/` directory somewhere safe: **losing the
 secrets means losing access to the data** (an `install.sh` re-run adopts, it
 never resets passwords).
 
+### Point-in-time recovery (pgBackRest — optional, OFF by default)
+
+`backup.sh` gives you the state at each dump. `pgbackrest.sh` adds a continuous
+WAL archive so you can recover to a moment *between* them, and protects against
+losing the disk rather than only against logical damage. It is **added
+alongside**, never instead: `update.sh`, `migrate.sh` and `restore.sh` all depend
+on `backup.sh`'s exit-code contract and its `neogen-*.dump` filename.
+
+The enabling ORDER is load-bearing. Turning on `archive_mode` while the
+repository is unreachable makes Postgres **retain every WAL segment until the
+disk fills and the database stops accepting writes** — worse than not archiving
+at all:
+
+```bash
+# 1. POSTGRES_IMAGE=ghcr.io/<owner>/nxpi-postgres:<ver> in ./.env, then:
+./compose.sh up -d postgres          # archive_command runs INSIDE this container,
+                                     # so the binary has to be there, not on the host
+# 2. fill repo1-azure-* in ./pgbackrest.conf
+./pgbackrest.sh stanza-create
+./pgbackrest.sh check                # MUST pass before the next step
+# 3. POSTGRES_ARCHIVE_MODE=on in ./.env, then RESTART (archive_mode needs a
+#    restart, not a reload):
+./compose.sh up -d --force-recreate postgres
+```
+
+Then `./pgbackrest.sh backup full|diff|incr` and `./pgbackrest.sh info`. Restores
+are deliberately not automated — `./pgbackrest.sh drill` prints the exact command
+and what to verify. **PITR is not done when a backup succeeds; it is done when
+you have restored to a target time on a scratch VM and passed a health gate.**
+Record the wall-clock time that takes: it is your RTO.
+
+Never put an account key in `pgbackrest.conf` — that file is committed. Prefer a
+managed identity, or pass `PGBACKREST_REPO1_AZURE_KEY` through `./.env`
+(pgbackrest reads `PGBACKREST_*` from the environment and they override the
+file).
+
 ## Restore
 
 ```bash
@@ -383,7 +579,7 @@ restores exactly the dump** (a plain `--clean` restore would leave objects the
 dump doesn't know about, silently mixing releases), re-applies `grants.sql`,
 verifies the result, **re-runs the additive schema sync** (so a dump older
 than the current release cannot leave the schema behind the code), **flushes
-Redis** (queued jobs from the post-dump timeline
+both Redis tiers** (queued jobs from the post-dump timeline
 would reference rows that no longer exist), restarts, and health-gates — so
 even restoring the wrong dump is recoverable.
 
@@ -407,6 +603,37 @@ APP_IMAGE=ghcr.io/negentrophi/nxpi_dev@sha256:…
 then `./compose.sh up -d app`. Schema syncs are additive-only, so an older
 image keeps working against a newer schema.
 
+## Migrating from a legacy checkout
+
+`migrate-legacy-deployment.sh` moves an OLD, already-running deployment's data
+onto a fresh install of *this* checkout — for a machine carrying an older copy of
+this package in a different directory:
+
+```bash
+./migrate-legacy-deployment.sh --old-dir /path/to/old-checkout --yes
+./migrate-legacy-deployment.sh --old-dir /path/to/old-checkout --yes \
+    --adopt-schema-version 1.4.0        # if the old schema's marker is empty
+```
+
+It adds no `pg_dump`/`pg_restore`/secret-generation logic of its own — it drives
+`backup.sh` → `install.sh` → `restore.sh` → `migrate.sh` → `update.sh` in order.
+Two things to understand before running it:
+
+- **It is DESTRUCTIVE and ONE-WAY for the old deployment.** Step 4 is
+  `docker compose down -v` in `--old-dir` (both checkouts use the same compose
+  project name, so they cannot run side by side). After that point, recovery
+  means restoring the staged dump through this checkout, not undoing the
+  teardown.
+- **Only `better_auth_secret` is carried over.** Regenerating it would
+  permanently break decryption of stored integration credentials and invalidate
+  every session. Postgres/Redis secrets are deliberately regenerated fresh —
+  safe, and it is what sidesteps stale credentials on the old side. The script
+  refuses to start if this checkout already has any of them.
+
+Zero data loss, **not** zero downtime: the app is offline from step 4 until the
+step-8 health gate. Uploads on local disk storage are not handled — use
+`backup.sh`/`restore.sh --uploads` for those yourself; the script only warns.
+
 ## Day-2 quick reference
 
 Use `./compose.sh` (not raw `docker compose`) for anything that (re)creates
@@ -420,6 +647,8 @@ pinned to the last-good image where raw compose would redeploy the broken one.
 curl -s localhost/api/health/ready       # readiness through Caddy
 ./migrate.sh                             # schema-only migration (data preserved)
 ./upgrade-db.sh --dry-run                # what an upgrade would do (no changes)
+./prepare-disks.sh --check               # dedicated-disk layout: verify, change nothing
+./pgbackrest.sh info                     # what the PITR repository holds (if enabled)
 ./compose.sh exec postgres psql -U neogen_admin -d neogen   # SQL console
 ```
 
@@ -444,8 +673,11 @@ Reboots need nothing: every service has `restart: unless-stopped`.
 
 `tests/lib-harness.sh` asserts the pure helpers in `lib.sh` (dotenv parsing,
 semver ordering, version/artifact resolution, migration-file selection,
-percent-decoding, the rollback-pin compose wrapper) in a throwaway sandbox —
-no docker or database needed. Run it after any `lib.sh` change:
+percent-decoding, the rollback-pin compose wrapper, the data-placement deciders
+`placement_verdict`/`compose_volume_device`/`mount_ok`/`fstab_has_mount`, the
+backup retention floor `prune_keeping`, and the pgBackRest readiness guards) in a
+throwaway sandbox — no docker or database needed. Run it after any `lib.sh`
+change:
 
 ```bash
 bash tests/lib-harness.sh                 # local
@@ -458,11 +690,11 @@ docker run --rm -v "$PWD":/pkg:ro ubuntu:24.04 \
 | Symptom | Cause / fix |
 |---|---|
 | `install.sh` dies at image pull with auth error | The GHCR package is private: `echo $PAT \| docker login ghcr.io -u <user> --password-stdin` (PAT scope `read:packages`), re-run. |
-| `install.sh` dies: "APP_IMAGE tag is X but DB_VERSION=Y" | `assert_version_alignment` refuses a mismatch on purpose — it only fires for an exact `X.Y.Z` image tag (moving tags like `latest`/`main`/`sha-…`/`<ver>-main.<sha>` skip it and rely on `DB_VERSION`). Note the app version and the DB artifact version advance INDEPENDENTLY — `package.json` is at 1.2.0 while `db/` reaches 1.12.0, because a release that ships no migration does not add a `db/<ver>/` folder. Set `DB_VERSION` explicitly rather than letting it derive from the tag. |
+| `install.sh` dies: "APP_IMAGE tag is X but DB_VERSION=Y" | `assert_version_alignment` refuses a mismatch on purpose — it only fires for an exact `X.Y.Z` image tag (moving tags like `latest`/`main`/`sha-…`/`<ver>-main.<sha>` skip it and rely on `DB_VERSION`). Note the app version and the DB artifact version advance INDEPENDENTLY — `package.json` is at 1.2.0 while `db/` reaches 1.15.0, because a release that ships no migration does not add a `db/<ver>/` folder. Set `DB_VERSION` explicitly rather than letting it derive from the tag. |
 | `install.sh` dies: "no SQL artifacts found under ./db" | The `db/<version>/` folder for your image tag isn't present. Set `DB_VERSION` in `.env` to a version that exists under `db/`, or pull the matching release of this repo. |
 | Seed step: "could not compute the admin hash" | The `nxpi-hash` helper image isn't pullable. `docker pull ghcr.io/negentrophi/nxpi-hash:latest` (published by the app repo's ci.yml; or set `NXPI_HASH_IMAGE`), then re-run. |
 | `install.sh` dies: "existing data volume found but no secrets" | You are adopting data from a previous deployment — copy its `secrets/` directory here (new random secrets can't open old data), or `docker compose down -v` to start fresh (destroys all data). |
-| App logs: `FATAL: … not readable by uid 1001` | Secret file permissions drifted. `sudo chown 1001 secrets/{postgres_url,redis_url,better_auth_secret} && sudo chmod 400` same files, then `docker compose up -d app`. |
+| App logs: `FATAL: … not readable by uid 1001` | Secret file permissions drifted. `sudo chown 1001 secrets/{postgres_url,redis_url,redis_cache_url,better_auth_secret} && sudo chmod 400` same files, then `docker compose up -d app`. |
 | Sign-in loops back to the login page (IP mode) | `BETTER_AUTH_COOKIE_SECURE=false` missing from `.env.app`, or `BETTER_AUTH_URL` doesn't exactly match what the browser uses (scheme + host, no trailing slash). |
 | A `migrate-<ver>.sql` fails to apply | It stops before the app is rolled (data untouched). Inspect the file under `db/<ver>/`; a genuinely destructive change needs a maintenance window + backup. Confirm `DB_VERSION` matches the target image. |
 | Port 80 already in use | Another web server on the VM. Stop it, or set `CADDY_HTTP_PORT`/`CADDY_HTTPS_PORT` in `.env` and front it yourself. |

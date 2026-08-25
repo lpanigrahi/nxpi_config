@@ -52,6 +52,10 @@ wait_healthy postgres 60 >/dev/null || die "postgres is not healthy — fix the 
 # The roll uses `up -d --no-deps app` (skips compose's depends_on healthy
 # checks by design) — so verify redis here, BEFORE the old app is replaced.
 wait_healthy redis 30 >/dev/null || die "redis is not healthy — fix the data tier before updating"
+# The cache tier is warn-only: an update must never fail because a cache is
+# down. lib/cache degrades to an in-process MemoryCache.
+wait_healthy redis-cache 30 >/dev/null \
+  || warn "redis-cache is not healthy — proceeding; the app will degrade to in-process caching"
 # Fresh-database guard: updating implies an EXISTING deployment. An empty DB
 # means this is really a first install — refuse rather than half-provision
 # (this path applies migrations only, never admin/org seed data). A FAILED

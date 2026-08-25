@@ -45,15 +45,85 @@ x-security: &security
 services:
   # ── Data tier ───────────────────────────────────────────────────────────
   postgres:
-    image: pgvector/pgvector:pg17
+    # Defaults to the STOCK pgvector image. Point POSTGRES_IMAGE at the
+    # pgbackrest-carrying build (docker/nxpi-postgres, published by CI) only
+    # when enabling PITR — `archive_command` runs INSIDE this container, so the
+    # binary has to be here, not on the host.
+    image: ${POSTGRES_IMAGE:-pgvector/pgvector:pg17}
+    # Tuning for a pgvector workload. HNSW search is pointer-chasing random
+    # reads, so the single biggest lever is how much of the graph stays cached —
+    # under cgroup v2 the container's memory limit bounds shared_buffers AND the
+    # page cache together. Every value is interpolated so ONE file is correct on
+    # both the current 8 GB VM and its larger replacement; the defaults below fit
+    # 8 GB, and the app repo's `scripts/azure-compose.test.ts` asserts they still do.
+    #   maintenance_work_mem — HNSW builds; pgvector NOTICEs when the graph
+    #     no longer fits and the build degrades badly.
+    #   max_parallel_maintenance_workers — default 2 makes a rebuild crawl.
+    #   random_page_cost / effective_io_concurrency — SSD, not spinning media.
+    #   autovacuum_vacuum_scale_factor — vector tables bloat the graph faster
+    #     than the 20% default assumes.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-128MB}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-384MB}
+      - -c
+      - maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-128MB}
+      - -c
+      - max_parallel_maintenance_workers=${POSTGRES_PARALLEL_MAINTENANCE:-2}
+      - -c
+      - work_mem=${POSTGRES_WORK_MEM:-8MB}
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - wal_compression=zstd
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - max_wal_size=${POSTGRES_MAX_WAL_SIZE:-2GB}
+      - -c
+      - autovacuum_vacuum_scale_factor=0.05
+      # ── WAL archiving (PITR) — OFF by default ──────────────────────────────
+      # archive_mode=on with an archive_command that cannot succeed makes
+      # Postgres RETAIN every WAL segment until the disk fills and writes stop.
+      # Enable only after `./pgbackrest.sh check` proves the repository is
+      # reachable, and note that archive_mode changes need a RESTART, not a
+      # reload. archive_command goes through pgbackrest rather than a cp: a
+      # copy that exits 0 without durably storing the segment lets Postgres
+      # recycle WAL that was never shipped — a hole that only surfaces mid-restore.
+      - -c
+      - archive_mode=${POSTGRES_ARCHIVE_MODE:-off}
+      - -c
+      - archive_command=pgbackrest --stanza=${PGBACKREST_STANZA:-neogen} archive-push %p
+      - -c
+      - archive_timeout=${POSTGRES_ARCHIVE_TIMEOUT:-60}
+    # Parallel HNSW index builds coordinate through /dev/shm, which Docker caps
+    # at 64 MB by default. The workers then die at the END of a long rebuild.
+    shm_size: 1gb
     environment:
       POSTGRES_USER: neogen_admin
       POSTGRES_DB: neogen
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      # initdb creates pg_wal as a symlink to this path, so WAL lands on its own
+      # disk without any post-hoc symlink surgery inside PGDATA. Only consulted
+      # on a FRESH cluster; an existing one keeps whatever layout it has.
+      POSTGRES_INITDB_WALDIR: /srv/pgwal/wal
     secrets:
       - postgres_password
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      # Mounted at the SAME path inside the container as on the host, so the
+      # pg_wal symlink resolves identically in both namespaces. Mounting it
+      # elsewhere works for the container but leaves a dangling symlink on the
+      # host, breaking any host-side rsync/du.
+      - postgres-wal:/srv/pgwal/wal
+      # archive_command executes in THIS container, so pgbackrest's config must
+      # be here — not merely on the host where ./pgbackrest.sh runs. Read-only:
+      # the container archives, it never rewrites its own configuration.
+      - ./pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
       - ./init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     networks:
       - backend
@@ -72,7 +142,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512m
+          memory: ${PG_MEM_LIMIT:-512m}
 
   redis:
     image: redis:7-alpine
@@ -114,7 +184,48 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256m
+          memory: ${REDIS_MEM_LIMIT:-256m}
+
+  # ── Cache tier — a SECOND Redis, with the opposite eviction policy ─────────
+  # BullMQ requires `noeviction` (evicting a queue key corrupts job state) while
+  # a cache needs `allkeys-lru`, because a cache that refuses writes instead of
+  # forgetting something takes the queues down with it. Those are mutually
+  # exclusive, so sharing one instance means cache growth can fail queue writes.
+  #
+  # ADDED beside `redis` rather than renaming it: three shell sites hardcode the
+  # service name (lib.sh's flush_redis, install.sh and update.sh's wait_healthy)
+  # and the live VM's redis-data volume holds in-flight jobs under it. Adding
+  # leaves every one of those paths untouched.
+  #
+  # No persistence and no volume: losing a cache is a cold start, not data loss.
+  redis-cache:
+    image: redis:7-alpine
+    command:
+      - sh
+      - -c
+      - |
+        umask 077
+        printf 'appendonly no\nsave ""\nmaxmemory ${REDIS_CACHE_MAXMEMORY:-192mb}\nmaxmemory-policy allkeys-lru\nrequirepass %s\n' "$$(cat /run/secrets/redis_password)" > /tmp/redis-cache.conf
+        chown redis /tmp/redis-cache.conf
+        exec /usr/local/bin/docker-entrypoint.sh redis-server /tmp/redis-cache.conf
+    secrets:
+      - redis_password
+    networks:
+      - backend
+    restart: unless-stopped
+    logging: *logging
+    security_opt: *security
+    healthcheck:
+      test:
+        ["CMD-SHELL", "REDISCLI_AUTH=$$(cat /run/secrets/redis_password) redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: ${REDIS_CACHE_MEM_LIMIT:-256m}
 
   # ── Application — pulled from the registry, never built on the VM ─────────
   app:
@@ -154,10 +265,14 @@ services:
       # File-based secrets → env, performed by ./secrets-entrypoint.sh:
       POSTGRES_URL_FILE: /run/secrets/postgres_url
       REDIS_URL_FILE: /run/secrets/redis_url
+      # Cache tier. Unset in the app image's env => lib/cache falls back
+      # to REDIS_URL, i.e. the pre-split single-instance topology.
+      REDIS_CACHE_URL_FILE: /run/secrets/redis_cache_url
       BETTER_AUTH_SECRET_FILE: /run/secrets/better_auth_secret
     secrets:
       - postgres_url
       - redis_url
+      - redis_cache_url
       - better_auth_secret
     # Plain named volumes for the app's disk paths. On first use Docker
     # populates a fresh volume from the image path — content AND ownership
@@ -209,7 +324,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1g
+          memory: ${APP_MEM_LIMIT:-1g}
         reservations:
           memory: 512m
     depends_on:
@@ -342,9 +457,52 @@ networks:
 # ── Named volumes ────────────────────────────────────────────────────────────
 # Keys match the repo-checkout stack (project `neogen`) so this package adopts
 # existing data on a VM that migrated from the overlay deployment.
+#
+# ── OPT-IN: pinning the stateful volumes to dedicated disks ──────────────────
+# The three stateful volumes ship UNPINNED — plain Docker-managed volumes on the
+# OS disk, which is what every existing deployment already has. Uncommenting the
+# `driver`/`driver_opts` blocks below bind-pins them to dedicated managed disks
+# instead (the hardened layout: PGDATA, WAL and the Redis AOF each on their own
+# Premium SSD v2). To opt in:
+#
+#   1. ./prepare-disks.sh          formats, mounts and persists /srv/pgdata,
+#                                  /srv/pgwal, /srv/redis (idempotent; --check
+#                                  verifies without changing anything)
+#   2. uncomment the blocks below
+#   3. LIVE deployment? read docs/CUTOVER-RUNBOOK.md FIRST. Docker NEVER
+#      re-points an existing volume — it refuses on conflicting options — so
+#      this is a copy-verify-recreate, not an edit. ./install.sh reports a
+#      `mismatch` verdict and stops rather than letting you converge into it.
+#
+# Each `device` is a SUBDIRECTORY of its mountpoint, never the mountpoint itself,
+# and that is load-bearing: if the disk fails to mount, binding the mountpoint
+# hands Postgres an empty directory and it initdbs a brand-new EMPTY cluster —
+# the app boots, passes every health check, and serves zero rows. The
+# subdirectory exists only ON the disk and Docker's bind driver will not create
+# it, so an unmounted disk fails the container start instead. It also sidesteps
+# `lost+found`, which would otherwise make a fresh ext4 volume "non-empty".
+#
+# Mount with UUIDs in fstab and `nofail` — a detached disk must not make the VM
+# unbootable. ./prepare-disks.sh does both.
 volumes:
   postgres-data:
+    # driver: local
+    # driver_opts:
+    #   type: none
+    #   o: bind
+    #   device: /srv/pgdata/data
+  postgres-wal:
+    # driver: local
+    # driver_opts:
+    #   type: none
+    #   o: bind
+    #   device: /srv/pgwal/wal
   redis-data:
+    # driver: local
+    # driver_opts:
+    #   type: none
+    #   o: bind
+    #   device: /srv/redis/data
   uploads-data:
   backups-data:
   npm-cache-data:
@@ -365,5 +523,7 @@ secrets:
     file: ./secrets/postgres_url
   redis_url:
     file: ./secrets/redis_url
+  redis_cache_url:
+    file: ./secrets/redis_cache_url
   better_auth_secret:
     file: ./secrets/better_auth_secret
