@@ -572,6 +572,14 @@ t ".env.app wins over .env"               "Authorization: Bearer fromapp" "$(cd 
 : > dph/.env.app
 t ".env is the fallback"                  "Authorization: Bearer fromenv" "$(cd dph && deep_probe_auth_header)"
 
+# ── NXPI_TARGET_VERSION: a rehearsal migrates a SCRATCH copy to a target the ─
+# live ./.env does not name yet (upgrade-db.sh bumps DB_VERSION later). The
+# override wins over DB_VERSION and the image tag; unset, nothing changes.
+mkdir -p tov && printf 'APP_IMAGE=x:latest\nDB_VERSION=1.15.0\n' > tov/.env
+t "db_target_version reads .env by default"    "1.15.0" "$(cd tov && db_target_version)"
+t "NXPI_TARGET_VERSION overrides it"           "1.41.0" "$(cd tov && NXPI_TARGET_VERSION=1.41.0 db_target_version)"
+t "an empty override is ignored"               "1.15.0" "$(cd tov && NXPI_TARGET_VERSION= db_target_version)"
+
 # ── pending_migrations(): what a read-only observer would apply, WITHOUT ─────
 # creating the marker table (discover.sh must leave no trace).
 t "pending_migrations is defined" "function" "$(type -t pending_migrations 2>/dev/null || echo MISSING)"

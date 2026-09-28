@@ -375,7 +375,44 @@ app_image_digest() {
 #   psql_admin < db/1.2.0/schema.sql
 #   psql_admin -v admin_email=... -v admin_password_hash=... < seed.sql
 psql_admin() {
-  compose exec -T postgres psql -v ON_ERROR_STOP=1 -U neogen_admin -d neogen "$@"
+  if [ "${PSQL_TARGET:-}" = "scratch" ]; then
+    # schema-parity.sh / the rehearsal: a throwaway postgres started by
+    # scratch_pg_start. Same user/db names, so every helper above works on it.
+    [ -n "${SCRATCH_CID:-}" ] || die "PSQL_TARGET=scratch but no scratch postgres is running"
+    $DOCKER exec -i "$SCRATCH_CID" psql -v ON_ERROR_STOP=1 -U neogen_admin -d neogen "$@"
+  else
+    compose exec -T postgres psql -v ON_ERROR_STOP=1 -U neogen_admin -d neogen "$@"
+  fi
+}
+
+# ── Scratch postgres (schema-parity.sh, the rehearsal) ───────────────────────
+# scratch_pg_start IMAGE — start a throwaway postgres from IMAGE (the live
+# postgres image, so the catalog matches), no network, data on tmpfs unless
+# SCRATCH_DATA_DIR names a host directory (a large dump needs disk). Sets
+# SCRATCH_CID. Waits for pg_isready; dies otherwise.
+scratch_pg_start() {
+  local image="$1" i store
+  if [ -n "${SCRATCH_DATA_DIR:-}" ]; then mkdir -p "$SCRATCH_DATA_DIR"; store="-v $SCRATCH_DATA_DIR:/var/lib/postgresql/data"
+  else store="--tmpfs /var/lib/postgresql/data:rw,size=${SCRATCH_TMPFS_SIZE:-4g}"; fi
+  # shellcheck disable=SC2086
+  SCRATCH_CID=$($DOCKER run -d --rm --network none $store --shm-size 256m \
+      -e POSTGRES_USER=neogen_admin -e POSTGRES_DB=neogen -e POSTGRES_PASSWORD=scratch \
+      "$image" -c max_wal_size=2GB -c maintenance_work_mem=256MB) || die "could not start a scratch postgres from $image"
+  for i in $(seq 1 60); do
+    $DOCKER exec "$SCRATCH_CID" pg_isready -U neogen_admin -d neogen >/dev/null 2>&1 && \
+      $DOCKER exec "$SCRATCH_CID" psql -U neogen_admin -d neogen -tAc 'select 1' >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  scratch_pg_stop; die "scratch postgres did not become ready in 60s"
+}
+scratch_pg_stop() { [ -n "${SCRATCH_CID:-}" ] && $DOCKER rm -f "$SCRATCH_CID" >/dev/null 2>&1; SCRATCH_CID=""; return 0; }
+# scratch_load_sql FILE [psql-args…] — apply a shipped SQL file to the scratch.
+# The \restrict / \unrestrict meta-commands pg_dump ≥ 17.6 emits are an
+# anti-injection guard for interactive use, not DDL; older psql clients reject
+# them, so they are stripped for the scratch load only.
+scratch_load_sql() {
+  local f="$1"; shift
+  sed -E '/^\\(un)?restrict /d' "$f" | PSQL_TARGET=scratch psql_admin "$@"
 }
 
 # flush_redis — FLUSHALL the redis container (queues + cache). Call whenever
@@ -628,7 +665,10 @@ assert_version_alignment() {
 # package, so only DB_VERSION can resolve them).
 db_target_version() {
   local ver img
-  ver=$(env_get .env DB_VERSION "")
+  # NXPI_TARGET_VERSION: a rehearsal migrates a SCRATCH copy to a release the
+  # live ./.env does not name yet (upgrade-db.sh bumps DB_VERSION afterwards).
+  ver=${NXPI_TARGET_VERSION:-}
+  [ -n "$ver" ] || ver=$(env_get .env DB_VERSION "")
   if [ -z "$ver" ]; then
     img=$(env_get .env APP_IMAGE "")
     case "$img" in *@sha256:*) return 0 ;; esac   # digest pin — no version
@@ -940,20 +980,27 @@ schema_probe_report() {
 # container can read it — a non-root HOST user (the operator running install.sh)
 # therefore cannot `cat` it directly. Fall back to sudo (install.sh requires
 # sudo and has already used it to set the secret's ownership).
-neo_gen_password() {
-  local url pw
-  url=$(cat secrets/postgres_url 2>/dev/null || true)
+neo_gen_password() { url_password_from_secret secrets/postgres_url; }
+
+# privileged_role_password — same, for the neogen_priv pool (1.29.0+).
+privileged_role_password() { url_password_from_secret secrets/postgres_privileged_url; }
+
+# url_password_from_secret FILE — the password inside a postgres:// URL secret,
+# read with a sudo fallback (the file is uid 1001 / mode 400) and percent-decoded.
+url_password_from_secret() {
+  local file="$1" url pw
+  url=$(cat "$file" 2>/dev/null || true)
   if [ -z "$url" ] && [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
     # `-n` first: an EXPIRED sudo cache in a non-interactive run (plausible
     # after a long image pull) must fail fast, not hang on a hidden password
     # prompt with stderr discarded. Retry interactively only when a tty can
     # actually take the prompt.
-    url=$(sudo -n cat secrets/postgres_url 2>/dev/null || true)
+    url=$(sudo -n cat "$file" 2>/dev/null || true)
     if [ -z "$url" ] && [ -t 0 ]; then
-      url=$(sudo cat secrets/postgres_url 2>/dev/null || true)
+      url=$(sudo cat "$file" 2>/dev/null || true)
     fi
   fi
-  pw=${url#*://}     # neo_gen:<pw>@postgres:5432/neogen
+  pw=${url#*://}     # <user>:<pw>@postgres:5432/neogen
   pw=${pw#*:}        # <pw>@postgres:5432/neogen
   pw=${pw%%@*}       # <pw>
   # percent-decode (installer passwords are plain hex → no-op; user-supplied
