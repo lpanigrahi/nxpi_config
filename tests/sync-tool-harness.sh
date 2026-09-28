@@ -74,6 +74,10 @@ t "drift leaves ours untouched"        "no"  "$(grep -q 'changed upstream' "$OUR
 # 5. the report can go to a file; a non-semver folder name is a hard error
 OUT=$(bash "$TOOL" "$SRC" --package "$OURS" --report "$WORK/report.txt" 2>&1); RC=$?
 t "--report writes the diff report"    "yes" "$(grep -q -- '--- ours/README.md' "$WORK/report.txt" 2>/dev/null && echo yes || echo no)"
+t "--report summary counts differing files" "yes" "$(grep -q '(1 differing file(s))' <<<"$OUT" && echo yes || echo no)"
+printf 'ours\n' > "$SRC/README.md"   # now identical → the count must read 0, on ONE line
+OUT=$(bash "$TOOL" "$SRC" --package "$OURS" --report "$WORK/report0.txt" 2>&1); RC=$?
+t "--report summary reads 0 when nothing differs" "yes" "$(grep -q '(0 differing file(s))' <<<"$OUT" && echo yes || echo no)"
 mkdir -p "$SRC/db/1.3.0-rc1"
 OUT=$(bash "$TOOL" "$SRC" --package "$OURS" 2>&1); RC=$?
 t "non-semver folder name exits 1"     "1"   "$RC"

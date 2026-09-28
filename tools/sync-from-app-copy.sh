@@ -131,7 +131,9 @@ emit_report() {
 }
 if [ -n "$REPORT" ]; then
   emit_report > "$REPORT"
-  ok "diff report written to $REPORT ($(grep -c '^--- ours/' "$REPORT" 2>/dev/null || echo 0) differing file(s))"
+  # grep -c prints the count even when it is 0 (and then exits 1) — no fallback echo.
+  n=$(grep -c '^--- ours/' "$REPORT" 2>/dev/null || true)
+  ok "diff report written to $REPORT (${n:-0} differing file(s))"
 else
   emit_report
 fi
