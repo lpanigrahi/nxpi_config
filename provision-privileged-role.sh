@@ -84,9 +84,11 @@ psql_admin -c "DO \$\$ BEGIN
 END \$\$;" </dev/null >/dev/null || die "CREATE ROLE failed"
 psql_admin -c "ALTER ROLE $ROLE WITH LOGIN BYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT;" </dev/null >/dev/null || die "ALTER ROLE failed"
 psql_admin -c "GRANT neo_gen TO $ROLE;" </dev/null >/dev/null || die "GRANT neo_gen TO $ROLE failed"
-# The password travels as a psql VARIABLE on stdin (psql interpolates :'pw'
-# in scripts read from stdin, quoting it as a literal), never as SQL text.
-printf "ALTER ROLE %s PASSWORD :'pw';\n" "$ROLE" | psql_admin -v pw="$PW" >/dev/null || die "setting the password failed"
+# The password travels on STDIN as a psql variable (`\set`, then :'pw' is
+# interpolated as a quoted literal) — never on argv, where `ps` and the exec
+# instance's inspect output would show it. Installer passwords are plain hex.
+case "$PW" in *\'*|*\\*) die "the privileged password contains a quote or backslash — regenerate secrets/postgres_privileged_url with plain hex" ;; esac
+printf "\\\\set pw '%s'\nALTER ROLE %s PASSWORD :'pw';\n" "$PW" "$ROLE" | psql_admin >/dev/null || die "setting the password failed"
 
 role_bypass || die "$ROLE exists but is not LOGIN+BYPASSRLS (or is SUPERUSER) after convergence — inspect pg_roles"
 role_member || die "$ROLE is not a member of neo_gen after convergence"

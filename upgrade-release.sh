@@ -12,12 +12,16 @@
 # Flags: --target X.Y.Z (default: newest db/ shipped here) · --image REF
 # (required forward; tag@sha256 recommended — a bare tag is pinned to the digest
 # it resolves to) · --dry-run (preflight only; nothing changes) · --yes (skip
-# the one typed UPGRADE; acks stay explicit) · --ack WORD (pre-supply a typed
-# acknowledgement: DROP-AGENT-MEMORY, KNOWN-LIMIT) · --accept-uncataloged-uploads
+# the one typed UPGRADE — and ROLLBACK on --rollback; typed ACKS are never
+# skipped, pre-supply them) · --ack WORD (DROP-AGENT-MEMORY, KNOWN-LIMIT; a
+# required ack that is neither supplied nor answerable — no terminal — is
+# refused in preflight, before anything changes) · --accept-uncataloged-uploads
 # · --no-rehearse · --skip-parity · --smoke-login (real sign-in with
 # SMOKE_LOGIN_EMAIL from ./.env and secrets/smoke_login_password) · --ship-config
-# (also upload the config tar to Blob) · --clear-stale-pin · --allow-override-file
-# · --accept-data-loss-since (rollback after go-live) · --adopt-schema-version V.
+# (also upload the config tar — it CONTAINS secrets/ — to Blob) ·
+# --clear-stale-pin · --allow-override-file · --accept-data-loss-since (rollback
+# after go-live) · --adopt-schema-version V. The flags of the first run are
+# recorded in state.env; --resume reuses them.
 #
 # Sequence (each step is recorded in backups/release-<id>/state.env; --resume
 # skips what is done):
@@ -172,14 +176,18 @@ if $ROLLBACK; then
   RS_ARGS="--yes $DUMP --skip-resync"; [ -n "$UPL" ] && [ -s "$UPL" ] && RS_ARGS="$RS_ARGS --uploads $UPL"
   # shellcheck disable=SC2086
   if ./restore.sh $RS_ARGS; then RS=0; else RS=$?; fi
-  # 4. verify against the bundle
+  # 4. verify against the bundle. restore.sh has already started the old app,
+  # which writes cron_run_log / session / job rows within seconds — so the
+  # judgement is rowcount_compare's (no table may SHRINK or DISAPPEAR relative
+  # to the pre-upgrade snapshot; growth is informational), never an exact cmp.
   hdr "Rollback verification"
   V=0
   rowcount_snapshot > "$RUN/rowcounts.rollback" 2>/dev/null || true
   if [ -s "$RUN/rowcounts.before" ] && [ -s "$RUN/rowcounts.rollback" ]; then
-    if cmp -s <(sort "$RUN/rowcounts.before") <(sort "$RUN/rowcounts.rollback"); then ok "row counts identical to the pre-upgrade snapshot"
-    else warn "row counts differ from the pre-upgrade snapshot:"; diff <(sort "$RUN/rowcounts.before") <(sort "$RUN/rowcounts.rollback") | head -n 20 | sed 's/^/    /'; V=1; fi
-  fi
+    RBC=$(rowcount_compare "$RUN/rowcounts.before" "$RUN/rowcounts.rollback"); RBRC=$?
+    printf '%s\n' "$RBC" | grep -E '^(!!|grew|new|unchanged)' | sed 's/^/    /' || true
+    [ "$RBRC" = "0" ] && ok "no table lost rows relative to the pre-upgrade snapshot" || { warn "tables LOST rows relative to the pre-upgrade snapshot (the '!!' lines)"; V=1; }
+  else warn "could not compare row counts (snapshot missing)"; V=1; fi
   if [ -s "$RUN/uploads-stats.before" ]; then
     NOW=$(uploads_volume_stats 2>/dev/null || true)
     [ "$NOW" = "$(cat "$RUN/uploads-stats.before")" ] && ok "uploads volume: $NOW (files, KiB) as before" || { warn "uploads volume differs: now '$NOW', before '$(cat "$RUN/uploads-stats.before")'"; V=1; }
@@ -198,6 +206,16 @@ is_exact_semver "$TARGET" || die "--target must be bare X.Y.Z"
 [ -d "db/$TARGET" ] || die "db/$TARGET is not shipped here"
 [ -n "$IMAGE" ] || IMAGE=$(gv NEW_IMAGE); [ -n "$IMAGE" ] || die "--image <ref> is required (the new app image, tag@sha256 recommended)"
 sv TARGET "$TARGET"
+# The first run's flags are recorded; a --resume that omits them reuses them.
+if [ -n "$RESUME" ]; then
+  [ -n "$ACKS" ] || { ACKS=$(gv ACKS); for a in $ACKS; do ACK_ARGS="$ACK_ARGS --ack $a"; done; }
+  $ACCEPT_UNCAT || [ "$(gv ACCEPT_UNCAT)" != "true" ] || ACCEPT_UNCAT=true
+  $SKIP_PARITY  || [ "$(gv SKIP_PARITY)"  != "true" ] || SKIP_PARITY=true
+  $REHEARSE     && [ "$(gv REHEARSE)" = "false" ] && REHEARSE=false
+  [ -n "$ADOPT" ] || ADOPT=$(gv ADOPT)
+fi
+sv ACKS "$ACKS"; sv ACCEPT_UNCAT "$ACCEPT_UNCAT"; sv SKIP_PARITY "$SKIP_PARITY"; sv REHEARSE "$REHEARSE"; sv ADOPT "$ADOPT"
+export NXPI_IMAGE_SWITCH_PENDING=1   # upgrade-db.sh: APP_IMAGE is switched AFTER the migration (step 8)
 
 # EXIT trap: a stop before any database mutation is undone by restarting the
 # OLD app; after the migration started nothing is auto-started — the message
@@ -253,7 +271,17 @@ if begin preflight "1. Preflight → db $TARGET, image $IMAGE"; then
 
   DB_BYTES=$(psql_scalar "select pg_database_size(current_database())"); UPS=$(uploads_volume_stats 2>/dev/null || printf '0\t0'); UP_KB=${UPS#*$'\t'}
   NEED=$(disk_need_kb "${DB_BYTES:-0}" "$(( ${UP_KB:-0} * 1024 ))"); AVAIL=$(df -Pk . | awk 'NR==2{print $4}')
-  kvp "disk need / free (KiB)" "$NEED / $AVAIL"; [ "$AVAIL" -ge "$NEED" ] || die "not enough free space for the window (need $NEED KiB, have $AVAIL) — prune backups/ or grow the disk"
+  kvp "disk need / free (KiB)" "$NEED / $AVAIL  (3×DB + 2×uploads + image + slack)"; [ "$AVAIL" -ge "$NEED" ] || die "not enough free space for the window (need $NEED KiB, have $AVAIL) — prune backups/ or grow the disk"
+  # Where the scratch postgres (parity + rehearsal) keeps its data: tmpfs is
+  # fastest but competes with the LIVE postgres for RAM. When the database is
+  # more than a quarter of what the kernel calls available, use the disk under
+  # the run directory instead (counted in disk_need_kb's third DB copy).
+  MEM_AVAIL_KB=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null || true)
+  if [ -n "$MEM_AVAIL_KB" ] && [ "$(( ${DB_BYTES:-0} / 1024 ))" -gt "$(( MEM_AVAIL_KB / 4 ))" ]; then
+    export SCRATCH_DATA_DIR="$SCRIPT_DIR/$RUN/scratch"; kvp "scratch postgres" "disk-backed under $RUN/scratch (DB $(( ${DB_BYTES:-0} / 1048576 )) MiB vs $(( MEM_AVAIL_KB / 1024 )) MiB available)"
+  elif [ -n "$MEM_AVAIL_KB" ]; then kvp "scratch postgres" "tmpfs (DB $(( ${DB_BYTES:-0} / 1048576 )) MiB, $(( MEM_AVAIL_KB / 1024 )) MiB available)"
+  else kvp "scratch postgres" "tmpfs (memory availability unknown on this host; set SCRATCH_DATA_DIR to force disk)"; fi
+  sv SCRATCH_DATA_DIR "${SCRATCH_DATA_DIR:-}"
 
   kvp "TRUSTED_PROXY_MODE" "$(env_get .env.app TRUSTED_PROXY_MODE '<absent → will append xff>')"
   kvp "METRICS_TOKEN" "$([ -n "$(env_get .env.app METRICS_TOKEN '')" ] && echo set || echo '<absent → will generate>')"
@@ -262,7 +290,17 @@ if begin preflight "1. Preflight → db $TARGET, image $IMAGE"; then
   log "guided upgrade dry run (pre-checks, allow-list, review headers)…"
   UD_ARGS="--dry-run --run-dir $RUN --skip-parity $ACK_ARGS"; [ -n "$ADOPT" ] && UD_ARGS="$UD_ARGS --adopt-schema-version $ADOPT"; $ASSUME_YES && UD_ARGS="$UD_ARGS --yes"
   # shellcheck disable=SC2086
-  ./upgrade-db.sh "$TARGET" $UD_ARGS || die "upgrade-db.sh --dry-run failed (above) — nothing was changed"
+  ./upgrade-db.sh "$TARGET" $UD_ARGS > "$RUN/.dryrun.out" 2>&1; UDRC=$?
+  cat "$RUN/.dryrun.out"
+  [ "$UDRC" = "0" ] || die "upgrade-db.sh --dry-run failed (above) — nothing was changed"
+  # A typed acknowledgement the real run will demand must be answerable now:
+  # pre-supplied with --ack, or a terminal on stdin. Otherwise refuse HERE.
+  NEED_ACKS=$(grep -oE 'will ask you to type [A-Z-]+' "$RUN/.dryrun.out" | awk '{print $NF}' | sort -u | tr '\n' ' ')
+  for w in $NEED_ACKS; do
+    case " $ACKS " in *" $w "*) ;; *) [ -t 0 ] || die "the real run will require the typed acknowledgement $w and stdin is not a terminal — re-run with --ack $w (nothing was changed)" ;; esac
+  done
+  [ -z "$NEED_ACKS" ] || kvp "typed acks required" "$NEED_ACKS$([ -n "$ACKS" ] && printf ' (supplied:%s)' "$ACKS")"
+  rm -f "$RUN/.dryrun.out"
 
   # The uploads gate: the current image answers 404 for any uploads/<uuid>-<name>
   # object with no thread_attachment row (uploads/shared/… excepted). Bytes stay
@@ -293,12 +331,22 @@ fi
 
 # ── 3. Safety bundle ─────────────────────────────────────────────────────────
 if begin bundle "3. Safety bundle → $RUN"; then
-  BK_ARGS="--no-prune --stamp $RUN_ID"; $DOCKER volume inspect "${PROJECT}_uploads-data" >/dev/null 2>&1 && BK_ARGS="$BK_ARGS --require-uploads"
-  # shellcheck disable=SC2086
-  BK_OUT=$(./backup.sh $BK_ARGS 2>&1 | tee /dev/stderr) || die "backup.sh failed — refusing to continue without a verified dump"
-  DUMP=$(printf '%s\n' "$BK_OUT" | sed -n 's/^BACKUP_DUMP=//p' | tail -n1); UPL=$(printf '%s\n' "$BK_OUT" | sed -n 's/^BACKUP_UPLOADS=//p' | tail -n1)
-  [ -s "$DUMP" ] || die "backup.sh did not report a dump"
+  HAVE_UPLOADS=false; $DOCKER volume inspect "${PROJECT}_uploads-data" >/dev/null 2>&1 && HAVE_UPLOADS=true
+  DUMP="backups/neogen-$RUN_ID.dump"; UPL=""; $HAVE_UPLOADS && UPL="backups/uploads-$RUN_ID.tar.gz"
+  if [ -s "$DUMP" ] && { [ -z "$UPL" ] || [ -s "$UPL" ]; } && compose exec -T postgres pg_restore --list "/app/backups/$(basename "$DUMP")" >/dev/null 2>&1; then
+    # --resume after a crash later in this step: the dump was written and
+    # verifies, and backup.sh refuses to overwrite a stamped dump — reuse it.
+    ok "reusing the verified dump $DUMP${UPL:+ and $UPL} from the interrupted run"
+  else
+    rm -f "$DUMP" "$UPL"   # a partial artifact from an interrupted run
+    BK_ARGS="--no-prune --stamp $RUN_ID"; $HAVE_UPLOADS && BK_ARGS="$BK_ARGS --require-uploads"
+    # shellcheck disable=SC2086
+    BK_OUT=$(./backup.sh $BK_ARGS 2>&1 | tee /dev/stderr) || die "backup.sh failed — refusing to continue without a verified dump"
+    DUMP=$(printf '%s\n' "$BK_OUT" | sed -n 's/^BACKUP_DUMP=//p' | tail -n1); UPL=$(printf '%s\n' "$BK_OUT" | sed -n 's/^BACKUP_UPLOADS=//p' | tail -n1)
+    [ -s "$DUMP" ] || die "backup.sh did not report a dump"
+  fi
   sv DUMP "$DUMP"; sv UPLOADS_TAR "$UPL"
+  sudo -v 2>/dev/null || true   # the preflight may have outlasted the sudo timestamp
   cp .env "$RUN/env.before"; cp .env.app "$RUN/env.app.before"; cp docker-compose.yml "$RUN/compose.before.yml"; chmod 600 "$RUN"/env*.before
   [ -n "$OLD_DIGEST" ] && printf 'services:\n  app:\n    image: "%s"\n' "$OLD_DIGEST" > "$RUN/rollback-image.yml"
   CONF="$RUN/config-$RUN_ID.tar.gz"
@@ -348,13 +396,23 @@ fi
 
 # ── 7. Migrate ───────────────────────────────────────────────────────────────
 if begin migrate "7. Migrate the database to $TARGET"; then
-  sv STEP_migrate_started done
   UD_ARGS="--yes --no-backup --run-dir $RUN --skip-parity $ACK_ARGS"; [ -n "$ADOPT" ] && UD_ARGS="$UD_ARGS --adopt-schema-version $ADOPT"
+  [ -f "$RUN/.migrate-invoked" ] && UD_ARGS="$UD_ARGS --reuse-baseline"   # a resume: keep the ORIGINAL baseline
+  rm -f "$RUN/.migrate-invoked.now"
+  # upgrade-db.sh writes $RUN/.migrate-invoked the moment every gate has passed
+  # and migrate.sh is about to write — a failure before that changed nothing.
   # shellcheck disable=SC2086
-  if ! ./upgrade-db.sh "$TARGET" $UD_ARGS; then
-    warn "upgrade-db.sh FAILED — every delta is one transaction and the marker is exact: the database is at an intermediate release, the app is DOWN."
+  if ./upgrade-db.sh "$TARGET" $UD_ARGS; then
+    sv STEP_migrate_started done
+  elif [ -f "$RUN/.migrate-invoked" ]; then
+    sv STEP_migrate_started done
+    warn "upgrade-db.sh FAILED after migrations began — every delta is one transaction and the marker is exact: the database is at an intermediate release, the app is DOWN."
     warn "Fix the cause and:  ./upgrade-release.sh --resume $RUN_ID     or roll back:  ./upgrade-release.sh --rollback $RUN_ID"
     exit 3
+  else
+    warn "upgrade-db.sh refused at one of its gates BEFORE any migration ran — the database is unchanged; the old app is restarted."
+    warn "Resolve the message above (an ack? --ack WORD; the privileged pool? .env + provision) and:  ./upgrade-release.sh --resume $RUN_ID"
+    exit 2
   fi
   finish migrate
 fi
@@ -381,11 +439,24 @@ fi
 # ── 10. Post-verification ────────────────────────────────────────────────────
 if begin verify "10. Post-verification"; then
   V=0; vfail() { warn "$*"; V=$((V+1)); }
-  rowcount_snapshot > "$RUN/rowcounts.after" || vfail "could not snapshot row counts"
+  # The HARD losslessness gate is the pair of snapshots upgrade-db.sh took
+  # with the app STOPPED (before the first delta, after the last) against the
+  # printed allow-list. A snapshot taken now, with the new image serving, also
+  # sees its boot-time sweeps (expired grants, session/invite cleanup) — that
+  # comparison is printed as advisory only.
   EXP="$RUN/pre-$TARGET-expected-changes.tsv"; [ -f "$EXP" ] || EXP=""
-  CMP=$(rowcount_compare "$RUN/rowcounts.before" "$RUN/rowcounts.after" ${EXP:+"$EXP"}); CRC=$?   # no errexit in this script
-  printf '%s\n' "$CMP" | grep -E '^(ok|!!|new|grew|unchanged)' | sed 's/^/    /' || true
-  [ "$CRC" = "0" ] && ok "row counts changed only as the pending deltas allow" || vfail "UNEXPECTED row-count change (the '!!' lines)"
+  PRE="$RUN/pre-$TARGET-rowcounts.txt"; POST="$PRE.after"
+  if [ -s "$PRE" ] && [ -s "$POST" ]; then
+    CMP=$(rowcount_compare "$PRE" "$POST" ${EXP:+"$EXP"}); CRC=$?   # no errexit in this script
+    printf '%s\n' "$CMP" | grep -E '^(ok|!!|new|grew|unchanged)' | sed 's/^/    /' || true
+    [ "$CRC" = "0" ] && ok "row counts changed only as the pending deltas allow (app stopped, before → after migration)" || vfail "UNEXPECTED row-count change during the migration (the '!!' lines)"
+  else vfail "upgrade-db.sh's before/after snapshots are missing under $RUN"; fi
+  rowcount_snapshot > "$RUN/rowcounts.after" 2>/dev/null || true
+  if [ -s "$RUN/rowcounts.after" ]; then
+    ADV=$(rowcount_compare "$RUN/rowcounts.before" "$RUN/rowcounts.after" ${EXP:+"$EXP"})
+    log "advisory — bundle time vs now, with the new image serving (its own sweeps may delete expired rows):"
+    printf '%s\n' "$ADV" | grep -E '^(!!|grew|new|unchanged)' | sed 's/^/    /' || true
+  fi
   U_NOW=$(user_count); [ "$U_NOW" = "$(cat "$RUN/users.before")" ] && ok "users: $U_NOW (unchanged)" || vfail "users changed: $(cat "$RUN/users.before") → $U_NOW"
   O_NOW=$(psql_scalar "select count(*) from organization"); [ "$O_NOW" = "$(cat "$RUN/orgs.before")" ] && ok "organizations: $O_NOW (unchanged)" || vfail "organizations changed"
   UPS_NOW=$(uploads_volume_stats 2>/dev/null || printf '0\t0'); [ "$UPS_NOW" = "$(cat "$RUN/uploads-stats.before")" ] && ok "uploads volume: $UPS_NOW (files, KiB) unchanged" || vfail "uploads volume changed: $(cat "$RUN/uploads-stats.before") → $UPS_NOW"

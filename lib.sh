@@ -323,10 +323,11 @@ health_gate() {
 # table_count — number of tables in schema `public`. Prints NOTHING on query
 # failure (deliberate: callers must FAIL CLOSED on an empty result rather than
 # mistake a transient exec/psql failure for a fresh database).
+# Routed through psql_admin so PSQL_TARGET=scratch (schema-parity.sh's
+# rehearsal) counts the SCRATCH database, not the live one beside it.
 table_count() {
-  compose exec -T postgres psql -U neogen_admin -d neogen -tAc \
-    "select count(*) from information_schema.tables where table_schema='public'" \
-    2>/dev/null | tr -d '[:space:]' || true
+  psql_admin -tAc "select count(*) from information_schema.tables where table_schema='public'" \
+    </dev/null 2>/dev/null | tr -d '[:space:]' || true
 }
 
 # user_count — rows in the auth "user" table; the bootstrap-completion
@@ -339,14 +340,10 @@ table_count() {
 # when the relation is missing, even though that branch would never execute.
 user_count() {
   local missing
-  missing=$(compose exec -T postgres psql -U neogen_admin -d neogen -tAc \
-    "select to_regclass('public.user') is null" \
-    2>/dev/null | tr -d '[:space:]' || true)
+  missing=$(psql_admin -tAc "select to_regclass('public.user') is null" </dev/null 2>/dev/null | tr -d '[:space:]' || true)
   case "$missing" in
     t) printf -- '-1' ;;
-    f) compose exec -T postgres psql -U neogen_admin -d neogen -tAc \
-         'select count(*) from public."user"' \
-         2>/dev/null | tr -d '[:space:]' || true ;;
+    f) psql_admin -tAc 'select count(*) from public."user"' </dev/null 2>/dev/null | tr -d '[:space:]' || true ;;
     *) : ;;   # query failed → print nothing (caller fails closed)
   esac
 }
@@ -780,10 +777,12 @@ env_set() {
 }
 
 # disk_need_kb DB_BYTES UPLOADS_BYTES — the free space a release window wants,
-# in KiB: two copies of the database (the dump plus the migration's rewrite /
-# index-build headroom), the uploads archive once, 1.5 GiB for the new image
-# and 2 GiB of slack for WAL bursts and logs.
-disk_need_kb() { printf '%s' $(( ( 2 * $1 + $2 ) / 1024 + 1572864 + 2097152 )); }
+# in KiB: three copies of the database (the dump, the migration's rewrite /
+# index-build headroom, and either a disk-backed scratch copy for the rehearsal
+# or the rollback's own safety dump), the uploads archive twice (the bundle
+# and the rollback's safety tar), 1.5 GiB for the new image and 2 GiB of slack
+# for WAL bursts and logs.
+disk_need_kb() { printf '%s' $(( ( 3 * $1 + 2 * $2 ) / 1024 + 1572864 + 2097152 )); }
 
 # rowcount_compare BEFORE AFTER [EXPECT] — the losslessness assertion.
 # BEFORE/AFTER are `table<TAB>count` snapshots (rowcount_snapshot). EXPECT is

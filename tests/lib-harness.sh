@@ -524,9 +524,11 @@ t "classification is exhaustive"   "6"   "$(wc -l <<<"$OUT" | tr -d ' ')"
 
 # ── disk_need_kb(): the free-space demand of a window ──────────────────────────
 t "disk_need_kb is defined" "function" "$(type -t disk_need_kb 2>/dev/null || echo MISSING)"
-# 2×DB + uploads + 1.5 GiB image + 2 GiB slack, in KiB: 2·1 GiB + 0 + 1.5 GiB + 2 GiB = 5.5 GiB = 5767168 KiB
-t "disk_need_kb 1GiB db, no uploads" "5767168" "$(disk_need_kb 1073741824 0)"
-t "disk_need_kb adds uploads once"   "5768192" "$(disk_need_kb 1073741824 1048576)"
+# 3×DB (dump, migration headroom, a disk-backed scratch or the rollback's own
+# safety dump) + 2×uploads (bundle tar + rollback safety tar) + 1.5 GiB image
+# + 2 GiB slack, in KiB: 3·1 GiB + 0 + 3.5 GiB = 6.5 GiB = 6815744 KiB
+t "disk_need_kb 1GiB db, no uploads" "6815744" "$(disk_need_kb 1073741824 0)"
+t "disk_need_kb counts uploads twice" "6817792" "$(disk_need_kb 1073741824 1048576)"
 
 # ── list_pending_destructive(): EVERY unapplied flagged delta, not just the first ─
 t "list_pending_destructive is defined" "function" "$(type -t list_pending_destructive 2>/dev/null || echo MISSING)"

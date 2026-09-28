@@ -100,10 +100,21 @@ t "permission_catalog_slugs has members:view" "yes" "$(permission_catalog_slugs 
 t "p25_unknown_permissions SQL embeds the vocabulary" "yes" "$(check_sql p25_unknown_permissions | grep -q "'members:view'" && echo yes || echo no)"
 
 # ── expect_rows_for(): the printed allow-list for rowcount_compare ───────────
-STUB="p22_viewer_audit_view_rows=1 p22_readonly_audit_view_items=1"
+# 1.22.0/0005 DELETEs the viewer/read-only audit:view rows AND INSERTs audit:view
+# for every system security-admin lacking it — the net on org_role_permission can
+# be zero or even growth, so the allow-list is an OPEN shrink that names both.
+STUB="p22_viewer_audit_view_rows=1 p22_readonly_audit_view_items=1 p22_secadmin_missing_audit_view=1"
 OUT=$(expect_rows_for $'migrate-1.22.0.sql')
-t "1.22.0 alone → exact shrink lines" "yes" "$(grep -qE $'^org_role_permission\tshrink=1\t' <<<"$OUT" && grep -qE $'^org_permission_group_item\tshrink=1\t' <<<"$OUT" && echo yes || echo no)"
+t "1.22.0 alone → open shrink on org_role_permission naming the insert" "yes" "$(grep -qE $'^org_role_permission\tshrink\t.*security-admin' <<<"$OUT" && echo yes || echo no)"
+t "1.22.0 alone → exact shrink on the pack items"  "yes" "$(grep -qE $'^org_permission_group_item\tshrink=1\t' <<<"$OUT" && echo yes || echo no)"
 t "1.22.0 alone → nothing else"       "2"   "$(wc -l <<<"$OUT" | tr -d ' ')"
+t "p22_secadmin_missing_audit_view is a check" "yes" "$(grep -q '^p22_secadmin_missing_audit_view' <<<"$CHECKS" && echo yes || echo no)"
+STUB="p26_audit_chain_head_rows=2"
+run_checks report $'migrate-1.26.0.sql' >/dev/null
+t "more than one audit_chain_head row BLOCKS 1.26.0" "yes" "$(grep -q '^p26_audit_chain_head_rows' <<<"$CHECK_BLOCKERS" && echo yes || echo no)"
+STUB="p26_audit_chain_head_rows=0"
+run_checks report $'migrate-1.26.0.sql' >/dev/null
+t "only the platform head (no other rows) is fine" "" "$CHECK_BLOCKERS"
 OUT=$(expect_rows_for $'migrate-1.22.0.sql\nmigrate-1.25.0.sql\nmigrate-1.27.0.sql\nmigrate-1.35.0.sql\nmigrate-1.40.1.sql')
 t "1.25.0 adds open shrinks"          "yes" "$(grep -qE $'^org_permission_group\tshrink\t' <<<"$OUT" && grep -qE $'^org_role_permission\tshrink\t' <<<"$OUT" && echo yes || echo no)"
 t "1.25.0 pins org_resource_grant same" "yes" "$(grep -qE $'^org_resource_grant\tsame\t' <<<"$OUT" && echo yes || echo no)"

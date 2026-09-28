@@ -33,6 +33,7 @@ CHECKS=$(printf '%s\n' \
   $'p20_apikeys_become_unscoped\tmigrate-1.20.0.sql\tinfo\tapikey\tAPI keys that will hold no org authority until re-bound (1.20.0 binds keys to one organization)' \
   $'p22_viewer_audit_view_rows\tmigrate-1.22.0.sql\tinfo\torg_role_permission,org_role\torg_role_permission rows 1.22.0 DELETES (system viewer role, audit:view, not denied)' \
   $'p22_readonly_audit_view_items\tmigrate-1.22.0.sql\tinfo\torg_permission_group_item,org_permission_group\torg_permission_group_item rows 1.22.0 DELETES (system read-only pack, audit:view)' \
+  $'p22_secadmin_missing_audit_view\tmigrate-1.22.0.sql\tinfo\torg_role,org_role_permission\tsystem security-admin roles 1.22.0 GRANTS audit:view to (one org_role_permission row inserted each)' \
   $'p25_privilege_request_dups\tmigrate-1.25.0.sql\tblock\torg_privilege_request\tduplicate PENDING privilege requests per (membership, role, team) — 0010 refuses them' \
   $'p25_team_member_no_team\tmigrate-1.25.0.sql\tblock\tteam_member,team\tteam_member rows whose team no longer exists — 0011 cannot resolve their organization' \
   $'p25_team_member_not_org_member\tmigrate-1.25.0.sql\tblock\tteam_member,team,organization_member\tteam_member rows whose user is NOT a member of the team\'s organization — 0011 refuses them (enrol the user; deleting the row can orphan a team)' \
@@ -45,7 +46,7 @@ CHECKS=$(printf '%s\n' \
   $'p25_unknown_permissions\tmigrate-1.25.0.sql\tblock\torg_role_permission,org_permission_group_item,org_resource_grant\tpermission slugs in use that 0012\'s catalog does not know' \
   $'p25_junction_orphans\tmigrate-1.25.0.sql\tblock\torg_role_permission,org_role,org_permission_group_item,org_permission_group,org_role_permission_group\tRBAC junction rows with no parent role/group — 0017 cannot take an organization from nothing' \
   $'p25_role_group_org_mismatch\tmigrate-1.25.0.sql\tblock\torg_role_permission_group,org_role,org_permission_group\trole↔pack attachments across two organizations — 0017 refuses them' \
-  $'p26_audit_chain_head_rows\tmigrate-1.26.0.sql\tinfo\taudit_chain_head\taudit_chain_head rows (1.26.0 keys the chain per organization; expects the single platform head)' \
+  $'p26_audit_chain_head_rows\tmigrate-1.26.0.sql\tblock\taudit_chain_head\taudit_chain_head rows OTHER than the single platform head (id=1) — 1.26.0/0020 refuses to key a chain it did not expect' \
   $'p29_app_role_can_bypass_rls\tmigrate-1.29.0.sql\tblock\t-\tthe neo_gen app role is SUPERUSER or BYPASSRLS — 1.29.0\'s FORCE ROW LEVEL SECURITY would be inert' \
   $'p35_agent_memory_rows\tmigrate-1.35.0.sql\tack:DROP-AGENT-MEMORY\tagent_memory\trows in agent_memory, which 1.35.0 DROPS (an orphan store with no readers — expected 0)' \
   $'rls_posture\talways\tinfo\t-\ttables with row-level security FORCED (0 before 1.29.0, ≥26 after)' \
@@ -79,6 +80,8 @@ check_sql() {
       printf '%s' "select count(*) from org_role_permission orp join org_role r on orp.role_id = r.id where r.is_system and r.key = 'viewer' and orp.permission = 'audit:view' and orp.denied = false" ;;
     p22_readonly_audit_view_items)
       printf '%s' "select count(*) from org_permission_group_item gi join org_permission_group g on gi.group_id = g.id where g.is_system and g.key = 'read-only' and gi.permission = 'audit:view'" ;;
+    p22_secadmin_missing_audit_view)
+      printf '%s' "select count(*) from org_role r where r.is_system and r.key = 'security-admin' and not exists (select 1 from org_role_permission p where p.role_id = r.id and p.permission = 'audit:view')" ;;
     p25_privilege_request_dups)
       printf '%s' "select count(*) from (select 1 from org_privilege_request where status = 'pending' group by membership_id, role_id, coalesce(team_id, '00000000-0000-0000-0000-000000000000'::uuid) having count(*) > 1) d" ;;
     p25_team_member_no_team)
@@ -113,7 +116,7 @@ check_sql() {
     p25_role_group_org_mismatch)
       printf '%s' "select count(*) from org_role_permission_group rg join org_role r on r.id = rg.role_id join org_permission_group g on g.id = rg.group_id where r.organization_id <> g.organization_id" ;;
     p26_audit_chain_head_rows)
-      printf '%s' "select count(*) from audit_chain_head" ;;
+      printf '%s' "select count(*) from audit_chain_head where id <> 1" ;;
     p29_app_role_can_bypass_rls)
       printf '%s' "select count(*) from pg_roles where rolname = 'neo_gen' and (rolsuper or rolbypassrls)" ;;
     p35_agent_memory_rows)
@@ -252,8 +255,14 @@ expect_rows_for() {
   local pending="$1" n
   has() { grep -qx "$1" <<<"$pending"; }
   if has migrate-1.22.0.sql; then
-    n=$(check_count p22_viewer_audit_view_rows);    case "$n" in ''|*[!0-9]*) n=0 ;; esac
-    printf 'org_role_permission\tshrink=%s\t1.22.0/0005: the system viewer role loses audit:view (moved to security-admin)\n' "$n"
+    # 0005 DELETEs the viewer rows AND INSERTs audit:view for every system
+    # security-admin lacking it, so the net on org_role_permission can be zero
+    # or growth — an OPEN shrink, with both counts in the reason; the pack items
+    # are delete-only and stay exact.
+    local d i
+    d=$(check_count p22_viewer_audit_view_rows);       case "$d" in ''|*[!0-9]*) d=0 ;; esac
+    i=$(check_count p22_secadmin_missing_audit_view);  case "$i" in ''|*[!0-9]*) i=0 ;; esac
+    printf 'org_role_permission\tshrink\t1.22.0/0005: the system viewer role loses audit:view (%s row(s) deleted) while security-admin gains it (%s row(s) inserted) — net may be zero\n' "$d" "$i"
     n=$(check_count p22_readonly_audit_view_items); case "$n" in ''|*[!0-9]*) n=0 ;; esac
     printf 'org_permission_group_item\tshrink=%s\t1.22.0/0005: the system read-only pack loses audit:view\n' "$n"
   fi

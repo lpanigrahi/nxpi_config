@@ -76,6 +76,7 @@ TARGET_VER=""
 NO_BACKUP=false
 RUN_DIR="backups"
 SKIP_PARITY=false
+REUSE_BASELINE=false
 ACKS=""
 
 while [ $# -gt 0 ]; do
@@ -84,6 +85,10 @@ while [ $# -gt 0 ]; do
     --dry-run)               DRY_RUN=true ;;
     --no-backup)             NO_BACKUP=true ;;
     --skip-parity)           SKIP_PARITY=true ;;
+    # upgrade-release.sh --resume: the baseline in --run-dir was taken BEFORE
+    # the first (partial) migration run; a fresh one would describe the
+    # intermediate state and make the final comparison lie.
+    --reuse-baseline)        REUSE_BASELINE=true ;;
     --ack)                   shift; [ $# -gt 0 ] || die "--ack needs a word"; ACKS="$ACKS $1" ;;
     --ack=*)                 ACKS="$ACKS ${1#*=}" ;;
     --run-dir)               shift; [ $# -gt 0 ] || die "--run-dir needs a directory"; RUN_DIR="$1" ;;
@@ -165,20 +170,19 @@ if [ -n "$CUR_DB_VERSION" ] && ! ver_le "$CUR_DB_VERSION" "$TARGET_VER"; then
   release, or pass a target at or above $CUR_DB_VERSION."
 fi
 
-ensure_migration_marker
-MARKER_N=$(marker_row_count)
-[ -n "$MARKER_N" ] || die "could not read the migration marker (postgres busy?) — re-run when stable"
-log "migration marker        : $MARKER_N recorded"
+# A dry run changes NOTHING — not even the marker table: read it if it exists.
+if $DRY_RUN && ! marker_table_exists; then
+  MARKER_N=0
+  log "migration marker        : table absent (dry run leaves it absent)"
+else
+  ensure_migration_marker
+  MARKER_N=$(marker_row_count)
+  [ -n "$MARKER_N" ] || die "could not read the migration marker (postgres busy?) — re-run when stable"
+  log "migration marker        : $MARKER_N recorded"
+fi
 
 # What apply_migrations WOULD run, computed the same way it computes it.
-PENDING=""
-while IFS= read -r f <&3; do
-  [ -n "$f" ] || continue
-  base=$(basename "$f")
-  [ "$(q "select 1 from public.deploy_schema_migrations where filename = '${base//\'/\'\'}'")" = "1" ] \
-    || PENDING="${PENDING}${base}"$'\n'
-done 3< <(migration_files_through "$TARGET_VER")
-PENDING=${PENDING%$'\n'}
+PENDING=$(pending_migrations "$TARGET_VER")
 
 # pending_has FILE — true when FILE is in the pending set.
 pending_has() { printf '%s\n' "$PENDING" | grep -qx "$1"; }
@@ -311,6 +315,8 @@ else
 fi
 if $DRY_RUN; then
   log "(dry run) would write $SNAPSHOT, $EXPECT and $CUSTOM_RBAC"
+elif $REUSE_BASELINE && [ -s "$SNAPSHOT" ] && [ -s "$EXPECT" ]; then
+  ok "reusing the baseline already in $RUN_DIR (--reuse-baseline): $SNAPSHOT, $EXPECT, $CUSTOM_RBAC"
 else
   rowcount_snapshot > "$SNAPSHOT" || die "could not snapshot row counts — refusing to migrate without a baseline"
   [ -s "$SNAPSHOT" ] || die "the row-count snapshot came back empty — refusing to migrate without a baseline"
@@ -347,8 +353,23 @@ else
 fi
 
 # assert_version_alignment only enforces for an EXACT X.Y.Z image tag; moving
-# tags (latest/main/sha-…) legitimately skip it and rely on DB_VERSION.
-$DRY_RUN || assert_version_alignment
+# tags (latest/main/sha-…) legitimately skip it and rely on DB_VERSION. A dry
+# run evaluates it against the TARGET (the .env edit has not happened yet), so
+# an exact-tag pin that would stop the real run is reported now, not after the
+# edit. upgrade-release.sh switches APP_IMAGE only AFTER this script (so an
+# abort restarts a still-bootable old image) and says so with
+# NXPI_IMAGE_SWITCH_PENDING=1.
+if [ -n "${NXPI_IMAGE_SWITCH_PENDING:-}" ]; then
+  log "version alignment: skipped — the caller switches APP_IMAGE after the migration"
+elif $DRY_RUN; then
+  ALIGN_IMG=$(env_get .env APP_IMAGE ""); ALIGN_TAG=${ALIGN_IMG##*:}; ALIGN_TAG=${ALIGN_TAG#v}
+  case "$ALIGN_IMG" in *@sha256:*) ALIGN_TAG="" ;; esac; case "$ALIGN_TAG" in */*) ALIGN_TAG="" ;; esac
+  if [ -n "$ALIGN_TAG" ] && is_exact_semver "$ALIGN_TAG" && [ "$ALIGN_TAG" != "$TARGET_VER" ]; then
+    warn "APP_IMAGE pins the exact tag $ALIGN_TAG: the real run will REFUSE at version alignment once DB_VERSION=$TARGET_VER — repin APP_IMAGE (or let upgrade-release.sh switch it) first"
+  fi
+else
+  assert_version_alignment
+fi
 
 # ── 7. Surface EVERY REQUIRES-REVIEW delta, then migrate ────────────────────
 # lib.sh's list_pending_destructive prints every flagged file apply_migrations
@@ -431,6 +452,9 @@ hdr "Migration"
 # Its post-migration health gate may fail here when a running app image
 # predates the schema; migrate.sh exits 0 in that case by design.
 MIGRATE_ARGS=""; $NO_BACKUP && MIGRATE_ARGS="--no-backup"
+# Sentinel for upgrade-release.sh: every gate above passed and the database is
+# about to be written — a failure BEFORE this file exists changed nothing.
+: > "$RUN_DIR/.migrate-invoked"
 # shellcheck disable=SC2086
 ./migrate.sh $MIGRATE_ARGS \
   || die "migration failed — the database was rolled back to its pre-migration state.

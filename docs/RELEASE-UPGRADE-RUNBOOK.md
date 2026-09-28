@@ -134,13 +134,16 @@ If any of that fails, roll back **now**, before `OPENED_AT` matters:
 | 3 | database migrated, app NOT rolled — **down** | fix and `--resume <id>`, or `--rollback <id>` |
 | 4 | serving on the new image, a verification differs | investigate; rollback still valid |
 | 5 | rollback completed healthy | you are back at the pre-upgrade state (the `.rollback-image.yml` pin stays until the next successful `./update.sh`) |
-| 6 | rollback failed | `./compose.sh ps`, `./compose.sh logs app`, the restore log under `backups/`; the bundle files are intact |
+| 6 | rollback failed | **Do not start the app by hand.** The state is: app stopped, `.env` already reverted, `.rollback-image.yml` pinned to the OLD digest, the database possibly still at 1.41.0 — `./compose.sh up -d` would boot the old image against a forced-RLS / keyed-chain schema. Read the restore log under `backups/`, fix the cause (disk full for the safety backup is the usual one), then re-run `./upgrade-release.sh --rollback <id>` or directly `./restore.sh --yes <dump> --uploads <tar> --skip-resync --no-backup`; the bundle files are intact |
 
 ## 5. Aftercare
 
-- Keep `backups/release-<id>/` (bundle + every snapshot and parity report)
-  until the next backup cycle has proven itself; `backups/pre-1.41.0-*` and
-  `.env.bak-*` can go once you are confident.
+- Keep `backups/release-<id>/` (every snapshot, parity report and the config/
+  caddy tars) until the next backup cycle has proven itself; `.env.bak-*` can
+  go once you are confident. **The run's dump and uploads tar live beside the
+  cron backups** (`backups/neogen-<id>.dump`, `backups/uploads-<id>.tar.gz`)
+  and fall under `BACKUP_RETENTION_DAYS` like any other — copy them into the
+  run directory (or off the VM) if you want them past that window.
 - Set `DB_PRIVILEGED_PREFLIGHT_MODE=enforce` in `.env.app` once the privileged
   pool is confirmed working, so a future regression refuses to boot instead
   of warning.
