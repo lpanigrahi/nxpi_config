@@ -80,7 +80,13 @@ list, the allow-list of row changes, every review header, and zero blockers:
 ```
 
 Announce the window. Budget: rehearsal wall-clock × 2, plus the health gates
-(300 s each, twice) and your own go/no-go checks.
+(300 s each, twice) and your own go/no-go checks. Measured on 2026-09-28 on a
+laptop (amd64 images emulated on Apple Silicon, a seed-sized database):
+`upgrade-release.sh` 353 s end to end (preflight incl. the scratch rehearsal
+≈ 3 min, the 27 deltas ≈ 1 min, roll + health gate ≈ 1 min), rollback 17 s.
+A VM runs the images natively but migrates real data: time the pending set
+against the row counts `discover.sh` prints (1.25.0 rewrites `org_resource_grant`
+and 1.26.0/1.31.0 build indexes on `admin_audit_log`).
 
 ## 3. The window
 
