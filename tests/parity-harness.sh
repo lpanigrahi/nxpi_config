@@ -74,6 +74,21 @@ cp scratch.inv live2.inv; mkdir out2; parity_classify scratch.inv live2.inv out2
 t "identical inventories → verdict 0"              "0" "$(parity_verdict out2; echo $?)"
 t "identical inventories → empty findings"         "0" "$(cat out2/only-scratch.txt out2/only-live.txt | wc -l | tr -d ' ')"
 
+# ── an EMPTY only-scratch must not swallow the only-live lines ───────────────
+# neogen-vm at 1.15.0: the live catalog is a strict superset of schema.sql (it
+# still carries the ivfflat index legacy 0082 drops). With nothing missing,
+# an `FNR == NR` two-file awk sees the FIRST line of the second file as part
+# of the (empty) first file and files the extra index as "missing".
+{ cat scratch.inv; echo 'index|public.knowledge_embeddings|knowledge_embeddings_embedding_ivfflat_idx|CREATE INDEX ON public.knowledge_embeddings USING ivfflat (embedding public.vector_cosine_ops)'; } > live3.inv
+mkdir out4; parity_classify scratch.inv live3.inv out4
+t "superset live: nothing is reported missing"     "0" "$(grep -c . out4/only-scratch.txt | tr -d ' ')"
+t "superset live: the extra index is only-live"    "1" "$(grep -c 'ivfflat' out4/only-live.txt | tr -d ' ')"
+t "superset live: summary says only-live=1"        "yes" "$(grep -qE 'only-scratch=0 only-live=1' out4/summary.txt && echo yes || echo no)"
+{ echo 'table|public.zzz|r|rls=f|force=f'; cat live3.inv; } > scratch2.inv   # the mirror: empty only-live
+mkdir out5; parity_classify scratch2.inv live3.inv out5
+t "superset scratch: the extra table is only-scratch" "1" "$(grep -c 'public.zzz' out5/only-scratch.txt | tr -d ' ')"
+t "superset scratch: nothing is reported extra"       "0" "$(grep -c . out5/only-live.txt | tr -d ' ')"
+
 # ── accept file: operator-accepted regexes drop hard lines to advisory ───────
 printf 'agent_memory\n' > accept.txt
 mkdir out3; parity_classify scratch.inv live.inv out3 accept.txt

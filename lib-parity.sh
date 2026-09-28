@@ -48,7 +48,9 @@ parity_classify() {
   awk -F'|' -v OFS='|' -v ADV="$out/advisory.txt" -v OS="$out/only-scratch.txt" -v OL="$out/only-live.txt" '
     function keyof(line,   n, i, k, f) { n = split(line, f, "|"); k = ""; for (i = 1; i <= n; i++) if (i != 3) k = k "|" f[i]; return k }
     function nameable(line) { return (line ~ /^index\|/ || line ~ /^constraint\|/) }
-    FNR == NR { s[FNR] = $0; if (nameable($0)) { sk[keyof($0)] = $3 }; ns = FNR; next }
+    # FILENAME, not `FNR == NR`: when only-scratch.raw is EMPTY the first
+    # record of only-live.raw also has FNR == NR and would be filed as scratch.
+    FILENAME == ARGV[1] { s[FNR] = $0; if (nameable($0)) { sk[keyof($0)] = $3 }; ns = FNR; next }
     { l[FNR] = $0; if (nameable($0)) { lk[keyof($0)] = $3 }; nl = FNR }
     END {
       for (i = 1; i <= ns; i++) { line = s[i]; if (nameable(line) && (keyof(line) in lk)) print "name-only: scratch=" line " ↔ live-name=" lk[keyof(line)] > ADV; else print line > OS }
