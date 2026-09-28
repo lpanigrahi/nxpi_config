@@ -6,8 +6,12 @@
 -- Deliberately NOT included: attnum (ordinal positions legitimately differ
 -- between ADD COLUMN and a fresh CREATE TABLE), owners, tablespaces, stats,
 -- extension versions, row data. Whitespace inside policy predicates and
--- function bodies is collapsed. search_path is emptied so every regclass /
--- regtype renders schema-qualified the same way on both sides.
+-- function bodies is collapsed, and SQL comments inside function bodies are
+-- dropped before hashing: a migrate-*.sql delta keeps its `--` commentary in
+-- pg_proc.prosrc while the pg_dump'd schema.sql renders the same function
+-- without it, and the code is what parity judges. search_path is emptied so
+-- every regclass / regtype renders schema-qualified the same way on both
+-- sides.
 \set QUIET on
 SET search_path = '';
 
@@ -75,12 +79,19 @@ SELECT 'trigger|' || t.tgrelid::regclass::text || '|' || t.tgname || '|' || pg_c
  WHERE n.nspname IN ('public', 'drizzle') AND NOT t.tgisinternal
  ORDER BY 1;
 
--- functions: signature, result, security/volatility, body hash (whitespace collapsed)
+-- functions: signature, result, security/volatility, body hash (comments dropped, whitespace collapsed).
+-- Comment stripping is textual: a `--` or `/*` inside a string literal is also
+-- dropped, identically on both sides, so parity stays consistent — it only
+-- stops noticing a literal that differs after such a token.
 SELECT 'function|' || n.nspname || '.' || p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')'
        || '|' || pg_catalog.pg_get_function_result(p.oid)
        || '|secdef=' || p.prosecdef || '|vol=' || p.provolatile::text
        || '|config=' || COALESCE(array_to_string(p.proconfig, ','), '')
-       || '|' || md5(regexp_replace(p.prosrc, '\s+', ' ', 'g'))
+       || '|' || md5(regexp_replace(
+                       regexp_replace(
+                         regexp_replace(p.prosrc, '/\*.*?\*/', '', 'g'),   -- /* block */ comments
+                         '--[^\n]*', '', 'g'),                            -- -- line comments
+                       '\s+', ' ', 'g'))
   FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
  WHERE n.nspname IN ('public', 'drizzle')
  ORDER BY 1;
