@@ -431,5 +431,133 @@ t "a mention in prose is not a marker"   ""  "$(review_marker_line m-mention.sql
 t "marker below line 6 is still reported (lint fails it)" "8" "$(review_marker_line m-late.sql)"
 t "no marker → empty"                    ""  "$(review_marker_line m-none.sql)"
 
+# ── Patch releases order between their minor and the next (1.40.0 < 1.40.1 < 1.41.0)
+t "ver_le 1.40.0 <= 1.40.1"  "y" "$(ver_le 1.40.0 1.40.1 && echo y || echo n)"
+t "ver_le 1.40.1 <= 1.41.0"  "y" "$(ver_le 1.40.1 1.41.0 && echo y || echo n)"
+t "ver_le 1.41.0 <= 1.40.1"  "n" "$(ver_le 1.41.0 1.40.1 && echo y || echo n)"
+t "is_exact_semver 1.40.1"   "y" "$(is_exact_semver 1.40.1 && echo y || echo n)"
+mkdir -p patch/db/1.40.0 patch/db/1.40.1 patch/db/1.41.0
+for v in 1.40.0 1.40.1 1.41.0; do printf -- '-- d\n' > patch/db/$v/migrate-$v.sql; done
+( cd patch && migration_files_through 1.41.0 | xargs -n1 basename | tr '\n' ' ' ) > patch/order.txt
+t "migration_files_through orders 1.40.0 1.40.1 1.41.0" "migrate-1.40.0.sql migrate-1.40.1.sql migrate-1.41.0.sql " "$(cat patch/order.txt)"
+( cd patch && migration_files_through 1.40.1 | xargs -n1 basename | tr '\n' ' ' ) > patch/order2.txt
+t "migration_files_through 1.40.1 stops before 1.41.0" "migrate-1.40.0.sql migrate-1.40.1.sql " "$(cat patch/order2.txt)"
+
+# ── image_ref_rename(): the registry moved nxpi_dev → nxpi; exact repo only ───
+t "image_ref_rename is defined" "function" "$(type -t image_ref_rename 2>/dev/null || echo MISSING)"
+t "tag ref is renamed"         "ghcr.io/negentrophi/nxpi:latest"      "$(image_ref_rename ghcr.io/negentrophi/nxpi_dev:latest)"
+t "digest ref is renamed"      "ghcr.io/negentrophi/nxpi@sha256:abc"  "$(image_ref_rename ghcr.io/negentrophi/nxpi_dev@sha256:abc)"
+t "new name is left alone"     "ghcr.io/negentrophi/nxpi:sha-cb44bba" "$(image_ref_rename ghcr.io/negentrophi/nxpi:sha-cb44bba)"
+t "helper image is left alone" "ghcr.io/negentrophi/nxpi-hash:latest" "$(image_ref_rename ghcr.io/negentrophi/nxpi-hash:latest)"
+t "db artifact is left alone"  "ghcr.io/negentrophi/nxpi_dev/db:1.41.0" "$(image_ref_rename ghcr.io/negentrophi/nxpi_dev/db:1.41.0)"
+t "other owner is left alone"  "ghcr.io/lpanigrahi/nxpi_dev:latest"   "$(image_ref_rename ghcr.io/lpanigrahi/nxpi_dev:latest)"
+t "custom old/new repos"       "r.io/b:1"                              "$(image_ref_rename r.io/a:1 r.io/a r.io/b)"
+
+# ── env_set(): replace-or-append a dotenv key so env_get reads it back ────────
+t "env_set is defined" "function" "$(type -t env_set 2>/dev/null || echo MISSING)"
+printf 'A=1\nDB_VERSION=1.15.0\n# comment\nB=2\n' > es.env
+env_set es.env DB_VERSION 1.41.0
+t "env_set replaces in place"        "1.41.0" "$(env_get es.env DB_VERSION)"
+t "env_set keeps the other keys"     "1 2"    "$(env_get es.env A) $(env_get es.env B)"
+t "env_set keeps line count"         "4"      "$(wc -l < es.env | tr -d ' ')"
+env_set es.env TRUSTED_PROXY_MODE xff
+t "env_set appends when absent"      "xff"    "$(env_get es.env TRUSTED_PROXY_MODE)"
+env_set es.env PW 'p @ss #1'
+t "env_set quotes a value with spaces/#" "p @ss #1" "$(env_get es.env PW)"
+env_set es.env IMG 'ghcr.io/negentrophi/nxpi:sha-cb44bba@sha256:1a615b98'
+t "env_set writes an image ref verbatim" "ghcr.io/negentrophi/nxpi:sha-cb44bba@sha256:1a615b98" "$(env_get es.env IMG)"
+printf 'K=1\n' > es2.env; printf 'K=2' >> es2.env   # no trailing newline before append
+env_set es2.env NEWKEY v
+t "env_set appends on its own line even without a trailing newline" "v" "$(env_get es2.env NEWKEY)"
+env_set es2.env K 3
+t "env_set collapses a last-wins duplicate to one line" "1" "$(grep -c '^K=' es2.env | tr -d ' ')"
+t "env_set value survives the collapse"                 "3" "$(env_get es2.env K)"
+
+# ── rowcount_compare(): losslessness with an explicit, printed allow-list ────
+t "rowcount_compare is defined" "function" "$(type -t rowcount_compare 2>/dev/null || echo MISSING)"
+printf 'user\t10\nchat\t5\norg_role_permission\t20\nagent_memory\t0\npermission_catalog\t0\norg_resource_grant\t7\ngroup\t4\n' > rc.before
+printf 'user\t10\nchat\t5\norg_role_permission\t17\npermission_catalog\t78\norg_resource_grant\t7\ngroup\t4\norg_resource_grant_agents\t3\n' > rc.after
+printf 'org_role_permission\tshrink=3\t0005 viewer loses audit:view\nagent_memory\tgone\t0094 orphan table dropped\npermission_catalog\tgrow\t0012 seeds the vocabulary\norg_resource_grant\tsame\t0015 checksummed rebuild\n' > rc.expect
+OUT=$(rowcount_compare rc.before rc.after rc.expect); RC=$?
+t "all-expected run exits 0"                "0"   "$RC"
+t "expected exact shrink is reported ok"    "yes" "$(grep -qE '^ok shrink.org_role_permission.20.17' <<<"$OUT" && echo yes || echo no)"
+t "expected gone is reported ok"            "yes" "$(grep -qE '^ok gone.agent_memory' <<<"$OUT" && echo yes || echo no)"
+t "a new partition child is reported new"   "yes" "$(grep -qE '^new.org_resource_grant_agents.3' <<<"$OUT" && echo yes || echo no)"
+t "unchanged tables are counted, not listed" "yes" "$(grep -qE '^unchanged.4$' <<<"$OUT" && echo yes || echo no)"
+t "no violation lines"                      "0"   "$(grep -c '^!!' <<<"$OUT" | tr -d ' ')"
+# violations: an unlisted shrink, an unlisted disappearance, a broken exact, a broken same
+printf 'user\t9\nchat\t5\norg_role_permission\t18\npermission_catalog\t78\norg_resource_grant\t6\n' > rc.bad
+OUT=$(rowcount_compare rc.before rc.after.missing rc.expect 2>/dev/null); RC=$?
+t "missing after-file fails closed"         "2"   "$RC"
+OUT=$(rowcount_compare rc.before rc.bad rc.expect); RC=$?
+t "violations exit 1"                       "1"   "$RC"
+t "unlisted shrink is a violation"          "yes" "$(grep -qE '^!! shrank.user.10.9' <<<"$OUT" && echo yes || echo no)"
+t "unlisted disappearance is a violation"   "yes" "$(grep -qE '^!! gone.group.4' <<<"$OUT" && echo yes || echo no)"
+t "exact shrink mismatch is a violation"    "yes" "$(grep -qE '^!! exact.org_role_permission.20.18.*expected 3' <<<"$OUT" && echo yes || echo no)"
+t "broken same is a violation"              "yes" "$(grep -qE '^!! same.org_resource_grant.7.6' <<<"$OUT" && echo yes || echo no)"
+# a plain shrink line for the same table relaxes an exact one (1.22.0 exact + 1.25.0 open)
+printf 'org_role_permission\tshrink=3\tfirst\norg_role_permission\tshrink\tsecond delta also deletes\n' > rc.expect2
+printf 'org_role_permission\t20\n' > rc.b2; printf 'org_role_permission\t11\n' > rc.a2
+OUT=$(rowcount_compare rc.b2 rc.a2 rc.expect2); RC=$?
+t "open shrink relaxes exact for the same table" "0" "$RC"
+# no expect file at all: any shrink is a violation, growth is fine
+printf 'a\t1\nb\t1\n' > rc.b3; printf 'a\t2\nb\t1\n' > rc.a3
+OUT=$(rowcount_compare rc.b3 rc.a3); RC=$?
+t "growth without an expect file is fine"   "0"   "$RC"
+# a gone that is NOT gone is a violation (the drop did not happen)
+printf 'x\t1\n' > rc.b4; printf 'x\t1\n' > rc.a4; printf 'x\tgone\tshould drop\n' > rc.e4
+OUT=$(rowcount_compare rc.b4 rc.a4 rc.e4); RC=$?
+t "expected-gone table still present is a violation" "1" "$RC"
+
+# ── uploads_classify(): disk set vs catalog set, with the served-uncataloged layout ─
+t "uploads_classify is defined" "function" "$(type -t uploads_classify 2>/dev/null || echo MISSING)"
+printf 'uploads/31-report.txt\nuploads/32-orphan.txt\nuploads/shared/33-logo.png\nuploads/threads/9f/34-x.pdf\nlogos/old.png\n' > up.disk
+printf 'uploads/31-report.txt\nuploads/gone-from-disk.txt\n' > up.db
+OUT=$(uploads_classify up.disk up.db)
+t "cataloged file"                 "yes" "$(grep -qE '^cataloged.uploads/31-report.txt$' <<<"$OUT" && echo yes || echo no)"
+t "flat uncataloged file"          "yes" "$(grep -qE '^uncataloged.flat.uploads/32-orphan.txt$' <<<"$OUT" && echo yes || echo no)"
+t "shared layout is tagged shared" "yes" "$(grep -qE '^uncataloged.shared.uploads/shared/33-logo.png$' <<<"$OUT" && echo yes || echo no)"
+t "threads layout is tagged"       "yes" "$(grep -qE '^uncataloged.threads.uploads/threads/9f/34-x.pdf$' <<<"$OUT" && echo yes || echo no)"
+t "outside the prefix is other"    "yes" "$(grep -qE '^uncataloged.other.logos/old.png$' <<<"$OUT" && echo yes || echo no)"
+t "catalog row without a file"     "yes" "$(grep -qE '^missing-on-disk.uploads/gone-from-disk.txt$' <<<"$OUT" && echo yes || echo no)"
+t "classification is exhaustive"   "6"   "$(wc -l <<<"$OUT" | tr -d ' ')"
+
+# ── disk_need_kb(): the free-space demand of a window ──────────────────────────
+t "disk_need_kb is defined" "function" "$(type -t disk_need_kb 2>/dev/null || echo MISSING)"
+# 2×DB + uploads + 1.5 GiB image + 2 GiB slack, in KiB: 2·1 GiB + 0 + 1.5 GiB + 2 GiB = 5.5 GiB = 5767168 KiB
+t "disk_need_kb 1GiB db, no uploads" "5767168" "$(disk_need_kb 1073741824 0)"
+t "disk_need_kb adds uploads once"   "5768192" "$(disk_need_kb 1073741824 1048576)"
+
+# ── list_pending_destructive(): EVERY unapplied flagged delta, not just the first ─
+t "list_pending_destructive is defined" "function" "$(type -t list_pending_destructive 2>/dev/null || echo MISSING)"
+t "is_migration_applied is defined"     "function" "$(type -t is_migration_applied 2>/dev/null || echo MISSING)"
+mkdir -p pend/db/1.1.0 pend/db/1.2.0 pend/db/1.3.0 pend/db/1.4.0
+printf -- '-- d\n-- REQUIRES-REVIEW: a\n' > pend/db/1.1.0/migrate-1.1.0.sql
+printf -- '-- d\n' > pend/db/1.2.0/migrate-1.2.0.sql
+printf -- '-- d\n-- REQUIRES-REVIEW: b\n' > pend/db/1.3.0/migrate-1.3.0.sql
+printf -- '-- d\n-- REQUIRES-REVIEW: c\n' > pend/db/1.4.0/migrate-1.4.0.sql
+printf 'DB_VERSION=1.4.0\n' > pend/.env
+ensure_migration_marker() { :; }                                   # stub: no DB
+is_migration_applied() { [ "$1" = "migrate-1.1.0.sql" ]; }         # stub: 1.1.0 already applied
+cd pend
+t "lists every pending flagged delta in order" "db/1.3.0/migrate-1.3.0.sql db/1.4.0/migrate-1.4.0.sql " "$(list_pending_destructive | tr '\n' ' ')"
+t "has_pending_destructive still prints only the first" "db/1.3.0/migrate-1.3.0.sql" "$(has_pending_destructive)"
+printf 'DB_VERSION=1.2.0\n' > .env
+t "nothing flagged within a lower target" "" "$(list_pending_destructive)"
+cd ..
+unset -f ensure_migration_marker is_migration_applied
+
+# ── SCHEMA_PROBES: one sentinel per release, sorted, with SQL renderers ───────
+t "SCHEMA_PROBES is set"        "yes" "$([ -n "${SCHEMA_PROBES:-}" ] && echo yes || echo no)"
+t "SCHEMA_PROBES is sorted -V"  "yes" "$([ "$(printf '%s\n' "$SCHEMA_PROBES" | cut -f1)" = "$(printf '%s\n' "$SCHEMA_PROBES" | cut -f1 | sort -V)" ] && echo yes || echo no)"
+t "SCHEMA_PROBES reaches 1.41.0" "yes" "$(printf '%s\n' "$SCHEMA_PROBES" | grep -q '^1\.41\.0	' && echo yes || echo no)"
+t "SCHEMA_PROBES keeps the legacy 1.5.0 probe" "yes" "$(printf '%s\n' "$SCHEMA_PROBES" | grep -q '^1\.5\.0	table	skill_scan$' && echo yes || echo no)"
+t "schema_probe_sql column"     "yes" "$(schema_probe_sql column agent.governance_disabled_by | grep -q "table_name='agent'.*column_name='governance_disabled_by'" && echo yes || echo no)"
+t "schema_probe_sql table"      "yes" "$(schema_probe_sql table permission_catalog | grep -q "table_name='permission_catalog'" && echo yes || echo no)"
+t "schema_probe_sql policy"     "yes" "$(schema_probe_sql policy 'tenant_isolation ON org_role' | grep -q "policyname='tenant_isolation'.*tablename='org_role'" && echo yes || echo no)"
+t "schema_probe_sql function"   "yes" "$(schema_probe_sql function admin_audit_log_signed_append | grep -q "proname='admin_audit_log_signed_append'" && echo yes || echo no)"
+t "schema_probe_sql constraint" "yes" "$(schema_probe_sql constraint knowledge_embeddings_dims_col_ck | grep -q "conname='knowledge_embeddings_dims_col_ck'" && echo yes || echo no)"
+t "schema_probe_sql index"      "yes" "$(schema_probe_sql index cron_run_log_one_running_per_job | grep -q "indexname='cron_run_log_one_running_per_job'" && echo yes || echo no)"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 exit $((FAIL > 0))
