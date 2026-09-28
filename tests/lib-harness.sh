@@ -398,5 +398,38 @@ t "unpinned volume + pinned file = mismatch" "mismatch" \
   "$(placement_verdict yes /srv/pgdata/data "$(volume_device anything)")"
 unset -f fake_docker_noopts fake_docker_literal fake_docker_pinned fake_docker_fails
 
+# ── bundle_missing_files(): a db/<ver> folder is complete or it is not ───────
+# tools/sync-from-app-copy.sh refuses to copy a folder that lacks any of the
+# four artifacts; tests/db-bundle-lint.sh asserts every shipped one is whole.
+# The oldest folder (1.2.0) legitimately has no migrate-*.sql — third arg "no".
+t "bundle_missing_files is defined" "function" "$(type -t bundle_missing_files 2>/dev/null || echo MISSING)"
+mkdir -p bundles/9.9.0 bundles/9.9.1 bundles/9.9.2 bundles/1.2.0
+for f in schema.sql grants.sql seed.sql migrate-9.9.0.sql; do printf 'x\n' > bundles/9.9.0/$f; done
+for f in schema.sql grants.sql migrate-9.9.1.sql; do printf 'x\n' > bundles/9.9.1/$f; done   # no seed
+for f in schema.sql seed.sql migrate-9.9.2.sql; do printf 'x\n' > bundles/9.9.2/$f; done
+: > bundles/9.9.2/grants.sql                                                                # EMPTY grants
+for f in schema.sql grants.sql seed.sql; do printf 'x\n' > bundles/1.2.0/$f; done            # base: no migrate
+t "complete bundle → nothing missing"      ""           "$(bundle_missing_files bundles/9.9.0 9.9.0)"
+t "missing seed is reported"               "seed.sql"   "$(bundle_missing_files bundles/9.9.1 9.9.1)"
+t "an EMPTY grants.sql counts as missing"  "grants.sql" "$(bundle_missing_files bundles/9.9.2 9.9.2)"
+t "base folder without migrate is whole"   ""           "$(bundle_missing_files bundles/1.2.0 1.2.0 no)"
+t "base folder still wants the migrate by default" "migrate-1.2.0.sql" "$(bundle_missing_files bundles/1.2.0 1.2.0)"
+t "absent folder reports every artifact"   $'schema.sql\ngrants.sql\nseed.sql\nmigrate-0.0.1.sql' \
+  "$(bundle_missing_files bundles/0.0.1 0.0.1)"
+
+# ── review_marker_line(): where apply_migrations can SEE the marker ──────────
+# lib.sh greps `head -n 6` for REQUIRES-REVIEW. A marker written lower is
+# invisible and the delta silently rides the rolling path; prose that merely
+# MENTIONS the token ("not REQUIRES-REVIEW") must not be mistaken for one.
+t "review_marker_line is defined" "function" "$(type -t review_marker_line 2>/dev/null || echo MISSING)"
+printf -- '-- migrate-x.sql — delta\n-- REQUIRES-REVIEW: drops a thing\n-- body\n' > m-flagged.sql
+printf -- '-- migrate-y.sql — delta\n-- additive\n-- (deliberately not marked REQUIRES-REVIEW: nothing is dropped)\n' > m-mention.sql
+{ printf -- '-- migrate-z.sql\n'; for i in 2 3 4 5 6 7; do printf -- '-- line %s\n' $i; done; printf -- '-- REQUIRES-REVIEW: too low\n'; } > m-late.sql
+printf -- '-- plain\n' > m-none.sql
+t "anchored marker on line 2 → 2"        "2" "$(review_marker_line m-flagged.sql)"
+t "a mention in prose is not a marker"   ""  "$(review_marker_line m-mention.sql)"
+t "marker below line 6 is still reported (lint fails it)" "8" "$(review_marker_line m-late.sql)"
+t "no marker → empty"                    ""  "$(review_marker_line m-none.sql)"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 exit $((FAIL > 0))

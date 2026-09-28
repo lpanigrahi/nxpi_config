@@ -14,3 +14,8 @@ backups/*
 .rollback-image.yml
 # Inter-script mutual-exclusion lockfile.
 .deploy.lock
+
+# Session/plan scratch written by the superpowers skills (ledgers, briefs) and
+# harness-managed git worktrees. Never package content.
+.superpowers/
+.claude/worktrees/

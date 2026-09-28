@@ -650,6 +650,34 @@ resolved_db_version() {
   basename "$d"
 }
 
+# ── Bundle inventory (pure) ──────────────────────────────────────────────────
+# bundle_missing_files DIR VER [REQUIRE_MIGRATE=yes|no] — print, one per line,
+# the artifacts a db/<VER> folder must ship but does not (missing OR empty):
+# schema.sql, grants.sql, seed.sql and migrate-VER.sql. Empty output = whole.
+# The base folder of a lineage (db/1.2.0 here) legitimately has no delta —
+# pass "no" as the third argument for it. Used by tools/sync-from-app-copy.sh
+# (refuse to copy a partial folder) and tests/db-bundle-lint.sh.
+bundle_missing_files() {
+  local dir="$1" ver="$2" want_migrate="${3:-yes}" f
+  for f in schema.sql grants.sql seed.sql; do
+    [ -s "$dir/$f" ] || printf '%s\n' "$f"
+  done
+  if [ "$want_migrate" != "no" ]; then
+    [ -s "$dir/migrate-$ver.sql" ] || printf '%s\n' "migrate-$ver.sql"
+  fi
+}
+
+# review_marker_line FILE — the 1-based line number of the destructive-review
+# marker (`-- REQUIRES-REVIEW:` at the start of a line), or nothing when the
+# file carries none. apply_migrations only looks at `head -n 6`, so a marker
+# reported here at a line > 6 is a shipped delta that would ride the rolling
+# path unreviewed — tests/db-bundle-lint.sh fails on it. Prose that merely
+# mentions the token ("not marked REQUIRES-REVIEW") is not anchored and is
+# deliberately not matched.
+review_marker_line() {
+  grep -nE '^-- REQUIRES-REVIEW:' "$1" 2>/dev/null | head -n1 | cut -d: -f1
+}
+
 # neo_gen_password — the app-role password, extracted (and percent-decoded)
 # from the postgres_url secret. Used to ALTER ROLE neo_gen so the app (which
 # connects over TCP as neo_gen) can authenticate.
