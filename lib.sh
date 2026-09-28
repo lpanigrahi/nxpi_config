@@ -1140,6 +1140,60 @@ list_pending_destructive() {
   done 3< <(migration_files_through "$target")
 }
 
+# marker_table_exists — true when public.deploy_schema_migrations exists.
+# Read-only (unlike ensure_migration_marker, which CREATEs it): discover.sh
+# must leave no trace on a database it only observes.
+marker_table_exists() {
+  [ "$(psql_scalar "select to_regclass('public.deploy_schema_migrations') is not null")" = "t" ]
+}
+
+# pending_migrations TARGET — the migrate-*.sql basenames (<= TARGET, apply
+# order) not recorded in the marker, WITHOUT creating the marker table. When
+# the table is absent nothing was ever recorded, so everything is pending and
+# no marker query is made at all.
+pending_migrations() {
+  local target="$1" f base have=yes
+  marker_table_exists || have=no
+  while IFS= read -r f <&3; do
+    [ -n "$f" ] || continue
+    base=$(basename "$f")
+    if [ "$have" = "yes" ] && is_migration_applied "$base"; then continue; fi
+    printf '%s\n' "$base"
+  done 3< <(migration_files_through "$target")
+}
+
+# rowcount_snapshot — `table<TAB>count` for every base table in schema public
+# (partitioned parents included — information_schema reports them as BASE
+# TABLE — so a rebuilt org_resource_grant is compared as one number), sorted.
+# Exact counts, never estimates: this is the losslessness baseline.
+rowcount_snapshot() {
+  psql_admin -tAF$'\t' -c "
+    select table_name,
+           (xpath('/row/c/text()',
+                  query_to_xml(format('select count(*) as c from public.%I', table_name),
+                               false, true, '')))[1]::text::bigint
+    from information_schema.tables
+    where table_schema = 'public' and table_type = 'BASE TABLE'
+    order by table_name;" </dev/null 2>/dev/null
+}
+
+# uploads_list_volume — every file in the uploads volume, path relative to the
+# volume root (which is what thread_attachment.storage_key stores), sorted.
+# Read-only mount; alpine is already on every VM this package installed.
+uploads_list_volume() {
+  $DOCKER run --rm -v "${PROJECT}_uploads-data":/data:ro alpine \
+    sh -c 'cd /data && find . -type f | sed "s|^\./||" | sort'
+}
+# uploads_volume_stats — `files<TAB>kbytes` of the uploads volume.
+uploads_volume_stats() {
+  $DOCKER run --rm -v "${PROJECT}_uploads-data":/data:ro alpine \
+    sh -c 'cd /data && printf "%s\t%s\n" "$(find . -type f | wc -l | tr -d " ")" "$(du -sk . | cut -f1)"'
+}
+# uploads_list_catalog — every storage_key the catalog knows, sorted.
+uploads_list_catalog() {
+  psql_admin -tAc "select storage_key from thread_attachment order by 1" </dev/null 2>/dev/null
+}
+
 # has_pending_migration — returns 0 if ANY migration <= the target version is
 # not yet recorded (the DB is behind the target image). Fails closed on a
 # marker-read error, like apply_migrations.

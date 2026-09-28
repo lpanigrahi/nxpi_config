@@ -572,5 +572,20 @@ t ".env.app wins over .env"               "Authorization: Bearer fromapp" "$(cd 
 : > dph/.env.app
 t ".env is the fallback"                  "Authorization: Bearer fromenv" "$(cd dph && deep_probe_auth_header)"
 
+# ── pending_migrations(): what a read-only observer would apply, WITHOUT ─────
+# creating the marker table (discover.sh must leave no trace).
+t "pending_migrations is defined" "function" "$(type -t pending_migrations 2>/dev/null || echo MISSING)"
+t "marker_table_exists is defined" "function" "$(type -t marker_table_exists 2>/dev/null || echo MISSING)"
+cd pend
+printf 'DB_VERSION=1.4.0\n' > .env
+marker_table_exists() { return 0; }
+is_migration_applied() { [ "$1" = "migrate-1.1.0.sql" ]; }
+t "pending_migrations lists unapplied basenames in order" "migrate-1.2.0.sql migrate-1.3.0.sql migrate-1.4.0.sql " "$(pending_migrations 1.4.0 | tr '\n' ' ')"
+marker_table_exists() { return 1; }
+is_migration_applied() { die "must not query a marker table that does not exist"; }
+t "no marker table → everything is pending, no query made" "migrate-1.1.0.sql migrate-1.2.0.sql migrate-1.3.0.sql migrate-1.4.0.sql " "$(pending_migrations 1.4.0 | tr '\n' ' ')"
+cd ..
+unset -f marker_table_exists is_migration_applied
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 exit $((FAIL > 0))
