@@ -337,6 +337,35 @@ case "$BAU" in
   *) die "BETTER_AUTH_URL in ./.env must start with http:// or https:// (got: '$BAU')" ;;
 esac
 
+# ── Runtime posture the CURRENT image requires (converged, never overwritten) ─
+# TRUSTED_PROXY_MODE: the app REFUSES to boot in production without it. This
+# stack always runs Caddy in front, whose reverse_proxy ignores an incoming
+# X-Forwarded-* chain, so `xff` is the true statement (see .env.app.example).
+# Appended only when ABSENT — an operator's `none` (app exposed without Caddy)
+# is kept as-is.
+if [ -n "$(env_get .env.app TRUSTED_PROXY_MODE '')" ]; then
+  ok "TRUSTED_PROXY_MODE=$(env_get .env.app TRUSTED_PROXY_MODE '') already set in ./.env.app"
+else
+  env_set .env.app TRUSTED_PROXY_MODE xff
+  ok "appended TRUSTED_PROXY_MODE=xff to ./.env.app (REQUIRED by the current image; see .env.app.example)"
+fi
+# METRICS_TOKEN: /api/health/deep (the schema-drift advisory the scripts
+# print) answers 403 without it. Generated once; a scraper presents the same.
+if [ -n "$(env_get .env.app METRICS_TOKEN '')" ]; then
+  ok "METRICS_TOKEN already set in ./.env.app"
+else
+  env_set .env.app METRICS_TOKEN "$(openssl rand -hex 32 | tr -d '\n')"
+  ok "generated METRICS_TOKEN in ./.env.app (credentials the deep health probe)"
+fi
+# The registry rename (2026-09): ghcr.io/negentrophi/nxpi_dev is FROZEN at its
+# last build; CI publishes ghcr.io/negentrophi/nxpi. install.sh never rewrites
+# APP_IMAGE (a pin is the operator's), it says so; upgrade-release.sh rewrites.
+case "$(env_get .env APP_IMAGE '')" in
+  ghcr.io/negentrophi/nxpi_dev:*|ghcr.io/negentrophi/nxpi_dev@*)
+    warn "APP_IMAGE names ghcr.io/negentrophi/nxpi_dev, which no longer receives builds — the current release is
+  published as $(image_ref_rename "$(env_get .env APP_IMAGE '')") (see .env.example, REGISTRY RENAME). ./upgrade-release.sh rewrites it." ;;
+esac
+
 has_llm_key=false
 for k in OPENAI_API_KEY ANTHROPIC_API_KEY GOOGLE_GENERATIVE_AI_API_KEY OPENROUTER_API_KEY GROQ_API_KEY XAI_API_KEY AZURE_OPENAI_API_KEY; do
   [ -n "$(env_get .env.app "$k" "")" ] && { has_llm_key=true; break; }
@@ -513,6 +542,17 @@ else
     log "database already provisioned ($TABLES tables, $USERS users) — nothing to do."
     log "(to move to a newer release, use ./update.sh)"
   fi
+fi
+
+# ── 7b. Privileged pool (opt-in via POSTGRES_PRIVILEGED_URL_FILE in ./.env) ──
+# The secret file always exists (generated above); the ROLE behind it is
+# minted only when the operator has opted in — shipping a BYPASSRLS connection
+# by default would hand every deployment the unconstrained reader db 1.29.0
+# exists to remove. Idempotent; runs on fresh and adopted databases alike.
+if [ -n "$(env_get .env POSTGRES_PRIVILEGED_URL_FILE '')" ]; then
+  ./provision-privileged-role.sh || die "privileged-role provisioning failed — see above (nothing else was changed)"
+elif [ "$(psql_scalar "select 1 from pg_roles where rolname='neogen_priv'")" = "1" ]; then
+  warn "the neogen_priv role exists but ./.env does not set POSTGRES_PRIVILEGED_URL_FILE — the app is NOT using it (see .env.example, 'Privileged database pool')"
 fi
 
 # ── 8. Application + ingress ─────────────────────────────────────────────────
