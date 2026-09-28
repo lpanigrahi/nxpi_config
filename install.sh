@@ -38,7 +38,16 @@ for arg in "$@"; do
 done
 
 # run a command as root (sudo only when not already root)
-as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
+# NXPI_NO_SUDO=1 (tests/rehearsal.sh on a workstation without passwordless
+# sudo): run as the invoking user and let root-only steps fail softly. The
+# only such step is chowning the app secrets to uid 1001, which then falls
+# back to WORLD-READABLE secret files — acceptable in a throwaway rehearsal
+# copy, never on a VM. Production runs are unchanged.
+as_root() {
+  if [ "$(id -u)" -eq 0 ]; then "$@"
+  elif [ -n "${NXPI_NO_SUDO:-}" ]; then "$@" 2>/dev/null || return 1
+  else sudo "$@"; fi
+}
 
 # GNU/BSD-portable in-place sed (Ubuntu = GNU; BSD only during local testing)
 sed_i() { if sed --version >/dev/null 2>&1; then sed -i "$@"; else sed -i '' "$@"; fi; }
@@ -54,7 +63,7 @@ else
 fi
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v openssl >/dev/null 2>&1 || die "openssl is required"
-if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+if [ "$(id -u)" -ne 0 ] && [ -z "${NXPI_NO_SUDO:-}" ] && ! sudo -n true 2>/dev/null; then
   log "sudo access is needed for Docker install + secret ownership; you may be prompted"
   sudo true || die "sudo access is required"
 fi
@@ -173,14 +182,31 @@ gen_secret redis_url               sh -c "printf 'redis://:%s@redis:6379' \"\$(c
 # unreadable"; a cache URL is freely regenerable, and requiring it would make
 # every existing deployment die on its next install.sh run.
 gen_secret redis_cache_url         sh -c "printf 'redis://:%s@redis-cache:6379' \"\$(cat secrets/redis_password)\""
+# The PRIVILEGED pool's URL (db ≥ 1.29.0 forces RLS; the app's cross-tenant
+# sweeps need a BYPASSRLS role). Always generated — docker-compose.yml mounts
+# it as a file-secret, and a file-secret must exist at container create — but
+# only READ by the app when ./.env sets POSTGRES_PRIVILEGED_URL_FILE, and the
+# role behind it (neogen_priv) exists only once ./provision-privileged-role.sh
+# has run. Freely regenerable, so NOT in the required-secrets list above.
+gen_secret postgres_privileged_url sh -c "printf 'postgres://neogen_priv:%s@postgres:5432/neogen' \"\$(openssl rand -hex 24)\""
 # Compose file-secrets are bind mounts that keep HOST permissions. The app
-# container runs as uid 1001 (nextjs) and must be able to read its three
-# secrets; the root-read files stay owned by the invoking user, mode 600.
-as_root chown 1001 secrets/postgres_url secrets/redis_url secrets/redis_cache_url secrets/better_auth_secret
-as_root chmod 400  secrets/postgres_url secrets/redis_url secrets/redis_cache_url secrets/better_auth_secret
+# container runs as uid 1001 (nextjs) and must be able to read its secrets;
+# the root-read files stay owned by the invoking user, mode 600.
+APP_SECRETS="secrets/postgres_url secrets/postgres_privileged_url secrets/redis_url secrets/redis_cache_url secrets/better_auth_secret"
+# shellcheck disable=SC2086
+if as_root chown 1001 $APP_SECRETS; then
+  # shellcheck disable=SC2086
+  as_root chmod 400 $APP_SECRETS
+  ok "secret permissions set (app secrets → uid 1001 / 400, rest → 600)"
+elif [ -n "${NXPI_NO_SUDO:-}" ]; then
+  # shellcheck disable=SC2086
+  chmod 444 $APP_SECRETS
+  warn "NXPI_NO_SUDO: app secrets left WORLD-READABLE (mode 444) so uid 1001 can read them — rehearsal copies only"
+else
+  die "could not chown the app secrets to uid 1001"
+fi
 chmod 600 secrets/postgres_password secrets/redis_password 2>/dev/null \
-  || as_root chmod 600 secrets/postgres_password secrets/redis_password
-ok "secret permissions set (app secrets → uid 1001 / 400, rest → 600)"
+  || as_root chmod 600 secrets/postgres_password secrets/redis_password || true
 
 # ── 4. Environment files ─────────────────────────────────────────────────────
 hdr "Environment files"
@@ -328,6 +354,35 @@ case "$BAU" in
     fi
     ;;
   *) die "BETTER_AUTH_URL in ./.env must start with http:// or https:// (got: '$BAU')" ;;
+esac
+
+# ── Runtime posture the CURRENT image requires (converged, never overwritten) ─
+# TRUSTED_PROXY_MODE: the app REFUSES to boot in production without it. This
+# stack always runs Caddy in front, whose reverse_proxy ignores an incoming
+# X-Forwarded-* chain, so `xff` is the true statement (see .env.app.example).
+# Appended only when ABSENT — an operator's `none` (app exposed without Caddy)
+# is kept as-is.
+if [ -n "$(env_get .env.app TRUSTED_PROXY_MODE '')" ]; then
+  ok "TRUSTED_PROXY_MODE=$(env_get .env.app TRUSTED_PROXY_MODE '') already set in ./.env.app"
+else
+  env_set .env.app TRUSTED_PROXY_MODE xff
+  ok "appended TRUSTED_PROXY_MODE=xff to ./.env.app (REQUIRED by the current image; see .env.app.example)"
+fi
+# METRICS_TOKEN: /api/health/deep (the schema-drift advisory the scripts
+# print) answers 403 without it. Generated once; a scraper presents the same.
+if [ -n "$(env_get .env.app METRICS_TOKEN '')" ]; then
+  ok "METRICS_TOKEN already set in ./.env.app"
+else
+  env_set .env.app METRICS_TOKEN "$(openssl rand -hex 32 | tr -d '\n')"
+  ok "generated METRICS_TOKEN in ./.env.app (credentials the deep health probe)"
+fi
+# The registry rename (2026-09): ghcr.io/negentrophi/nxpi_dev is FROZEN at its
+# last build; CI publishes ghcr.io/negentrophi/nxpi. install.sh never rewrites
+# APP_IMAGE (a pin is the operator's), it says so; upgrade-release.sh rewrites.
+case "$(env_get .env APP_IMAGE '')" in
+  ghcr.io/negentrophi/nxpi_dev:*|ghcr.io/negentrophi/nxpi_dev@*)
+    warn "APP_IMAGE names ghcr.io/negentrophi/nxpi_dev, which no longer receives builds — the current release is
+  published as $(image_ref_rename "$(env_get .env APP_IMAGE '')") (see .env.example, REGISTRY RENAME). ./upgrade-release.sh rewrites it." ;;
 esac
 
 has_llm_key=false
@@ -506,6 +561,17 @@ else
     log "database already provisioned ($TABLES tables, $USERS users) — nothing to do."
     log "(to move to a newer release, use ./update.sh)"
   fi
+fi
+
+# ── 7b. Privileged pool (opt-in via POSTGRES_PRIVILEGED_URL_FILE in ./.env) ──
+# The secret file always exists (generated above); the ROLE behind it is
+# minted only when the operator has opted in — shipping a BYPASSRLS connection
+# by default would hand every deployment the unconstrained reader db 1.29.0
+# exists to remove. Idempotent; runs on fresh and adopted databases alike.
+if [ -n "$(env_get .env POSTGRES_PRIVILEGED_URL_FILE '')" ]; then
+  ./provision-privileged-role.sh || die "privileged-role provisioning failed — see above (nothing else was changed)"
+elif [ "$(psql_scalar "select 1 from pg_roles where rolname='neogen_priv'")" = "1" ]; then
+  warn "the neogen_priv role exists but ./.env does not set POSTGRES_PRIVILEGED_URL_FILE — the app is NOT using it (see .env.example, 'Privileged database pool')"
 fi
 
 # ── 8. Application + ingress ─────────────────────────────────────────────────

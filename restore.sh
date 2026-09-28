@@ -25,10 +25,15 @@ CONFIRMED=false
 DO_BACKUP=true
 DUMP=""
 UPLOADS_TAR=""
+SKIP_RESYNC=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --yes)       CONFIRMED=true ;;
     --no-backup) DO_BACKUP=false ;;
+    # A ROLLBACK restores a dump older than ./.env's DB_VERSION on purpose and
+    # must NOT be migrated forward again; upgrade-release.sh --rollback restores
+    # the old ./.env first AND passes this, belt and braces.
+    --skip-resync) SKIP_RESYNC=true ;;
     --uploads)   shift; UPLOADS_TAR="${1:-}"; [ -n "$UPLOADS_TAR" ] || die "--uploads needs a file argument" ;;
     -h|--help)   sed -n '2,/^# ===/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
     -*)          die "unknown flag: $1 (see --help)" ;;
@@ -213,7 +218,10 @@ fi
 # this block may `die` — that would leave the site down. Anything that cannot
 # be auto-applied is downgraded to a warning; the app is always restarted below.
 hdr "Schema re-sync (additive, matches the current release)"
-if RS_DIR=$(db_dir); then
+if $SKIP_RESYNC; then
+  log "skipped (--skip-resync): the restored schema is left exactly as the dump has it"
+elif RS_DIR=$(db_dir); then
+  log "target: ./$RS_DIR (from ./.env DB_VERSION=$(env_get .env DB_VERSION '<unset>') / APP_IMAGE) — a dump OLDER than this is migrated FORWARD now; pass --skip-resync to keep it as dumped"
   # Probe the marker BEFORE has_pending_destructive (whose
   # ensure_migration_marker would CREATE the table and mask "absent"), and
   # distinguish three states: table absent in the dump (pre-marker dump),

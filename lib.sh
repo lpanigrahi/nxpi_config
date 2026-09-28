@@ -216,17 +216,38 @@ ingress_probe() {
 # deep_probe_body — print /api/health/deep's response body (empty on failure).
 # Unlike ingress_probe this does NOT use -f: a 503 body is exactly what we want
 # to read. Same --resolve treatment so the real vhost is exercised.
+#
+# CREDENTIALED since DT-4-i-1: the deep probe answers 403 without the metrics
+# bearer or a platform-admin session, because its body names org-scoped tables
+# with no forced row security and the schema objects this image expects. The
+# token is the same METRICS_TOKEN /api/metrics takes. Unset (the default on a
+# deployment that scrapes nothing) means this advisory prints nothing useful —
+# which is what schema_notice already does for every non-matching body, so no
+# install/update/migrate step changes its verdict.
+#
+# deep_probe_auth_header — the Authorization header for that probe. The app
+# reads METRICS_TOKEN from its process env, i.e. ./.env.app (env_file) — so
+# that file is authoritative; ./.env is accepted as a fallback for an operator
+# who put it there. Pure (file reads only); harness-tested.
+deep_probe_auth_header() {
+  local token
+  token=$(env_get .env.app METRICS_TOKEN "")
+  [ -n "$token" ] || token=$(env_get .env METRICS_TOKEN "")
+  if [ -n "$token" ]; then printf 'Authorization: Bearer %s' "$token"
+  else printf 'X-Deep-Probe: none'; fi
+}
 deep_probe_body() {
-  local site http_port https_port
+  local site http_port https_port auth
   site=$(env_get .env SITE_ADDRESS "")
+  auth=$(deep_probe_auth_header)
   if [ -n "$site" ]; then
     https_port=$(env_get .env CADDY_HTTPS_PORT 443)
-    curl -sS --max-time 5 \
+    curl -sS --max-time 5 -H "$auth" \
       --resolve "${site}:${https_port}:127.0.0.1" \
       "https://${site}:${https_port}/api/health/deep" 2>/dev/null || true
   else
     http_port=$(env_get .env CADDY_HTTP_PORT 80)
-    curl -sS --max-time 5 \
+    curl -sS --max-time 5 -H "$auth" \
       "http://127.0.0.1:${http_port}/api/health/deep" 2>/dev/null || true
   fi
 }
@@ -302,10 +323,11 @@ health_gate() {
 # table_count — number of tables in schema `public`. Prints NOTHING on query
 # failure (deliberate: callers must FAIL CLOSED on an empty result rather than
 # mistake a transient exec/psql failure for a fresh database).
+# Routed through psql_admin so PSQL_TARGET=scratch (schema-parity.sh's
+# rehearsal) counts the SCRATCH database, not the live one beside it.
 table_count() {
-  compose exec -T postgres psql -U neogen_admin -d neogen -tAc \
-    "select count(*) from information_schema.tables where table_schema='public'" \
-    2>/dev/null | tr -d '[:space:]' || true
+  psql_admin -tAc "select count(*) from information_schema.tables where table_schema='public'" \
+    </dev/null 2>/dev/null | tr -d '[:space:]' || true
 }
 
 # user_count — rows in the auth "user" table; the bootstrap-completion
@@ -318,14 +340,10 @@ table_count() {
 # when the relation is missing, even though that branch would never execute.
 user_count() {
   local missing
-  missing=$(compose exec -T postgres psql -U neogen_admin -d neogen -tAc \
-    "select to_regclass('public.user') is null" \
-    2>/dev/null | tr -d '[:space:]' || true)
+  missing=$(psql_admin -tAc "select to_regclass('public.user') is null" </dev/null 2>/dev/null | tr -d '[:space:]' || true)
   case "$missing" in
     t) printf -- '-1' ;;
-    f) compose exec -T postgres psql -U neogen_admin -d neogen -tAc \
-         'select count(*) from public."user"' \
-         2>/dev/null | tr -d '[:space:]' || true ;;
+    f) psql_admin -tAc 'select count(*) from public."user"' </dev/null 2>/dev/null | tr -d '[:space:]' || true ;;
     *) : ;;   # query failed → print nothing (caller fails closed)
   esac
 }
@@ -354,7 +372,44 @@ app_image_digest() {
 #   psql_admin < db/1.2.0/schema.sql
 #   psql_admin -v admin_email=... -v admin_password_hash=... < seed.sql
 psql_admin() {
-  compose exec -T postgres psql -v ON_ERROR_STOP=1 -U neogen_admin -d neogen "$@"
+  if [ "${PSQL_TARGET:-}" = "scratch" ]; then
+    # schema-parity.sh / the rehearsal: a throwaway postgres started by
+    # scratch_pg_start. Same user/db names, so every helper above works on it.
+    [ -n "${SCRATCH_CID:-}" ] || die "PSQL_TARGET=scratch but no scratch postgres is running"
+    $DOCKER exec -i "$SCRATCH_CID" psql -v ON_ERROR_STOP=1 -U neogen_admin -d neogen "$@"
+  else
+    compose exec -T postgres psql -v ON_ERROR_STOP=1 -U neogen_admin -d neogen "$@"
+  fi
+}
+
+# ── Scratch postgres (schema-parity.sh, the rehearsal) ───────────────────────
+# scratch_pg_start IMAGE — start a throwaway postgres from IMAGE (the live
+# postgres image, so the catalog matches), no network, data on tmpfs unless
+# SCRATCH_DATA_DIR names a host directory (a large dump needs disk). Sets
+# SCRATCH_CID. Waits for pg_isready; dies otherwise.
+scratch_pg_start() {
+  local image="$1" i store
+  if [ -n "${SCRATCH_DATA_DIR:-}" ]; then mkdir -p "$SCRATCH_DATA_DIR"; store="-v $SCRATCH_DATA_DIR:/var/lib/postgresql/data"
+  else store="--tmpfs /var/lib/postgresql/data:rw,size=${SCRATCH_TMPFS_SIZE:-4g}"; fi
+  # shellcheck disable=SC2086
+  SCRATCH_CID=$($DOCKER run -d --rm --network none $store --shm-size 256m \
+      -e POSTGRES_USER=neogen_admin -e POSTGRES_DB=neogen -e POSTGRES_PASSWORD=scratch \
+      "$image" -c max_wal_size=2GB -c maintenance_work_mem=256MB) || die "could not start a scratch postgres from $image"
+  for i in $(seq 1 60); do
+    $DOCKER exec "$SCRATCH_CID" pg_isready -U neogen_admin -d neogen >/dev/null 2>&1 && \
+      $DOCKER exec "$SCRATCH_CID" psql -U neogen_admin -d neogen -tAc 'select 1' >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  scratch_pg_stop; die "scratch postgres did not become ready in 60s"
+}
+scratch_pg_stop() { [ -n "${SCRATCH_CID:-}" ] && $DOCKER rm -f "$SCRATCH_CID" >/dev/null 2>&1; SCRATCH_CID=""; return 0; }
+# scratch_load_sql FILE [psql-args…] — apply a shipped SQL file to the scratch.
+# The \restrict / \unrestrict meta-commands pg_dump ≥ 17.6 emits are an
+# anti-injection guard for interactive use, not DDL; older psql clients reject
+# them, so they are stripped for the scratch load only.
+scratch_load_sql() {
+  local f="$1"; shift
+  sed -E '/^\\(un)?restrict /d' "$f" | PSQL_TARGET=scratch psql_admin "$@"
 }
 
 # flush_redis — FLUSHALL the redis container (queues + cache). Call whenever
@@ -607,7 +662,10 @@ assert_version_alignment() {
 # package, so only DB_VERSION can resolve them).
 db_target_version() {
   local ver img
-  ver=$(env_get .env DB_VERSION "")
+  # NXPI_TARGET_VERSION: a rehearsal migrates a SCRATCH copy to a release the
+  # live ./.env does not name yet (upgrade-db.sh bumps DB_VERSION afterwards).
+  ver=${NXPI_TARGET_VERSION:-}
+  [ -n "$ver" ] || ver=$(env_get .env DB_VERSION "")
   if [ -z "$ver" ]; then
     img=$(env_get .env APP_IMAGE "")
     case "$img" in *@sha256:*) return 0 ;; esac   # digest pin — no version
@@ -650,6 +708,281 @@ resolved_db_version() {
   basename "$d"
 }
 
+# ── Bundle inventory (pure) ──────────────────────────────────────────────────
+# bundle_missing_files DIR VER [REQUIRE_MIGRATE=yes|no] — print, one per line,
+# the artifacts a db/<VER> folder must ship but does not (missing OR empty):
+# schema.sql, grants.sql, seed.sql and migrate-VER.sql. Empty output = whole.
+# The base folder of a lineage (db/1.2.0 here) legitimately has no delta —
+# pass "no" as the third argument for it. Used by tools/sync-from-app-copy.sh
+# (refuse to copy a partial folder) and tests/db-bundle-lint.sh.
+bundle_missing_files() {
+  local dir="$1" ver="$2" want_migrate="${3:-yes}" f
+  for f in schema.sql grants.sql seed.sql; do
+    [ -s "$dir/$f" ] || printf '%s\n' "$f"
+  done
+  if [ "$want_migrate" != "no" ]; then
+    [ -s "$dir/migrate-$ver.sql" ] || printf '%s\n' "migrate-$ver.sql"
+  fi
+}
+
+# review_marker_line FILE — the 1-based line number of the destructive-review
+# marker (`-- REQUIRES-REVIEW:` at the start of a line), or nothing when the
+# file carries none. apply_migrations only looks at `head -n 6`, so a marker
+# reported here at a line > 6 is a shipped delta that would ride the rolling
+# path unreviewed — tests/db-bundle-lint.sh fails on it. Prose that merely
+# mentions the token ("not marked REQUIRES-REVIEW") is not anchored and is
+# deliberately not matched.
+review_marker_line() {
+  grep -nE '^-- REQUIRES-REVIEW:' "$1" 2>/dev/null | head -n1 | cut -d: -f1
+}
+
+# ── Release-tooling helpers (pure unless noted) ──────────────────────────────
+# image_ref_rename REF [OLD_REPO NEW_REPO] — the app image moved registries
+# (github.com/negentrophi/nxpi_dev → negentrophi/nxpi, so CI now publishes
+# ghcr.io/negentrophi/nxpi). Rewrites REF only when its repository is EXACTLY
+# OLD_REPO — a `:tag` or `@sha256:` suffix is carried over; `…/nxpi_dev/db`,
+# `…/nxpi-hash` and other owners are left alone.
+image_ref_rename() {
+  local ref="$1" old="${2:-ghcr.io/negentrophi/nxpi_dev}" new="${3:-ghcr.io/negentrophi/nxpi}"
+  case "$ref" in
+    "$old")            printf '%s' "$new" ;;
+    "$old":*|"$old"@*) printf '%s%s' "$new" "${ref#"$old"}" ;;
+    *)                 printf '%s' "$ref" ;;
+  esac
+}
+
+# env_set FILE KEY VALUE — set KEY in a dotenv file so that env_get reads VALUE
+# back: replaces the first `KEY=` line in place (and drops later duplicates —
+# env_get is last-wins, so a stale duplicate would shadow the new value), or
+# appends on its own line. A value containing whitespace, `#`, `"` or `\` is
+# double-quoted with env_get's escaping; image refs and URLs are written bare.
+# Callers that want a backup take it first (upgrade-db.sh keeps .env.bak-<ts>).
+env_set() {
+  local file="$1" key="$2" val="$3" out
+  case "$val" in
+    *[[:space:]\#\"\\]*) out=$(printf '%s' "$val" | sed 's/\\/\\\\/g; s/"/\\"/g'); out="\"$out\"" ;;
+    *) out="$val" ;;
+  esac
+  [ -f "$file" ] || : > "$file"
+  # A file whose last line lacks a newline would swallow the appended key.
+  if [ -s "$file" ] && [ -n "$(tail -c1 "$file")" ]; then printf '\n' >> "$file"; fi
+  if grep -qE "^[[:space:]]*${key}=" "$file"; then
+    # ENVIRON, not -v: awk -v interprets backslash escapes in the value.
+    K="$key" V="$out" awk '
+      $0 ~ ("^[ \t]*" ENVIRON["K"] "=") { if (!done) { print ENVIRON["K"] "=" ENVIRON["V"]; done = 1 }; next }
+      { print }' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+  else
+    printf '%s=%s\n' "$key" "$out" >> "$file"
+  fi
+}
+
+# disk_need_kb DB_BYTES UPLOADS_BYTES — the free space a release window wants,
+# in KiB: three copies of the database (the dump, the migration's rewrite /
+# index-build headroom, and either a disk-backed scratch copy for the rehearsal
+# or the rollback's own safety dump), the uploads archive twice (the bundle
+# and the rollback's safety tar), 1.5 GiB for the new image and 2 GiB of slack
+# for WAL bursts and logs.
+disk_need_kb() { printf '%s' $(( ( 3 * $1 + 2 * $2 ) / 1024 + 1572864 + 2097152 )); }
+
+# rowcount_compare BEFORE AFTER [EXPECT] — the losslessness assertion.
+# BEFORE/AFTER are `table<TAB>count` snapshots (rowcount_snapshot). EXPECT is
+# optional, `table<TAB>kind<TAB>reason` per line, kind ∈
+#   shrink      may lose rows (a delta deletes materialised defaults)
+#   shrink=N    must lose EXACTLY N rows (a pre-check counted them)
+#   gone        the table must be gone (a delta drops it)
+#   grow        may gain rows (a delta seeds reference data; a no-op is fine)
+#   same        must be exactly equal (a checksummed rebuild)
+# A plain `shrink` for a table relaxes an earlier `shrink=N` for it (two deltas
+# in one run both delete from it). Prints one line per finding — `!! …` is a
+# violation, `ok <kind>` an expected change with its reason, `new`/`grew` are
+# informational, `unchanged N` closes. Exit 0 clean, 1 on any violation,
+# 2 when a snapshot is missing (fail closed).
+rowcount_compare() {
+  local before="$1" after="$2" expect="${3:-}"
+  [ -s "$before" ] && [ -s "$after" ] || return 2
+  if [ -n "$expect" ] && [ ! -f "$expect" ]; then return 2; fi
+  awk -F'\t' -v OFS='\t' -v EXPECT="$expect" '
+    BEGIN {
+      if (EXPECT != "") while ((getline line < EXPECT) > 0) {
+        n = split(line, p, "\t"); t = p[1]; k = p[2]; r = (n >= 3 ? p[3] : "")
+        reason[t] = (t in reason && reason[t] != "" ? reason[t] "; " r : r)
+        if (k ~ /^shrink=/)   { kind[t] = "shrink"; if (!(t in open)) exact[t] = substr(k, 8) + 0 }
+        else if (k == "shrink") { kind[t] = "shrink"; open[t] = 1; delete exact[t] }
+        else kind[t] = k
+      }
+    }
+    FILENAME == ARGV[1] { before[$1] = $2 + 0; next }
+    { after[$1] = $2 + 0 }
+    END {
+      viol = 0; same = 0
+      for (t in before) {
+        if (!(t in after)) {
+          if (kind[t] == "gone") print "ok gone", t, before[t], "-", reason[t]
+          else { print "!! gone", t, before[t]; viol++ }
+          continue
+        }
+        b = before[t]; a = after[t]
+        if (kind[t] == "gone") { print "!! gone-but-present", t, b, a, reason[t]; viol++; continue }
+        if (kind[t] == "same") {
+          if (a == b) { print "ok same", t, b, a, reason[t]; same++ } else { print "!! same", t, b, a, reason[t]; viol++ }
+          continue
+        }
+        if (a < b) {
+          if (kind[t] != "shrink")      { print "!! shrank", t, b, a; viol++ }
+          else if (!(t in exact))       print "ok shrink", t, b, a, reason[t]
+          else if (b - a == exact[t])   print "ok shrink", t, b, a, reason[t]
+          else { print "!! exact", t, b, a, "expected " exact[t], reason[t]; viol++ }
+        } else if (a > b) {
+          if (kind[t] == "grow")   print "ok grow", t, b, a, reason[t]
+          else if (kind[t] == "shrink") print "grew", t, b, a, "(expected shrink " reason[t] ")"
+          else print "grew", t, b, a
+        } else {
+          if (kind[t] == "shrink" && (t in exact) && exact[t] != 0) { print "!! exact", t, b, a, "expected " exact[t], reason[t]; viol++ }
+          else same++
+        }
+      }
+      for (t in after) if (!(t in before)) print "new", t, after[t]
+      print "unchanged", same
+      exit (viol ? 1 : 0)
+    }' "$before" "$after"
+}
+
+# uploads_classify DISK_LIST DB_LIST — the uploads inventory. DISK_LIST holds
+# one path per line relative to the uploads volume root; DB_LIST one
+# thread_attachment.storage_key per line (the key IS the relative path). Prints
+#   cataloged<TAB>key
+#   uncataloged<TAB>layout<TAB>key     layout: flat | shared | threads | other
+#   missing-on-disk<TAB>key            a catalog row whose bytes are gone
+# Only `uploads/shared/<file>` stays servable without a catalog row on the
+# current image; every other uncataloged object answers 404 there.
+uploads_classify() {
+  awk -F'\t' -v OFS='\t' '
+    FILENAME == ARGV[1] { if ($0 != "") ondisk[$0] = 1; next }
+    { if ($0 != "") indb[$0] = 1 }
+    END {
+      for (k in ondisk) {
+        if (k in indb) { print "cataloged", k; continue }
+        n = split(k, s, "/")
+        if      (s[1] != "uploads")         lay = "other"
+        else if (n == 2)                    lay = "flat"
+        else if (s[2] == "shared" && n == 3) lay = "shared"
+        else if (s[2] == "threads")         lay = "threads"
+        else                                lay = "other"
+        print "uncataloged", lay, k
+      }
+      for (k in indb) if (!(k in ondisk)) print "missing-on-disk", k
+    }' "$1" "$2" | sort
+}
+
+# SCHEMA_PROBES — one sentinel object per shipped release: the first object that
+# release introduces. Two readers: upgrade-db.sh's adopted-database guard (an
+# empty marker must be stamped at the release the schema REALLY matches, and
+# these are how to tell) and discover.sh's "highest release whose sentinel
+# exists" report. Releases without a unique sentinel (1.7.0, 1.21.0, 1.28.0,
+# 1.34.0, 1.40.1) are omitted — their deltas are IF NOT EXISTS / CREATE OR
+# REPLACE, so choosing the LOWER neighbour and re-applying them is a no-op.
+# Format: version<TAB>kind<TAB>object; kinds match schema_probe_sql.
+SCHEMA_PROBES=$(printf '%s\n' \
+  $'1.5.0\ttable\tskill_scan' \
+  $'1.6.0\ttable\tskill_qa_run' \
+  $'1.8.0\tcolumn\tskill.deployed' \
+  $'1.9.0\ttable\tjob_execution' \
+  $'1.10.0\tcolumn\tsession.mfa_verified_at' \
+  $'1.11.0\ttable\torganization_entitlement' \
+  $'1.12.0\tcolumn\tuser.locked_until' \
+  $'1.13.0\tcolumn\torg_role_permission.denied' \
+  $'1.14.0\ttable\tplugin_source' \
+  $'1.15.0\tcolumn\tplugin_bundle.deleted_at' \
+  $'1.16.0\tcolumn\torg_resource_grant.expires_at' \
+  $'1.17.0\ttable\torg_permission_usage' \
+  $'1.18.0\ttable\taccess_review_campaign' \
+  $'1.19.0\ttable\torg_privilege_request' \
+  $'1.20.0\tcolumn\tapikey.organization_id' \
+  $'1.22.0\tcolumn\tapikey.config_id' \
+  $'1.23.0\tcolumn\tsession.impersonation_reason' \
+  $'1.24.0\tcolumn\torganization.authz_generation' \
+  $'1.25.0\ttable\tpermission_catalog' \
+  $'1.26.0\ttable\tauthz_decision_log' \
+  $'1.27.0\ttable\torg_role_eligibility' \
+  $'1.29.0\tpolicy\ttenant_isolation ON org_role' \
+  $'1.30.0\tcolumn\tadmin_audit_log.subject_digest' \
+  $'1.31.0\tfunction\tadmin_audit_log_signed_append' \
+  $'1.32.0\tfunction\torg_privilege_request_release_guard' \
+  $'1.33.0\ttable\tadmin_audit_log_quarantine' \
+  $'1.35.0\tconstraint\tknowledge_embeddings_dims_col_ck' \
+  $'1.36.0\tcolumn\tthread_attachment.organization_id' \
+  $'1.37.0\tcolumn\ttwo_factor.verified' \
+  $'1.38.0\tcolumn\tintegration_event.idempotency_key' \
+  $'1.39.0\tcolumn\ttoken_usage.organization_id' \
+  $'1.40.0\tpolicy\twrite_frame_insert ON sod_rule' \
+  $'1.41.0\tcolumn\tagent.governance_disabled_by')
+
+# schema_probe_sql KIND OBJECT — a query that yields 1 when OBJECT exists in
+# schema public. KIND: table | column (t.c) | index | constraint | function |
+# policy ("name ON table"). Names come from SCHEMA_PROBES (this file), never
+# from user input.
+schema_probe_sql() {
+  local kind="$1" obj="$2"
+  case "$kind" in
+    table)      printf "select 1 from information_schema.tables where table_schema='public' and table_name='%s'" "$obj" ;;
+    column)     printf "select 1 from information_schema.columns where table_schema='public' and table_name='%s' and column_name='%s'" "${obj%%.*}" "${obj#*.}" ;;
+    index)      printf "select 1 from pg_indexes where schemaname='public' and indexname='%s'" "$obj" ;;
+    constraint) printf "select 1 from pg_constraint where conname='%s'" "$obj" ;;
+    function)   printf "select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public' and p.proname='%s'" "$obj" ;;
+    policy)     printf "select 1 from pg_policies where schemaname='public' and policyname='%s' and tablename='%s'" "${obj%% ON *}" "${obj##* ON }" ;;
+    *) return 1 ;;
+  esac
+}
+
+# image_digest_of REF — the `repo@sha256:…` digest of a LOCALLY present image
+# (pull first), or nothing. When REF itself carries @sha256:, the local image
+# must match it — a tag that moved underneath is refused.
+image_digest_of() {
+  local ref="$1" want="" d
+  case "$ref" in *@sha256:*) want="${ref#*@}" ;; esac
+  d=$($DOCKER image inspect "$ref" --format '{{join .RepoDigests "\n"}}' 2>/dev/null | grep -F '@sha256:' | head -n1 || true)
+  if [ -n "$want" ] && [ -n "$d" ] && [ "${d#*@}" != "$want" ]; then return 1; fi
+  printf '%s' "$d"
+}
+
+# confirm PROMPT WORD — require WORD to be typed. $ASSUME_YES=true bypasses; a
+# non-tty without it must not hang. Callers that must NEVER auto-confirm (typed
+# acknowledgements of data loss) flip ASSUME_YES off around the call.
+: "${ASSUME_YES:=false}"
+confirm() {
+  local prompt="$1" word="$2" reply
+  $ASSUME_YES && { log "$prompt — auto-confirmed (--yes)"; return 0; }
+  [ -t 0 ] || die "$prompt
+  Not a terminal and --yes was not given — refusing to proceed unattended."
+  printf '%s\n  type %s to continue: ' "$prompt" "$word"
+  read -r reply
+  [ "$reply" = "$word" ] || die "aborted (got '$reply', expected '$word') — nothing was changed"
+}
+
+# psql_scalar SQL — one scalar from the live database, or nothing on failure
+# (callers fail closed). stdin is /dev/null on purpose: `compose exec -T`
+# attaches stdin and would otherwise DRAIN the caller's own stdin (fd-3 loops,
+# interactive `read`). Impure.
+psql_scalar() { psql_admin -tAc "$1" </dev/null 2>/dev/null | tr -d '[:space:]' || true; }
+
+# rel_ready TABLE — true when TABLE exists in schema public (a pre-check for a
+# release whose own tables are still pending has nothing to inspect). Impure.
+rel_ready() { [ "$(psql_scalar "select 1 from information_schema.tables where table_schema='public' and table_name='${1//\'/\'\'}'")" = "1" ]; }
+
+# schema_probe_report — walk SCHEMA_PROBES against the live database and print
+# `version<TAB>present|absent<TAB>kind object` per row, then a summary line
+# `highest-present<TAB>V` (or `highest-present<TAB>none`). Impure; read-only.
+schema_probe_report() {
+  local v k o sql highest="none"
+  while IFS=$'\t' read -r v k o; do
+    [ -n "$v" ] || continue
+    sql=$(schema_probe_sql "$k" "$o")
+    if [ "$(psql_scalar "$sql")" = "1" ]; then printf '%s\tpresent\t%s %s\n' "$v" "$k" "$o"; highest="$v"
+    else printf '%s\tabsent\t%s %s\n' "$v" "$k" "$o"; fi
+  done <<<"$SCHEMA_PROBES"
+  printf 'highest-present\t%s\n' "$highest"
+}
+
 # neo_gen_password — the app-role password, extracted (and percent-decoded)
 # from the postgres_url secret. Used to ALTER ROLE neo_gen so the app (which
 # connects over TCP as neo_gen) can authenticate.
@@ -657,20 +990,27 @@ resolved_db_version() {
 # container can read it — a non-root HOST user (the operator running install.sh)
 # therefore cannot `cat` it directly. Fall back to sudo (install.sh requires
 # sudo and has already used it to set the secret's ownership).
-neo_gen_password() {
-  local url pw
-  url=$(cat secrets/postgres_url 2>/dev/null || true)
+neo_gen_password() { url_password_from_secret secrets/postgres_url; }
+
+# privileged_role_password — same, for the neogen_priv pool (1.29.0+).
+privileged_role_password() { url_password_from_secret secrets/postgres_privileged_url; }
+
+# url_password_from_secret FILE — the password inside a postgres:// URL secret,
+# read with a sudo fallback (the file is uid 1001 / mode 400) and percent-decoded.
+url_password_from_secret() {
+  local file="$1" url pw
+  url=$(cat "$file" 2>/dev/null || true)
   if [ -z "$url" ] && [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
     # `-n` first: an EXPIRED sudo cache in a non-interactive run (plausible
     # after a long image pull) must fail fast, not hang on a hidden password
     # prompt with stderr discarded. Retry interactively only when a tty can
     # actually take the prompt.
-    url=$(sudo -n cat secrets/postgres_url 2>/dev/null || true)
+    url=$(sudo -n cat "$file" 2>/dev/null || true)
     if [ -z "$url" ] && [ -t 0 ]; then
-      url=$(sudo cat secrets/postgres_url 2>/dev/null || true)
+      url=$(sudo cat "$file" 2>/dev/null || true)
     fi
   fi
-  pw=${url#*://}     # neo_gen:<pw>@postgres:5432/neogen
+  pw=${url#*://}     # <user>:<pw>@postgres:5432/neogen
   pw=${pw#*:}        # <pw>@postgres:5432/neogen
   pw=${pw%%@*}       # <pw>
   # percent-decode (installer passwords are plain hex → no-op; user-supplied
@@ -835,37 +1175,106 @@ apply_migrations() {
 # go through ./migrate.sh (its own backup, no auto-rollback "additive-compatible"
 # assumption), never the rolling path whose rollback trusts additivity.
 has_pending_destructive() {
-  local target f base base_sql applied rc
+  local all
+  all=$(list_pending_destructive) || return $?
+  [ -z "$all" ] || printf '%s\n' "${all%%$'\n'*}"
+  return 0
+}
+
+# is_migration_applied BASENAME — true when the marker records the file.
+# FAIL CLOSED (like apply_migrations): a transient psql error must not read as
+# "not applied" and falsely flag an already-applied migration as pending.
+# errexit is restored to whatever the caller had, not forced on.
+is_migration_applied() {
+  local base_sql applied rc had_e=""
+  base_sql=${1//\'/\'\'}
+  case $- in *e*) had_e=1 ;; esac
+  set +e; applied=$(psql_admin -tAc "select 1 from public.deploy_schema_migrations where filename = '$base_sql'" 2>/dev/null); rc=$?
+  [ -n "$had_e" ] && set -e
+  [ $rc -eq 0 ] || die "could not read the migration marker for $1 (postgres busy?) — re-run when stable"
+  [ "$(printf '%s' "$applied" | tr -d '[:space:]')" = "1" ]
+}
+
+# list_pending_destructive — EVERY unapplied REQUIRES-REVIEW migration (<= the
+# target) apply_migrations would run, one path per line in apply order. A
+# multi-release jump can carry several (1.26.0, 1.29.0 and 1.35.0 in one run);
+# an operator's review must see them all, not the first.
+list_pending_destructive() {
+  local target f base
   target=$(resolved_db_version) || return 0
   ensure_migration_marker
   while IFS= read -r f <&3; do
     [ -n "$f" ] || continue
     base=$(basename "$f")
-    base_sql=${base//\'/\'\'}
-    # FAIL CLOSED (like apply_migrations): a transient psql error must not read
-    # as "not applied" and falsely flag an already-applied migration as pending.
-    set +e; applied=$(psql_admin -tAc "select 1 from public.deploy_schema_migrations where filename = '$base_sql'" 2>/dev/null); rc=$?; set -e
-    [ $rc -eq 0 ] || die "could not read the migration marker for $base (postgres busy?) — re-run when stable"
-    applied=$(printf '%s' "$applied" | tr -d '[:space:]')
-    [ "$applied" = "1" ] && continue
-    if head -n 6 "$f" | grep -q 'REQUIRES-REVIEW'; then printf '%s\n' "$f"; return 0; fi
+    is_migration_applied "$base" && continue
+    if head -n 6 "$f" | grep -q 'REQUIRES-REVIEW'; then printf '%s\n' "$f"; fi
   done 3< <(migration_files_through "$target")
+}
+
+# marker_table_exists — true when public.deploy_schema_migrations exists.
+# Read-only (unlike ensure_migration_marker, which CREATEs it): discover.sh
+# must leave no trace on a database it only observes.
+marker_table_exists() {
+  [ "$(psql_scalar "select to_regclass('public.deploy_schema_migrations') is not null")" = "t" ]
+}
+
+# pending_migrations TARGET — the migrate-*.sql basenames (<= TARGET, apply
+# order) not recorded in the marker, WITHOUT creating the marker table. When
+# the table is absent nothing was ever recorded, so everything is pending and
+# no marker query is made at all.
+pending_migrations() {
+  local target="$1" f base have=yes
+  marker_table_exists || have=no
+  while IFS= read -r f <&3; do
+    [ -n "$f" ] || continue
+    base=$(basename "$f")
+    if [ "$have" = "yes" ] && is_migration_applied "$base"; then continue; fi
+    printf '%s\n' "$base"
+  done 3< <(migration_files_through "$target")
+}
+
+# rowcount_snapshot — `table<TAB>count` for every base table in schema public
+# (partitioned parents included — information_schema reports them as BASE
+# TABLE — so a rebuilt org_resource_grant is compared as one number), sorted.
+# Exact counts, never estimates: this is the losslessness baseline.
+rowcount_snapshot() {
+  psql_admin -tAF$'\t' -c "
+    select table_name,
+           (xpath('/row/c/text()',
+                  query_to_xml(format('select count(*) as c from public.%I', table_name),
+                               false, true, '')))[1]::text::bigint
+    from information_schema.tables
+    where table_schema = 'public' and table_type = 'BASE TABLE'
+    order by table_name;" </dev/null 2>/dev/null
+}
+
+# uploads_list_volume — every file in the uploads volume, path relative to the
+# volume root (which is what thread_attachment.storage_key stores), sorted.
+# Read-only mount; alpine is already on every VM this package installed.
+uploads_list_volume() {
+  $DOCKER run --rm -v "${PROJECT}_uploads-data":/data:ro alpine \
+    sh -c 'cd /data && find . -type f | sed "s|^\./||" | sort'
+}
+# uploads_volume_stats — `files<TAB>kbytes` of the uploads volume.
+uploads_volume_stats() {
+  $DOCKER run --rm -v "${PROJECT}_uploads-data":/data:ro alpine \
+    sh -c 'cd /data && printf "%s\t%s\n" "$(find . -type f | wc -l | tr -d " ")" "$(du -sk . | cut -f1)"'
+}
+# uploads_list_catalog — every storage_key the catalog knows, sorted.
+uploads_list_catalog() {
+  psql_admin -tAc "select storage_key from thread_attachment order by 1" </dev/null 2>/dev/null
 }
 
 # has_pending_migration — returns 0 if ANY migration <= the target version is
 # not yet recorded (the DB is behind the target image). Fails closed on a
 # marker-read error, like apply_migrations.
 has_pending_migration() {
-  local target f base base_sql applied rc
+  local target f
   target=$(resolved_db_version) || return 1
   ensure_migration_marker
   while IFS= read -r f <&3; do
     [ -n "$f" ] || continue
-    base=$(basename "$f")
-    base_sql=${base//\'/\'\'}
-    set +e; applied=$(psql_admin -tAc "select 1 from public.deploy_schema_migrations where filename = '$base_sql'" 2>/dev/null); rc=$?; set -e
-    [ $rc -eq 0 ] || die "could not read the migration marker for $base (postgres busy?) — re-run when stable"
-    [ "$(printf '%s' "$applied" | tr -d '[:space:]')" = "1" ] || return 0
+    is_migration_applied "$(basename "$f")" || return 0
   done 3< <(migration_files_through "$target")
   return 1
 }

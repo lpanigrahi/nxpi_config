@@ -1,0 +1,31 @@
+-- migrate-1.23.0.sql — schema delta 1.22.0 → 1.23.0 (source migration 0006
+-- of the journaled series:
+-- src/lib/db/migrations/pg/0006_session_impersonation_reason.sql).
+-- Additive-safe (ADR-0107; review N7, justification half).
+--
+-- Additive-safe, deliberately unflagged (lib.sh scans the first six lines
+-- for its destructive-review marker — that token must not appear up here):
+-- adds one nullable column, no table/column/row is dropped and no cascade
+-- is introduced. Idempotent (ADD COLUMN IF NOT EXISTS) — re-running is a
+-- no-op.
+--
+-- WHY: the 30-minute impersonation window now requires a mandatory reason,
+-- stamped by `databaseHooks.session.create.before` for
+-- `/admin/impersonate-user` from the `x-impersonation-reason` request
+-- header (Better Auth's z.object({ userId }) body schema for that endpoint
+-- cannot carry it — the reason travels only in the header). Without this
+-- column an image ahead of the delta 42703s on every session read
+-- (better-auth's drizzle adapter emits an explicit column list) — a TOTAL
+-- LOGIN OUTAGE, the same incident class as 0077/0099's session columns.
+-- db/1.23.0/schema.sql carries the same column for fresh installs.
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- >>> 0006_session_impersonation_reason.sql
+-- ═══════════════════════════════════════════════════════════════════════════
+--
+-- 0006 — impersonation justification (ADR-0107; review N7, justification
+-- half). Written by databaseHooks.session.create.before for
+-- /admin/impersonate-user; the server action and the raw Better-Auth
+-- endpoint converge there.
+
+ALTER TABLE "session" ADD COLUMN IF NOT EXISTS "impersonation_reason" text;

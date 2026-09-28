@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# migrate.sh — schema-only, DATA-PRESERVING database migration.
+# migrate.sh — in-place migration of an EXISTING database (schema, and the
+#              reference rows a delta carries).
 #
 #   ./migrate.sh                # safety backup → additive schema sync
 #   ./migrate.sh --no-backup    # skip the safety backup (not recommended)
@@ -11,8 +12,20 @@
 #
 # Guarantees (enforced by this script + apply_migrations in lib.sh, applying
 # static SQL via psql inside the postgres container):
-#   • NEVER initializes: refuses to run against an empty database and never
-#     seeds or overwrites rows — your data is not touched.
+#   • NEVER initializes: refuses to run against an empty database, and never
+#     re-applies db/<version>/seed.sql — so YOUR rows (users, chats, agents,
+#     org configuration) are never replaced by a bundle's own.
+#   • A delta MAY upsert REFERENCE rows, idempotently, and several do: the RBAC
+#     permission vocabulary (1.25.0, 1.40.1), the platform separation-of-duties
+#     defaults (1.27.0, 1.40.1) and a handful of column backfills (1.39.0,
+#     1.41.0 among them). A packaged delta IS its source migration's body, and
+#     some of those migrations seed reference data — db/1.40.1's entire payload
+#     is rows, because it repairs a catalog that shipped empty. Every such
+#     statement is an upsert: re-running it is a no-op. Two deltas also DELETE
+#     rows by design — 1.22.0 and 1.25.0 remove the materialised system-role
+#     DEFAULTS (is_system rows with denied=false) that the catalog now supplies;
+#     custom roles, deny rows and per-instance grants are untouched.
+#     ./upgrade-db.sh's row-count comparison names every expected change.
 #   • ADDITIVE-ONLY by default: applies db/<version>/migrate-*.sql; a
 #     DESTRUCTIVE change is flagged REQUIRES-REVIEW and refused unless
 #     ALLOW_DESTRUCTIVE_MIGRATION=1 (after that, roll the matching image

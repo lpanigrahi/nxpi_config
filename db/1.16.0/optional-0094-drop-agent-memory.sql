@@ -1,0 +1,14 @@
+-- optional-0094-drop-agent-memory.sql — OPERATOR-RUN, never applied
+-- automatically (not matched by the migrate-*.sql glob; the 0082 IVFFlat
+-- precedent).
+--
+-- Drops the legacy per-agent memory store: an orphan with ZERO readers and
+-- ZERO writers repo-wide (the live store is memory_entry). The table ships 6
+-- dead indexes including a resident HNSW graph. Idempotent; safe on any
+-- database at delta 1.16.0 or earlier. Apply with:
+--
+--   docker compose exec -T postgres psql -U neogen_admin -d neogen \
+--     < db/1.16.0/optional-0094-drop-agent-memory.sql
+--
+-- Fresh installs from this directory's schema.sql never have the table.
+DROP TABLE IF EXISTS agent_memory;

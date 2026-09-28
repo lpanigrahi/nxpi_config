@@ -1,0 +1,111 @@
+-- migrate-1.38.0.sql — schema delta 1.37.0 → 1.38.0 (R14 QA campaign, plane P7, finding F1): a replay key for inbound connector webhooks. Source migration 0039 (journaled migration 0039_integration_event_idempotency.sql), carried whole below.
+-- Route: ./update.sh   (the ordinary rolling path)
+--
+-- WHAT IT IS FOR, IN ONE PARAGRAPH.
+--
+-- `POST /api/integrations/inbound/[connectorId]` is the door Slack, Teams,
+-- Jira, ServiceNow, Salesforce and SharePoint deliver events through. It is
+-- PUBLIC by design — no session, CSRF-exempt — and the connector's HMAC
+-- signature is the only authentication. Until this delta the endpoint persisted
+-- a NEW `integration_event` row for every accepted POST, keyed on a freshly
+-- minted UUID, and every outbox dedup key the event worker computes derives
+-- from THAT id. Idempotency was therefore per ROW and never per SOURCE EVENT:
+-- anyone who observed ONE delivery — a reverse proxy, a WAF log, an APM trace,
+-- a TLS-terminating egress box, a leaked `integration_event.payload`, or the
+-- vendor's own retry storm — could re-POST it forever. Measured at the wire:
+-- three byte-identical POSTs of one signed Jira body produced 3 events,
+-- 6 `event_outbox` rows (3 event_bus + 3 webhook), all dispatched, and one
+-- agent run per replay as the connector's configured user — unbounded model
+-- spend, unbounded tool side effects on the org's real systems, and no lever to
+-- stop it short of rotating the connector secret. Only the Slack connector
+-- carried any freshness bound at all (its 300-second `x-slack-request-timestamp`
+-- window); the other five compute a bare `HMAC-SHA256(raw body)`, which carries
+-- no expiry.
+--
+-- This is the posture the platform's OWN billing webhook already documents and
+-- 1.11.0's `invoice_org_external_id_uq` (source migration 0079) already
+-- enforces one plane over: "without it a captured signed body replays into
+-- unlimited duplicate invoices". The index is deliberately the enforcement
+-- point rather than an application check — the refusal has to be atomic and
+-- hold across replicas, and this is the receiver an attacker can drive
+-- concurrently.
+--
+-- WHAT THE KEY IS. The app image computes it
+-- (`lib/integrations/inbound-webhook.ts`): the PROVIDER's own event id when the
+-- provider stamps one inside the SIGNED material — today only Slack's
+-- `event_id` — otherwise SHA-256 of (connector id, signature headers, raw
+-- body). Never an unsigned header, however well the vendor documents one: a
+-- replayer holds the captured body and its signature and can set headers
+-- freely, so a key taken from a header is a key the attacker chooses. A
+-- duplicate is answered 200 `{"received":true,"duplicate":true}` and writes
+-- nothing further — no event, no outbox row, no queue job, no agent dispatch.
+--
+-- THE KEY IS A WINDOW, NOT A TOMBSTONE, AND NOTHING IN THIS FILE ENFORCES
+-- THAT. An earlier draft of this header said "a genuinely new event differs in
+-- at least one byte, gets a different key, and keeps at-least-once". That is
+-- true of a vendor envelope carrying an id or a timestamp (slack, jira) and
+-- FALSE of the four connectors whose inbound shape is the platform's own small
+-- envelope — teams (`{type:"messageCreated"}`), servicenow
+-- (`{table_name, operation}`), salesforce and sharepoint — where two genuinely
+-- distinct deliveries really can be byte-identical. Left permanent, the key
+-- would answer the second of those `duplicate` and lose it for good.
+--
+-- The APP IMAGE bounds it: a daily sweep NULLs `idempotency_key` on rows older
+-- than 24 hours, after which this PARTIAL index stops constraining them and the
+-- same bytes are admitted as a new event. That is why the window needed no
+-- second delta — releasing a row is an UPDATE, not DDL. An operator who applies
+-- this delta to a database whose app image PREDATES that sweep gets permanent
+-- keys: replay protection intact, and a byte-identical genuine repeat on those
+-- four connectors dropped. The residual that remains WITH the sweep is bounded
+-- to the 24-hour window and is documented in
+-- `src/lib/integrations/inbound-webhook.ts`.
+--
+-- WHAT MOVES. Nothing. One nullable `ADD COLUMN IF NOT EXISTS` and one
+-- `CREATE UNIQUE INDEX IF NOT EXISTS`; no CHECK, no FK, no data rewritten,
+-- nothing dropped.
+--
+-- The index is PARTIAL (`WHERE idempotency_key IS NOT NULL`) and there is NO
+-- BACKFILL, both deliberately. A NULL key is either a row written before this
+-- delta or a row this platform minted itself (an outbound/system event), and
+-- neither is a replay candidate; a TOTAL unique index would collapse every such
+-- row into one. And the raw body and signature a historical row was born from
+-- are not stored anywhere, so any key computed for one now would be a fiction —
+-- two historical rows fabricated onto one key would DELETE an event rather than
+-- protect one.
+--
+-- SAFE TO APPLY WITH ROWS PRESENT, and this is the reason it ships no
+-- preconditions check: the column is new, so it is NULL on every existing row,
+-- so the partial index indexes ZERO rows at creation time and can collide with
+-- nothing. (`pnpm db:preflight` on a source deployment reports the same; there
+-- is simply no gate for this file to add.)
+--
+-- RE-RUNNABLE. Both statements are `IF [NOT] EXISTS`; applying this file twice
+-- lands the same shape, and a database already carrying the column and the
+-- index executes nothing.
+--
+-- ROLLBACK: `DROP INDEX IF EXISTS integration_event_idempotency_key_uq;
+-- ALTER TABLE integration_event DROP COLUMN IF EXISTS idempotency_key;`. What
+-- that costs is stated rather than discovered, and it is NOT what a reader would
+-- assume from the other index deltas in this lineage. MEASURED on a live
+-- database with the index dropped and the app image left in place: the app's
+-- insert names this partial index as its ON CONFLICT target, so Postgres cannot
+-- infer it and raises 42P10 (`there is no unique or exclusion constraint
+-- matching the ON CONFLICT specification`) — which means EVERY inbound webhook
+-- delivery for every connector answers 500, rather than the deliveries quietly
+-- becoming replayable again. That is fail-closed by design (a fallback insert
+-- would silently reopen the unlimited replay fan-out this delta exists to
+-- block), but it makes the rollback an OUTAGE on that door unless the app image
+-- is rolled back with it. Roll both halves, or neither. An image rolled ahead of
+-- this file has the same shape, which is why the app carries a boot sentinel
+-- that probes `pg_indexes` for this index by name: the skew becomes one loud
+-- boot-log line instead of a cryptic 500 per delivery.
+--
+-- Apply with psql -1 (ON_ERROR_STOP) so the two statements land or do not.
+
+SET lock_timeout = '5s';
+
+ALTER TABLE integration_event ADD COLUMN IF NOT EXISTS idempotency_key text;
+
+CREATE UNIQUE INDEX IF NOT EXISTS integration_event_idempotency_key_uq
+  ON integration_event (connector_id, idempotency_key)
+  WHERE idempotency_key IS NOT NULL;

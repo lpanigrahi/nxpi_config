@@ -5,6 +5,11 @@
 #   ./backup.sh                 # pg_dump -Fc → ./backups/neogen-<ts>.dump
 #                               # + uploads volume tar (when on local storage)
 #   ./backup.sh --no-prune      # skip retention pruning (used by restore.sh)
+#   ./backup.sh --stamp <ts>    # name the artifacts neogen-<ts>.dump / uploads-<ts>.tar.gz
+#                               # (upgrade-release.sh ties them to its run id)
+#   The last two lines of output are machine-readable for callers:
+#     BACKUP_DUMP=backups/neogen-<ts>.dump
+#     BACKUP_UPLOADS=backups/uploads-<ts>.tar.gz   (empty when none was taken)
 #
 # • Runs pg_dump INSIDE the postgres container — no PostgreSQL client or
 #   Node.js needed on the VM host.
@@ -25,18 +30,23 @@ cd "$SCRIPT_DIR"
 PRUNE=true
 REQUIRE_UPLOADS=false
 BACKUP_DEGRADED=false   # uploads archive failed (best-effort path) → exit 1 at the end
-for arg in "$@"; do
-  case "$arg" in
+STAMP_OVERRIDE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     # Used by restore.sh's pre-restore safety backup: retention pruning here
     # could otherwise DELETE the very dump the caller is about to restore.
     --no-prune) PRUNE=false ;;
     # Used by restore.sh when it is about to WIPE the uploads volume: the
     # uploads safety archive must then be a hard requirement, not best-effort.
     --require-uploads) REQUIRE_UPLOADS=true ;;
+    --stamp)    shift; STAMP_OVERRIDE="${1:-}"; [ -n "$STAMP_OVERRIDE" ] || die "--stamp needs a value" ;;
+    --stamp=*)  STAMP_OVERRIDE="${1#*=}" ;;
     -h|--help)  sed -n '2,/^# ===/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
-    *) die "unknown flag: $arg (see --help)" ;;
+    *) die "unknown flag: $1 (see --help)" ;;
   esac
+  shift
 done
+case "$STAMP_OVERRIDE" in *[!A-Za-z0-9._-]*) die "--stamp may contain only letters, digits, . _ -" ;; esac
 
 init_docker
 acquire_lock
@@ -45,8 +55,10 @@ acquire_lock
 umask 077
 mkdir -p backups
 chmod 700 backups 2>/dev/null || true
-STAMP=$(date +%Y%m%d-%H%M%S)
+STAMP=${STAMP_OVERRIDE:-$(date +%Y%m%d-%H%M%S)}
 DUMP="backups/neogen-${STAMP}.dump"
+[ ! -e "$DUMP" ] || die "$DUMP already exists — a --stamp must be unique per run"
+UPLOADS_TAR=""
 
 # ── Database dump ────────────────────────────────────────────────────────────
 hdr "Database backup"
@@ -163,6 +175,9 @@ else
   log "  set BACKUP_BLOB_ACCOUNT + BACKUP_BLOB_CONTAINER in ./.env to automate this, or run:"
   log "  az storage blob upload --account-name <acct> -c backups -f $DUMP -n $(basename "$DUMP")"
 fi
+# Machine-readable trailer (upgrade-release.sh records these in its run state).
+printf 'BACKUP_DUMP=%s\n' "$DUMP"
+printf 'BACKUP_UPLOADS=%s\n' "${UPLOADS_TAR:-}"
 if $BACKUP_DEGRADED; then
   warn "backup completed WITHOUT the uploads archive (database dump is good) — exiting nonzero for cron/automation."
   exit 1
