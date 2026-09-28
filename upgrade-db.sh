@@ -417,7 +417,9 @@ EOF
     *) printf '  (no packaged review note for %s — read its header above)\n' "$(basename "$1")" ;;
   esac
 }
-DESTRUCTIVE_LIST=$(list_pending_destructive || true)
+# Against the TARGET, not ./.env's current DB_VERSION: in a dry run the .env
+# edit has not happened yet, and the review headers must show regardless.
+DESTRUCTIVE_LIST=$(NXPI_TARGET_VERSION="$TARGET_VER" list_pending_destructive || true)
 if [ -n "$DESTRUCTIVE_LIST" ]; then
   hdr "Review required: $(printf '%s\n' "$DESTRUCTIVE_LIST" | xargs -n1 basename | tr '\n' ' ')"
   while IFS= read -r f; do
