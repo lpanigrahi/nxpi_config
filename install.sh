@@ -38,7 +38,16 @@ for arg in "$@"; do
 done
 
 # run a command as root (sudo only when not already root)
-as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
+# NXPI_NO_SUDO=1 (tests/rehearsal.sh on a workstation without passwordless
+# sudo): run as the invoking user and let root-only steps fail softly. The
+# only such step is chowning the app secrets to uid 1001, which then falls
+# back to WORLD-READABLE secret files — acceptable in a throwaway rehearsal
+# copy, never on a VM. Production runs are unchanged.
+as_root() {
+  if [ "$(id -u)" -eq 0 ]; then "$@"
+  elif [ -n "${NXPI_NO_SUDO:-}" ]; then "$@" 2>/dev/null || return 1
+  else sudo "$@"; fi
+}
 
 # GNU/BSD-portable in-place sed (Ubuntu = GNU; BSD only during local testing)
 sed_i() { if sed --version >/dev/null 2>&1; then sed -i "$@"; else sed -i '' "$@"; fi; }
@@ -54,7 +63,7 @@ else
 fi
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v openssl >/dev/null 2>&1 || die "openssl is required"
-if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+if [ "$(id -u)" -ne 0 ] && [ -z "${NXPI_NO_SUDO:-}" ] && ! sudo -n true 2>/dev/null; then
   log "sudo access is needed for Docker install + secret ownership; you may be prompted"
   sudo true || die "sudo access is required"
 fi
@@ -183,11 +192,21 @@ gen_secret postgres_privileged_url sh -c "printf 'postgres://neogen_priv:%s@post
 # Compose file-secrets are bind mounts that keep HOST permissions. The app
 # container runs as uid 1001 (nextjs) and must be able to read its secrets;
 # the root-read files stay owned by the invoking user, mode 600.
-as_root chown 1001 secrets/postgres_url secrets/postgres_privileged_url secrets/redis_url secrets/redis_cache_url secrets/better_auth_secret
-as_root chmod 400  secrets/postgres_url secrets/postgres_privileged_url secrets/redis_url secrets/redis_cache_url secrets/better_auth_secret
+APP_SECRETS="secrets/postgres_url secrets/postgres_privileged_url secrets/redis_url secrets/redis_cache_url secrets/better_auth_secret"
+# shellcheck disable=SC2086
+if as_root chown 1001 $APP_SECRETS; then
+  # shellcheck disable=SC2086
+  as_root chmod 400 $APP_SECRETS
+  ok "secret permissions set (app secrets → uid 1001 / 400, rest → 600)"
+elif [ -n "${NXPI_NO_SUDO:-}" ]; then
+  # shellcheck disable=SC2086
+  chmod 444 $APP_SECRETS
+  warn "NXPI_NO_SUDO: app secrets left WORLD-READABLE (mode 444) so uid 1001 can read them — rehearsal copies only"
+else
+  die "could not chown the app secrets to uid 1001"
+fi
 chmod 600 secrets/postgres_password secrets/redis_password 2>/dev/null \
-  || as_root chmod 600 secrets/postgres_password secrets/redis_password
-ok "secret permissions set (app secrets → uid 1001 / 400, rest → 600)"
+  || as_root chmod 600 secrets/postgres_password secrets/redis_password || true
 
 # ── 4. Environment files ─────────────────────────────────────────────────────
 hdr "Environment files"

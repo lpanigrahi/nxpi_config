@@ -119,7 +119,10 @@ done_() { [ "$(gv "STEP_$1")" = "done" ]; }
 begin() { done_ "$1" && { log "step $1: already done (resume) — skipping"; return 1; }; sv "STEP_$1" "start $(date +%FT%T)"; hdr "$2"; return 0; }
 finish() { sv "STEP_$1" "done"; }
 LOG="$RUN/run.log"
-exec > >(tee -a "$LOG") 2>&1
+# Everything from here runs inside main(), piped to tee at the bottom of the
+# file: a plain pipe is waited for, so the last lines (a die's message!) always
+# reach both the terminal and $LOG — `exec > >(tee …)` loses them at exit.
+main() {
 log "run $RUN_ID — state: $STATE — log: $LOG"
 
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
@@ -152,7 +155,7 @@ if $ROLLBACK; then
   Re-run with --accept-data-loss-since to confirm that is intended."
   fi
   if [ -n "$OLD_DIGEST" ] && ! $DOCKER image inspect "$OLD_DIGEST" >/dev/null 2>&1; then
-    log "pulling the previous image $OLD_DIGEST…"; $DOCKER pull "$OLD_DIGEST" >/dev/null || die "cannot pull $OLD_DIGEST — the previous image is gone from the registry"
+    log "pulling the previous image ${OLD_DIGEST}…"; $DOCKER pull "$OLD_DIGEST" >/dev/null || die "cannot pull $OLD_DIGEST — the previous image is gone from the registry"
   fi
   log "this restores: $DUMP${UPL:+ + $UPL}, ./.env and ./.env.app from the bundle, and pins the app to ${OLD_DIGEST:-<no digest recorded>}"
   confirm "Roll back to the pre-upgrade state (the current database and uploads are REPLACED)." "ROLLBACK"
@@ -239,7 +242,7 @@ if begin preflight "1. Preflight → db $TARGET, image $IMAGE"; then
   [ -n "$OLD_DB_VERSION" ] || die "DB_VERSION is unset in ./.env — set it to the release this database is at"
   ver_le "$OLD_DB_VERSION" "$TARGET" || die "DB_VERSION=$OLD_DB_VERSION is newer than the target $TARGET"
 
-  log "pulling $IMAGE…"
+  log "pulling ${IMAGE}…"   # braces: bash 3.2 (macOS) reads "$IMAGE…" as one identifier
   $DOCKER pull "$IMAGE" >/dev/null 2>&1 || die "cannot pull $IMAGE — is the package public / are you logged in to ghcr.io?"
   NEW_DIGEST=$(image_digest_of "$IMAGE") || die "the local image for $IMAGE does not carry the digest the reference names — the tag moved; re-pull and pin explicitly"
   [ -n "$NEW_DIGEST" ] || die "could not read a repository digest for $IMAGE"
@@ -426,3 +429,7 @@ sv OPENED_AT "$(date +%FT%T)"
 ok "db $TARGET on $NEW_PINNED, all verifications passed. The window can close."
 FINISHED=true
 exit 0
+}
+
+main 2>&1 | tee -a "$LOG"
+exit "${PIPESTATUS[0]}"

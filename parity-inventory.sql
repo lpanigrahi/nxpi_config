@@ -44,9 +44,16 @@ SELECT 'index|' || schemaname || '.' || tablename || '|' || indexname || '|'
  WHERE schemaname IN ('public', 'drizzle')
  ORDER BY 1;
 
--- constraints: name in field 3, then type, definition, FK actions, validity
+-- constraints: name in field 3, then type, definition, FK actions, validity.
+-- CHECK bodies are compared in a cast-and-paren-stripped form: a CHECK created
+-- by a migration deparses as ARRAY[('a'::character varying)::text, …] while the
+-- same CHECK created by pg_dump's schema.sql deparses as (ARRAY['a'::character
+-- varying, …])::text[] — identical semantics, different rendering.
 SELECT 'constraint|' || c.conrelid::regclass::text || '|' || c.conname || '|' || c.contype::text
-       || '|' || pg_catalog.pg_get_constraintdef(c.oid)
+       || '|' || CASE WHEN c.contype = 'c'
+                      THEN regexp_replace(regexp_replace(regexp_replace(pg_catalog.pg_get_constraintdef(c.oid),
+                             '::(character varying|text\[\]|text|integer|bigint|numeric)', '', 'g'), '[()]', '', 'g'), '\s+', ' ', 'g')
+                      ELSE pg_catalog.pg_get_constraintdef(c.oid) END
        || '|del=' || c.confdeltype::text || '|upd=' || c.confupdtype::text
        || '|deferrable=' || c.condeferrable || '|valid=' || c.convalidated
   FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_namespace n ON n.oid = c.connamespace
