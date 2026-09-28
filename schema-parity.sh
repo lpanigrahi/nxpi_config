@@ -116,9 +116,9 @@ if [ -z "$REHEARSE" ]; then
 
   hdr "Result"
   cat "$OUT/summary.txt"
-  if [ -s "$OUT/only-scratch.txt" ]; then warn "objects the LIVE database is MISSING (only-scratch):"; sed 's/^/    /' "$OUT/only-scratch.txt" | head -n 60; fi
-  if [ -s "$OUT/only-live.txt" ];    then warn "objects the LIVE database has EXTRA (only-live):";     sed 's/^/    /' "$OUT/only-live.txt"    | head -n 60; fi
-  if [ -s "$OUT/advisory.txt" ];     then log  "advisory ($(grep -c . "$OUT/advisory.txt" | tr -d ' ') lines, see $OUT/advisory.txt):"; sed 's/^/    /' "$OUT/advisory.txt" | head -n 20; fi
+  if [ -s "$OUT/only-scratch.txt" ]; then warn "objects the LIVE database is MISSING (only-scratch):"; head -n 60 "$OUT/only-scratch.txt" | sed 's/^/    /'; fi
+  if [ -s "$OUT/only-live.txt" ];    then warn "objects the LIVE database has EXTRA (only-live):";     head -n 60 "$OUT/only-live.txt" | sed 's/^/    /'; fi
+  if [ -s "$OUT/advisory.txt" ];     then log  "advisory ($(grep -c . "$OUT/advisory.txt" | tr -d ' ') lines, see $OUT/advisory.txt):"; head -n 20 "$OUT/advisory.txt" | sed 's/^/    /'; fi
   if parity_verdict "$OUT"; then ok "live catalog matches db/$VER/schema.sql"; exit 0
   else warn "differences found — full lists under $OUT"; exit 3; fi
 fi
@@ -184,8 +184,8 @@ scratch_load_sql "db/$TARGET/grants.sql" >/dev/null || die "db/$TARGET/grants.sq
 PSQL_TARGET=scratch psql_admin -tA < parity-inventory.sql | parity_filter /dev/stdin > "$OUT/target.inv" 2>/dev/null
 parity_classify "$OUT/target.inv" "$OUT/migrated.inv" "$OUT" "$ACCEPT"
 cat "$OUT/summary.txt"
-if [ -s "$OUT/only-scratch.txt" ]; then warn "the MIGRATED copy is MISSING (only-scratch):"; sed 's/^/    /' "$OUT/only-scratch.txt" | head -n 60; fi
-if [ -s "$OUT/only-live.txt" ];    then warn "the MIGRATED copy has EXTRA (only-live):";     sed 's/^/    /' "$OUT/only-live.txt"    | head -n 60; fi
+if [ -s "$OUT/only-scratch.txt" ]; then warn "the MIGRATED copy is MISSING (only-scratch):"; head -n 60 "$OUT/only-scratch.txt" | sed 's/^/    /'; fi
+if [ -s "$OUT/only-live.txt" ];    then warn "the MIGRATED copy has EXTRA (only-live):";     head -n 60 "$OUT/only-live.txt" | sed 's/^/    /'; fi
 
 hdr "Rehearsal result"
 RC=0
