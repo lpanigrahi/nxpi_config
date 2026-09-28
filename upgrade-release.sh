@@ -327,6 +327,16 @@ OLD_DB_VERSION=$(gv OLD_DB_VERSION); OLD_DIGEST=$(gv OLD_DIGEST); NEW_PINNED=$(g
 if begin stop_app "2. Stop the app (Caddy keeps answering 502)"; then
   compose stop app >/dev/null 2>&1 || warn "compose stop app reported an error (already stopped?)"
   ok "app stopped at $(date +%FT%T)"; finish stop_app
+elif ! done_ roll && [ -n "$(compose ps -q --status running app 2>/dev/null)" ]; then
+  # A --resume after a pre-mutation exit (a refused gate, Ctrl-C): the EXIT
+  # trap restarted the OLD app so users were served meanwhile. Stop it again
+  # before anything below writes — the migration must never run under a live
+  # app. The bundle from the original run is reused as designed; rows written
+  # while the old app served in between are NOT in it.
+  hdr "2. Stop the app again (resume: the exit trap had restarted it)"
+  compose stop app >/dev/null 2>&1 || warn "compose stop app reported an error (already stopped?)"
+  ok "app stopped at $(date +%FT%T)"
+  warn "the safety bundle is the original run's — anything written while the old app served since then is not in it; start a fresh run instead if that matters"
 fi
 
 # ── 3. Safety bundle ─────────────────────────────────────────────────────────
