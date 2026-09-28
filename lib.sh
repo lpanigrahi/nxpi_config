@@ -895,6 +895,20 @@ schema_probe_sql() {
   esac
 }
 
+# confirm PROMPT WORD — require WORD to be typed. $ASSUME_YES=true bypasses; a
+# non-tty without it must not hang. Callers that must NEVER auto-confirm (typed
+# acknowledgements of data loss) flip ASSUME_YES off around the call.
+: "${ASSUME_YES:=false}"
+confirm() {
+  local prompt="$1" word="$2" reply
+  $ASSUME_YES && { log "$prompt — auto-confirmed (--yes)"; return 0; }
+  [ -t 0 ] || die "$prompt
+  Not a terminal and --yes was not given — refusing to proceed unattended."
+  printf '%s\n  type %s to continue: ' "$prompt" "$word"
+  read -r reply
+  [ "$reply" = "$word" ] || die "aborted (got '$reply', expected '$word') — nothing was changed"
+}
+
 # psql_scalar SQL — one scalar from the live database, or nothing on failure
 # (callers fail closed). stdin is /dev/null on purpose: `compose exec -T`
 # attaches stdin and would otherwise DRAIN the caller's own stdin (fd-3 loops,

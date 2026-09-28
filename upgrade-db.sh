@@ -6,7 +6,11 @@
 #   ./upgrade-db.sh                          # newest shipped db/<version>
 #   ./upgrade-db.sh 1.9.0                    # stop at a specific release
 #   ./upgrade-db.sh --dry-run                # report only, change nothing
-#   ./upgrade-db.sh --yes                    # non-interactive
+#   ./upgrade-db.sh --yes                    # non-interactive (acks still explicit)
+#   ./upgrade-db.sh --ack DROP-AGENT-MEMORY  # pre-supply a typed acknowledgement
+#   ./upgrade-db.sh --no-backup              # the caller already took the backup
+#   ./upgrade-db.sh --run-dir DIR            # snapshots/expect files go here
+#   ./upgrade-db.sh --skip-parity            # do not run ./schema-parity.sh afterwards
 #   ./upgrade-db.sh --adopt-schema-version 1.4.0   # adopted/restored DB
 #
 # This script adds NO migration logic of its own — it drives ./migrate.sh (and
@@ -16,48 +20,74 @@
 #   • PRE:  refuses to guess ADOPT_SCHEMA_VERSION. Getting it too LOW re-runs
 #           db/1.3.0/migrate-1.3.0.sql, which DELETEs org_role_permission and
 #           org_permission_group_item rows. That is the single largest risk in
-#           any upgrade and it lives in a release you already have.
-#   • PRE:  when 1.9.0 is pending, checks cron_run_log for duplicate 'running'
-#           rows. migrate-1.9.0.sql downgrades that collision to a NOTICE, so
-#           psql exits 0, the file is stamped applied, and its unique index is
-#           SILENTLY never created — the app then fails at runtime on
-#           ON CONFLICT with no trace in the marker table.
-#   • PRE:  when 1.11.0 is pending, checks invoice and org_invite for the
-#           duplicates its two new UNIQUE indexes cannot span. That delta fails
-#           CLOSED on them by design (it will not delete rows to make an index
-#           fit), and duplicate PENDING invites are documented-normal on a VM
-#           with invite churn — so this is the check that lets --dry-run tell
-#           you, instead of a full backup and an aborted migration telling you.
-#   • PRE:  snapshots row counts, so "no data was lost" is verified, not assumed.
-#   • POST: asserts every object each release in scope should have created,
-#           that grants reached the new tables, and that no table shrank.
+#           any upgrade and it lives in a release you already have. The
+#           sentinel table (SCHEMA_PROBES in lib.sh) says which release the
+#           schema really matches.
+#   • PRE:  runs every data pre-check in lib-checks.sh that the PENDING set
+#           gates: the 1.9.0 cron NOTICE landmine, the 1.11.0 UNIQUE-index
+#           duplicates, 1.25.0's fail-closed predicates (privilege-request
+#           duplicates, team members outside their org, malformed role keys,
+#           grants with a bad type / non-UUID / dangling resource, unknown
+#           permission slugs, junction orphans), 1.29.0's app-role posture,
+#           1.35.0's cron duplicates and agent_memory rows. Each delta would
+#           abort INSIDE the window otherwise — after the backup and the .env
+#           edit. A non-zero ack-class count (agent_memory rows) needs a typed
+#           word, also with --yes (pass --ack WORD to pre-supply it).
+#   • PRE:  snapshots row counts and the CUSTOM RBAC rows, so "no data was
+#           lost" is verified, not assumed — against an explicit, printed list
+#           of the changes the pending deltas are allowed to make
+#           (expect_rows_for in lib-checks.sh: 1.22.0/1.25.0 delete the
+#           materialised SYSTEM-role defaults, 1.25.0 rebuilds
+#           org_resource_grant checksummed, 1.35.0 drops agent_memory,
+#           1.25.0/1.27.0/1.40.1 seed reference rows).
+#   • POST: asserts every sentinel object each release in scope introduces,
+#           the load-bearing objects (catalog rows, chain head, partitions, RLS
+#           posture, cron index, dropped orphans), that grants reached EVERY
+#           table, that the custom RBAC rows are byte-identical, and that no
+#           table shrank outside the expected list. Then ./schema-parity.sh
+#           (when present) diffs the live catalog against db/<target>/schema.sql.
 #
-# A REQUIRES-REVIEW delta in scope (currently 1.9.0's document_chunk FK cascade)
-# is surfaced with its own header text and needs an explicit confirmation; the
-# rolling ./update.sh path refuses those by design. Purely additive targets
-# (e.g. 1.10.0, 1.11.0, 1.12.0, 1.13.0, 1.14.0, 1.15.0) need no such gate.
+# Every REQUIRES-REVIEW delta in scope (1.9.0, 1.26.0, 1.29.0, 1.35.0) is
+# surfaced with its own header and rationale before ONE confirmation; the
+# rolling ./update.sh path refuses those by design. 1.29.0 additionally needs
+# the privileged-pool decision to be explicit: POSTGRES_PRIVILEGED_URL_FILE set
+# in ./.env and the neogen_priv role provisioned, or the KNOWN-LIMIT ack.
 #
-# 1.15.0 also ships optional-0082-drop-ivfflat-index.sql. It is NOT matched by
-# the migrate-*.sql glob, so nothing here ever applies it — dropping the unused
-# IVFFlat twin of the HNSW index is an operator step (see README.md).
+# optional-*.sql files (1.15.0, 1.16.0, 1.22.0) are NOT matched by the
+# migrate-*.sql glob, so nothing here ever applies them (1.35.0 converges what
+# two of them offered).
 #
-# Afterwards, roll the matching app image with ./update.sh.
+# Afterwards, roll the matching app image with ./update.sh — or let
+# ./upgrade-release.sh drive this script, the image switch and the roll as one
+# rehearsed, resumable, rollback-able window.
 # =============================================================================
 set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR"
 # shellcheck source=lib.sh
 . ./lib.sh
+# shellcheck source=lib-checks.sh
+. ./lib-checks.sh
 
 ASSUME_YES=false
 DRY_RUN=false
 ADOPT=""
 TARGET_VER=""
+NO_BACKUP=false
+RUN_DIR="backups"
+SKIP_PARITY=false
+ACKS=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --yes|-y)                ASSUME_YES=true ;;
     --dry-run)               DRY_RUN=true ;;
+    --no-backup)             NO_BACKUP=true ;;
+    --skip-parity)           SKIP_PARITY=true ;;
+    --ack)                   shift; [ $# -gt 0 ] || die "--ack needs a word"; ACKS="$ACKS $1" ;;
+    --ack=*)                 ACKS="$ACKS ${1#*=}" ;;
+    --run-dir)               shift; [ $# -gt 0 ] || die "--run-dir needs a directory"; RUN_DIR="$1" ;;
+    --run-dir=*)             RUN_DIR="${1#*=}" ;;
     --adopt-schema-version)  shift; [ $# -gt 0 ] || die "--adopt-schema-version needs a value (e.g. 1.4.0)"; ADOPT="${1#v}" ;;
     --adopt-schema-version=*) ADOPT="${1#*=}"; ADOPT="${ADOPT#v}" ;;
     -h|--help)               sed -n '2,/^# ===/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
@@ -67,6 +97,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+mkdir -p "$RUN_DIR" 2>/dev/null || die "cannot create --run-dir $RUN_DIR"
 
 # Default target: the newest db/<version> this package ships. `sort -V` is the
 # same ordering apply_migrations uses, so 1.10.0 correctly follows 1.9.0.
@@ -78,7 +109,9 @@ is_exact_semver "$TARGET_VER" || die "target must be a bare X.Y.Z release (got: 
 [ -d "db/$TARGET_VER" ] || die "db/$TARGET_VER is not shipped in this package.
   Available: $(find db -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort -V | tr '\n' ' ')"
 
-SNAPSHOT="backups/pre-${TARGET_VER}-rowcounts.txt"
+SNAPSHOT="$RUN_DIR/pre-${TARGET_VER}-rowcounts.txt"
+EXPECT="$RUN_DIR/pre-${TARGET_VER}-expected-changes.tsv"
+CUSTOM_RBAC="$RUN_DIR/pre-${TARGET_VER}-custom-rbac.txt"
 
 # An operator-supplied version reaches SQL string context and picks a db/ folder.
 [ -z "$ADOPT" ] || is_exact_semver "$ADOPT" \
@@ -88,23 +121,14 @@ SNAPSHOT="backups/pre-${TARGET_VER}-rowcounts.txt"
 # at or beyond it. Gates the per-release verification blocks below.
 at_least() { ver_le "$1" "$TARGET_VER"; }
 
-# confirm PROMPT WORD — require WORD to be typed. --yes bypasses; a dry run
-# never reaches a mutation, and a non-tty without --yes must not hang.
-confirm() {
-  local prompt="$1" word="$2" reply
-  $ASSUME_YES && { log "$prompt — auto-confirmed (--yes)"; return 0; }
-  [ -t 0 ] || die "$prompt
-  Not a terminal and --yes was not given — refusing to proceed unattended."
-  printf '%s\n  type %s to continue: ' "$prompt" "$word"
-  read -r reply
-  [ "$reply" = "$word" ] || die "aborted (got '$reply', expected '$word') — nothing was changed"
-}
+# ack_given WORD — true when the operator pre-supplied WORD via --ack.
+ack_given() { case " $ACKS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 # q SQL — a single scalar, or nothing on failure (callers fail closed).
-# stdin is /dev/null on purpose: `compose exec -T` attaches stdin and would
-# otherwise DRAIN this script's own stdin — both the fd-3 loops below and the
-# interactive `read` in confirm() depend on it staying intact.
-q() { psql_admin -tAc "$1" </dev/null 2>/dev/null | tr -d '[:space:]' || true; }
+# (psql_scalar in lib.sh; stdin is /dev/null there on purpose — `compose exec
+# -T` would otherwise DRAIN this script's own stdin, which the fd-3 loops below
+# and the interactive `read` in confirm() depend on.)
+q() { psql_scalar "$1"; }
 
 init_docker
 acquire_lock
@@ -182,17 +206,12 @@ if [ "$MARKER_N" = "0" ]; then
   Too HIGH silently skips migrations the schema still needs.
   Too LOW re-runs db/1.3.0/migrate-1.3.0.sql, which DELETEs rows from
   org_role_permission and org_permission_group_item — real data loss.
-  If unsure, check for a column/table added by a known release, e.g.:
-      skill_scan          exists ⇒ schema is at least 1.5.0
-      skill_qa_run        exists ⇒ at least 1.6.0
-      skill.deployed      exists ⇒ at least 1.8.0
-      job_execution       exists ⇒ at least 1.9.0
-      session.mfa_verified_at    ⇒ at least 1.10.0
-      organization_entitlement   ⇒ at least 1.11.0
-      user.locked_until          ⇒ at least 1.12.0
-      org_role_permission.denied ⇒ at least 1.13.0
-      plugin_source       exists ⇒ at least 1.14.0
-      plugin_bundle.deleted_at   ⇒ at least 1.15.0"
+  The sentinel objects each release introduces, probed against THIS database
+  (present ⇒ the schema is at least that release):
+$(schema_probe_report | awk -F'\t' '$1=="highest-present"{print "      highest release whose sentinel exists: " $2; next} {printf "      %-8s %-8s %s\n", $1, $2, $3}')
+  Releases without a unique sentinel (1.7.0, 1.21.0, 1.28.0, 1.34.0, 1.40.1)
+  are safe to re-apply — choose the LOWER neighbour. ./schema-parity.sh <X.Y.Z>
+  is the decisive test: it must report nothing in only-scratch."
 
   STAMPED=""; EXECUTED=""
   while IFS= read -r f <&3; do
@@ -211,94 +230,57 @@ if [ "$MARKER_N" = "0" ]; then
   export ADOPT_SCHEMA_VERSION="$ADOPT"
 fi
 
-# ── 3. cron_run_log pre-check (only when 1.9.0 is actually pending) ─────────
-# migrate-1.9.0.sql creates a partial UNIQUE index on cron_run_log(cron_job_id)
-# WHERE status='running', wrapped in `EXCEPTION WHEN unique_violation THEN
-# RAISE NOTICE`. A NOTICE is not an error: psql exits 0, lib.sh stamps the file
-# applied, and the index is never created and never retried. Catch it BEFORE.
-if pending_has "migrate-1.9.0.sql"; then
-  hdr "Pre-check: cron_run_log (migrate-1.9.0.sql is pending)"
-  if [ "$(q "select to_regclass('public.cron_run_log') is null")" = "t" ]; then
-    log "cron_run_log does not exist yet — nothing to check"
-  else
-    DUPES=$(q "select count(*) from (select cron_job_id from cron_run_log where status='running' group by cron_job_id having count(*) > 1) d")
-    assert_numeric "$DUPES" "the cron_run_log duplicate count"
-    if [ "$DUPES" != "0" ]; then
-      warn "$DUPES cron job(s) have MORE THAN ONE 'running' row:"
-      psql_admin -c "select cron_job_id, count(*) from cron_run_log where status='running' group by cron_job_id having count(*) > 1;" </dev/null || true
-      die "migrate-1.9.0.sql would SILENTLY skip creating
-  cron_run_log_one_running_per_job (it downgrades the collision to a NOTICE, so
-  the migration still reports success). The app would then fail at runtime with
-  'no unique or exclusion constraint matching the ON CONFLICT specification'.
-  Let the app's cleanupStaleLogs sweep finish, or resolve the duplicates by hand
-  (keep the newest per job), then re-run this script."
-    fi
-    ok "no duplicate 'running' rows — the 1.9.0 claim index can be created"
-  fi
+# ── 3. Data pre-checks for the pending set (lib-checks.sh) ──────────────────
+# Every delta that fails CLOSED on live data — 1.9.0's cron NOTICE landmine,
+# 1.11.0's UNIQUE-index duplicates, 1.25.0's sixteen RAISE EXCEPTION sites,
+# 1.29.0's app-role posture, 1.35.0's cron duplicates and agent_memory drop —
+# does so from INSIDE its single-transaction apply, after the backup and the
+# ./.env edit. lib-checks.sh mirrors each predicate as a read-only SELECT keyed
+# on the pending file, so a --dry-run reports it a week early. A BLOCK or an
+# unreadable check dies; an ACK-class count needs the operator's typed word.
+hdr "Data pre-checks ($(printf '%s\n' "$PENDING" | grep -c . | tr -d ' ') pending delta(s))"
+run_checks die "$PENDING"
+if [ -n "$CHECK_ACKS" ]; then
+  while read -r ack_name ack_word ack_count; do
+    [ -n "$ack_name" ] || continue
+    if ack_given "$ack_word"; then log "$ack_name: $ack_count row(s) — acknowledged via --ack $ack_word"; continue; fi
+    warn "$ack_name reports $ack_count row(s) that the pending delta will DROP with the table."
+    if $DRY_RUN; then log "(dry run) the real run will ask you to type $ack_word (or pass --ack $ack_word)"; continue; fi
+    ASSUME_YES_SAVED=$ASSUME_YES; ASSUME_YES=false   # an ack is never auto-confirmed
+    confirm "Accept losing these rows." "$ack_word"
+    ASSUME_YES=$ASSUME_YES_SAVED
+  done <<<"$CHECK_ACKS"
 fi
 
-# ── 4. invoice / org_invite pre-check (only when 1.11.0 is actually pending) ─
-# migrate-1.11.0.sql builds two partial UNIQUE indexes. Unlike 1.9.0's NOTICE
-# handler it fails CLOSED on pre-existing duplicates — it will not delete rows
-# to make an index fit, because ./migrate.sh is additive-only by contract. That
-# is the right call, but on its own it surfaces as an aborted migration AFTER
-# migrate.sh has taken a full backup and this script has already edited ./.env.
-# Checking here is what lets --dry-run report it instead.
-if pending_has "migrate-1.11.0.sql"; then
-  hdr "Pre-check: invoice / org_invite (migrate-1.11.0.sql is pending)"
-
-  # rel_ready TABLE COL… — true only when the table AND every named column are
-  # present. An adopted schema may predate any of them; that must read as
-  # "nothing to check yet", never as a check that silently passed.
-  rel_ready() {
-    local t="$1" c; shift
-    [ "$(q "select to_regclass('public.$t') is not null")" = "t" ] || return 1
-    for c in "$@"; do
-      [ "$(q "select 1 from information_schema.columns where table_schema='public' and table_name='$t' and column_name='$c'")" = "1" ] || return 1
-    done
-    return 0
-  }
-
-  # (a) invoice_org_external_id_uq. A duplicate here is a real anomaly: it is a
-  # replayed billing webhook, minted before the index existed to block it.
-  if rel_ready invoice organization_id external_invoice_id issued_at; then
-    INV_DUPES=$(q "select count(*) from (select 1 from invoice where external_invoice_id is not null group by organization_id, external_invoice_id having count(*) > 1) d")
-    assert_numeric "$INV_DUPES" "the invoice duplicate count"
-    if [ "$INV_DUPES" != "0" ]; then
-      warn "$INV_DUPES (organization_id, external_invoice_id) group(s) hold duplicate invoices:"
-      # Order by issued_at, not min(id): invoice.id is gen_random_uuid(), so the
-      # smallest uuid is not the earliest row.
-      psql_admin -c "select organization_id, external_invoice_id, count(*) as copies, min(issued_at) as earliest from invoice where external_invoice_id is not null group by 1,2 having count(*) > 1 order by 3 desc;" </dev/null || true
-      die "migrate-1.11.0.sql will REFUSE to build invoice_org_external_id_uq over these.
-  They are duplicate open invoices from replayed billing webhooks. Keep ONE row
-  per group (normally the 'earliest' shown above), void or delete the rest, then
-  re-run this script. The delta will not modify invoice rows for you —
-  ./migrate.sh is additive-only by contract."
+# ── 4. The privileged-pool decision (only when 1.29.0 is pending) ───────────
+# 1.29.0 FORCEs row-level security. The app's background cross-tenant sweeps
+# run on a privileged pool that falls back to POSTGRES_URL when nothing else
+# is configured — and then matches ZERO rows, silently. The bundle does not
+# choose for you; this script refuses to let the choice stay implicit.
+if pending_has "migrate-1.29.0.sql"; then
+  hdr "Privileged pool (migrate-1.29.0.sql is pending)"
+  PRIV_FILE=$(env_get .env POSTGRES_PRIVILEGED_URL_FILE "")
+  if [ -n "$PRIV_FILE" ]; then
+    [ -s secrets/postgres_privileged_url ] || die "POSTGRES_PRIVILEGED_URL_FILE is set in ./.env but secrets/postgres_privileged_url is missing — run ./install.sh (it generates it), then ./provision-privileged-role.sh"
+    if [ "$(q "select 1 from pg_roles where rolname='neogen_priv' and rolbypassrls")" = "1" ]; then
+      ok "neogen_priv (BYPASSRLS) exists and ./.env wires secrets/postgres_privileged_url into the app"
+    elif $DRY_RUN; then
+      warn "neogen_priv does not exist yet — run ./provision-privileged-role.sh before the real run"
+    else
+      die "POSTGRES_PRIVILEGED_URL_FILE is set but the neogen_priv role does not exist — run ./provision-privileged-role.sh first (idempotent), then re-run"
     fi
-    ok "no duplicate (organization_id, external_invoice_id) invoices"
   else
-    log "invoice is not present in its 1.11.0 shape yet — nothing to check"
-  fi
-
-  # (b) org_invite_pending_email_uq. A duplicate here is EXPECTED, not damage:
-  # invite-service.create re-invites when a pending invite has EXPIRED, leaving
-  # two rows with accepted_at IS NULL. Any VM with invite churn can hit this, so
-  # say so plainly rather than implying corruption.
-  if rel_ready org_invite organization_id invited_email accepted_at expires_at; then
-    INVITE_DUPES=$(q "select count(*) from (select 1 from org_invite where accepted_at is null group by organization_id, invited_email having count(*) > 1) d")
-    assert_numeric "$INVITE_DUPES" "the org_invite duplicate count"
-    if [ "$INVITE_DUPES" != "0" ]; then
-      warn "$INVITE_DUPES (organization_id, invited_email) group(s) hold more than one PENDING invite:"
-      psql_admin -c "select organization_id, invited_email, count(*) as pending, max(expires_at) as keep_this_one from org_invite where accepted_at is null group by 1,2 having count(*) > 1 order by 3 desc;" </dev/null || true
-      die "migrate-1.11.0.sql will REFUSE to build org_invite_pending_email_uq over these.
-  This is NOT corruption — re-inviting after a pending invite EXPIRED leaves both
-  rows pending, which is normal. Keep the newest per group (the 'keep_this_one'
-  expires_at above) and delete the superseded rows, then re-run this script. The
-  delta will not delete invite rows for you — ./migrate.sh is additive-only."
+    warn "POSTGRES_PRIVILEGED_URL_FILE is unset in ./.env: after this delta the expired-grant sweep and the
+  knowledge/vector GC match zero rows until it is set (see .env.example, 'Privileged database pool').
+  Reads still filter expiry at query time, so nothing is granted that should not be — this is
+  housekeeping and observability, not privilege persistence."
+    if ack_given KNOWN-LIMIT; then log "accepted as a known limit (--ack KNOWN-LIMIT)"
+    elif $DRY_RUN; then log "(dry run) the real run will ask you to type KNOWN-LIMIT, or set the flag and provision the role"
+    else
+      ASSUME_YES_SAVED=$ASSUME_YES; ASSUME_YES=false
+      confirm "Proceed WITHOUT a privileged pool (record this decision)." "KNOWN-LIMIT"
+      ASSUME_YES=$ASSUME_YES_SAVED
     fi
-    ok "no duplicate pending invites — the 1.11.0 invite index can be created"
-  else
-    log "org_invite is not present in its 1.11.0 shape yet — nothing to check"
   fi
 fi
 
@@ -306,34 +288,46 @@ fi
 # Exact counts for every user table, so the post-check can prove nothing shrank.
 # Written BEFORE any mutation.
 hdr "Row-count snapshot"
-snapshot_to() {
+# custom_rbac_rows — the NON-system role permissions and pack items: the rows
+# no delta may touch (1.22.0 and 1.25.0 delete materialised SYSTEM defaults
+# only). Captured before, compared byte-for-byte after.
+custom_rbac_rows() {
   psql_admin -tAF$'\t' -c "
-    select table_name,
-           (xpath('/row/c/text()',
-                  query_to_xml(format('select count(*) as c from public.%I', table_name),
-                               false, true, '')))[1]::text::bigint
-    from information_schema.tables
-    where table_schema = 'public' and table_type = 'BASE TABLE'
-    order by table_name;" </dev/null 2>/dev/null
+    select 'role', r.id::text, rp.permission, rp.denied::text
+      from org_role_permission rp join org_role r on r.id = rp.role_id where not r.is_system
+    union all
+    select 'pack', g.id::text, gi.permission, ''
+      from org_permission_group_item gi join org_permission_group g on g.id = gi.group_id where not g.is_system
+    order by 1, 2, 3;" </dev/null 2>/dev/null
 }
-if $DRY_RUN; then
-  log "(dry run) would write $SNAPSHOT"
+# The allow-list the post-check will judge by — printed now so a dry run shows
+# exactly which tables may change and why.
+EXPECT_TEXT=$(expect_rows_for "$PENDING")
+if [ -n "$EXPECT_TEXT" ]; then
+  log "row-count changes the pending deltas are ALLOWED to make (everything else must be unchanged):"
+  printf '%s\n' "$EXPECT_TEXT" | awk -F'\t' '{printf "    %-28s %-10s %s\n", $1, $2, $3}'
 else
-  mkdir -p backups
-  snapshot_to > "$SNAPSHOT" || die "could not snapshot row counts — refusing to migrate without a baseline"
-  [ -s "$SNAPSHOT" ] || die "the row-count snapshot came back empty — refusing to migrate without a baseline"
-  ok "baseline written: $SNAPSHOT ($(wc -l < "$SNAPSHOT" | tr -d ' ') tables)"
+  log "the pending set is additive-only: no table may lose rows"
 fi
-
 if $DRY_RUN; then
-  hdr "Dry run complete"
-  log "no changes were made. Re-run without --dry-run to apply."
-  exit 0
+  log "(dry run) would write $SNAPSHOT, $EXPECT and $CUSTOM_RBAC"
+else
+  rowcount_snapshot > "$SNAPSHOT" || die "could not snapshot row counts — refusing to migrate without a baseline"
+  [ -s "$SNAPSHOT" ] || die "the row-count snapshot came back empty — refusing to migrate without a baseline"
+  printf '%s\n' "$EXPECT_TEXT" | sed '/^$/d' > "$EXPECT"
+  if rel_ready org_role_permission && rel_ready org_permission_group_item; then
+    custom_rbac_rows > "$CUSTOM_RBAC" || die "could not snapshot the custom RBAC rows"
+  else
+    : > "$CUSTOM_RBAC"
+  fi
+  ok "baseline written: $SNAPSHOT ($(wc -l < "$SNAPSHOT" | tr -d ' ') tables), $CUSTOM_RBAC ($(wc -l < "$CUSTOM_RBAC" | tr -d ' ') custom RBAC rows)"
 fi
 
 # ── 6. Align DB_VERSION ─────────────────────────────────────────────────────
 hdr "Target version"
-if [ "$CUR_DB_VERSION" != "$TARGET_VER" ]; then
+if $DRY_RUN; then
+  log "(dry run) ./.env would get DB_VERSION=$TARGET_VER (currently ${CUR_DB_VERSION:-<unset>}); the review follows"
+elif [ "$CUR_DB_VERSION" != "$TARGET_VER" ]; then
   log "./.env needs:  DB_VERSION=$TARGET_VER   (currently ${CUR_DB_VERSION:-<unset>})"
   confirm "This edits your ./.env." "EDIT"
   # Same content as ./.env, so same secrecy — do not inherit a loose umask.
@@ -354,49 +348,91 @@ fi
 
 # assert_version_alignment only enforces for an EXACT X.Y.Z image tag; moving
 # tags (latest/main/sha-…) legitimately skip it and rely on DB_VERSION.
-assert_version_alignment
+$DRY_RUN || assert_version_alignment
 
-# ── 7. Surface any REQUIRES-REVIEW delta, then migrate ──────────────────────
-# lib.sh's has_pending_destructive prints the first flagged file apply_migrations
-# would run. Only then do we arm the override — a purely additive upgrade
-# (e.g. 1.9.0 → 1.10.0) never asks for it.
-DESTRUCTIVE_FILE=$(has_pending_destructive || true)
-if [ -n "$DESTRUCTIVE_FILE" ]; then
-  hdr "Review required: $(basename "$DESTRUCTIVE_FILE")"
-  warn "this delta is flagged REQUIRES-REVIEW — its own rationale follows:"
-  sed -n '1,12p' "$DESTRUCTIVE_FILE" | sed 's/^/  /'
-  cat <<'EOF'
-
-  Reviewed for data loss across 1.5.0 → 1.15.0: there is no DROP TABLE, DROP
-  COLUMN, TRUNCATE or unguarded DELETE anywhere in that range. Every NOT NULL
-  column added carries a default, so existing rows are grandfathered without a
-  table rewrite. The flag is about CHANGED BEHAVIOUR, not migration-time loss.
-
-  Two nuances in that range, neither a loss: migrate-1.15.0.sql runs ONE
-  UPDATE (nav_visibility_override), which reconciles rows whose scope and
-  organization_id already disagree before it adds the CHECK that forbids the
-  combination — row-count preserving, so the snapshot comparison still holds.
-  And 1.15.0's DROP INDEX ships OUTSIDE the migrate-*.sql glob, as
-  optional-0082-drop-ivfflat-index.sql, so it is never applied from here.
-
-  ./migrate.sh will take its own mandatory backup before touching anything.
+# ── 7. Surface EVERY REQUIRES-REVIEW delta, then migrate ────────────────────
+# lib.sh's list_pending_destructive prints every flagged file apply_migrations
+# would run — a 1.15.0 → 1.41.0 jump carries three. Only then do we arm the
+# override — a purely additive upgrade (e.g. 1.9.0 → 1.10.0) never asks for it.
+# review_notes FILE — what each flagged delta does to DATA, in one paragraph.
+review_notes() {
+  case "$(basename "$1")" in
+    migrate-1.9.0.sql) cat <<'EOF'
+  Reviewed for data loss across 1.5.0 → 1.15.0: no DROP TABLE, DROP COLUMN,
+  TRUNCATE or unguarded DELETE; every NOT NULL column added carries a default.
+  The flag is about CHANGED BEHAVIOUR: document_chunk's organization FK becomes
+  ON DELETE CASCADE, so deleting an organization deletes its RAG corpus instead
+  of re-homing it. Row-count preserving.
 EOF
-  confirm "Proceed, accepting the reviewed change above." "UPGRADE"
-  export ALLOW_DESTRUCTIVE_MIGRATION=1
+    ;;
+    migrate-1.26.0.sql) cat <<'EOF'
+  No row is deleted. audit_chain_head.chain_key becomes NOT NULL (the chain is
+  keyed per organization from here) — the PREVIOUSLY RUNNING image sends none,
+  so it cannot write ANY audit row afterwards: this is ROLL-FORWARD-ONLY. The
+  matching image must be rolled right after the migration; the pre-upgrade dump
+  is the only way back. Row-count preserving (one UPDATE keys the platform head).
+EOF
+    ;;
+    migrate-1.29.0.sql) cat <<'EOF'
+  No table, column, index or constraint changes; nothing is deleted. ENFORCEMENT
+  changes: row-level security is ENABLED and FORCED on 26 tenant tables. The
+  previously running image does not set app.current_org_id and would read EMPTY
+  tables — roll-forward-only, same as 1.26.0. The privileged-pool decision above
+  is what keeps the background sweeps working. Fully reversible in SQL, but the
+  supported way back is the pre-upgrade dump.
+EOF
+    ;;
+    migrate-1.35.0.sql) cat <<'EOF'
+  47 legacy constraint names are RENAMED to their fresh-lineage equivalents;
+  document_chunk's organization FK becomes ON DELETE CASCADE where it was SET
+  NULL (deleting an organization then deletes its RAG corpus); RLS parity on
+  assistant / organization_entitlement / knowledge_embedding_migration_state;
+  the redundant IVFFlat index is dropped; and the ORPHAN table agent_memory is
+  DROPPED (zero readers and writers in the app — its row count was acknowledged
+  in the pre-checks above). The delta aborts, whole, on duplicate 'running'
+  cron rows (pre-checked). Row counts: agent_memory disappears; nothing else.
+EOF
+    ;;
+    *) printf '  (no packaged review note for %s — read its header above)\n' "$(basename "$1")" ;;
+  esac
+}
+DESTRUCTIVE_LIST=$(list_pending_destructive || true)
+if [ -n "$DESTRUCTIVE_LIST" ]; then
+  hdr "Review required: $(printf '%s\n' "$DESTRUCTIVE_LIST" | xargs -n1 basename | tr '\n' ' ')"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    warn "$(basename "$f") is flagged REQUIRES-REVIEW — its own rationale follows:"
+    sed -n '1,12p' "$f" | sed 's/^/  /'
+    echo; review_notes "$f"; echo
+  done <<<"$DESTRUCTIVE_LIST"
+  $NO_BACKUP || log "./migrate.sh will take its own mandatory backup before touching anything."
+  if $DRY_RUN; then log "(dry run) the real run asks for ONE typed UPGRADE covering every delta above"
+  else
+    confirm "Proceed, accepting the reviewed change(s) above." "UPGRADE"
+    export ALLOW_DESTRUCTIVE_MIGRATION=1
+  fi
 else
   hdr "Review"
   ok "no REQUIRES-REVIEW delta in scope — this upgrade is additive-only"
   log "(the same set is what ./update.sh's rolling path would apply)"
-  confirm "Proceed with the upgrade to $TARGET_VER." "UPGRADE"
+  $DRY_RUN || confirm "Proceed with the upgrade to $TARGET_VER." "UPGRADE"
+fi
+
+if $DRY_RUN; then
+  hdr "Dry run complete"
+  log "no changes were made. Re-run without --dry-run to apply."
+  exit 0
 fi
 
 hdr "Migration"
-# migrate.sh takes the safety backup, re-checks the marker, applies every
-# pending delta in semver order inside a single transaction per file, and
-# re-applies db/<target>/grants.sql afterwards.
+# migrate.sh takes the safety backup (unless --no-backup: the caller already
+# did), re-checks the marker, applies every pending delta in semver order
+# inside a single transaction per file, and re-applies db/<target>/grants.sql.
 # Its post-migration health gate may fail here when a running app image
 # predates the schema; migrate.sh exits 0 in that case by design.
-./migrate.sh \
+MIGRATE_ARGS=""; $NO_BACKUP && MIGRATE_ARGS="--no-backup"
+# shellcheck disable=SC2086
+./migrate.sh $MIGRATE_ARGS \
   || die "migration failed — the database was rolled back to its pre-migration state.
   Your backup is in ./backups. Inspect the error above, then re-run."
 
@@ -559,6 +595,77 @@ if at_least 1.15.0; then
     "re-run ./migrate.sh (0088 skips cleanly when plugin_bundle is absent — check that it exists)."
 fi
 
+# ── Version-agnostic checks for everything 1.16.0 and later ─────────────────
+# One sentinel per release (SCHEMA_PROBES) instead of a hand-written block per
+# release, plus the LOAD-BEARING objects whose absence takes a screen or the
+# login down, and a grants sweep over EVERY table (a delta GRANTs its own new
+# tables and grants.sql re-asserts; this proves one of the two reached the role).
+hdr "Sentinels ($TARGET_VER)"
+while IFS=$'\t' read -r pv pk po; do
+  [ -n "$pv" ] || continue
+  at_least "$pv" || continue
+  ver_le 1.16.0 "$pv" || continue    # ≤ 1.15.0 is covered by the blocks above
+  chk "$pv sentinel: $pk $po" "1" "$(q "$(schema_probe_sql "$pk" "$po")")" \
+    "the delta that introduces it did not fully apply — check the marker table and re-run ./migrate.sh."
+done <<<"$SCHEMA_PROBES"
+
+if at_least 1.25.0; then
+  chk "permission_catalog is populated (≥ 78 slugs)" "t" \
+    "$(q "select (select count(*) from permission_catalog) >= 78")" \
+    "0012's seed did not land (or 1.40.1's repair is pending) — the RBAC matrix renders empty and every grant edit fails 23503."
+  chk "org_resource_grant is partitioned" "p" \
+    "$(q "select relkind from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and c.relname='org_resource_grant'")" \
+    "0015's rebuild did not complete."
+  chk "org_resource_grant has its six partitions" "6" \
+    "$(q "select count(*) from pg_inherits where inhparent='public.org_resource_grant'::regclass")" \
+    "0015's partitions are missing."
+  chk "org_role.key is NOT NULL" "NO" \
+    "$(q "select is_nullable from information_schema.columns where table_schema='public' and table_name='org_role' and column_name='key'")" \
+    "0009 did not apply."
+fi
+if at_least 1.26.0; then
+  chk "audit chain head is keyed" "1" \
+    "$(q "select 1 from information_schema.columns where table_schema='public' and table_name='audit_chain_head' and column_name='chain_key' and is_nullable='NO'")" \
+    "0020 did not apply."
+fi
+if at_least 1.29.0; then
+  chk "≥ 26 tables FORCE row-level security" "t" \
+    "$(q "select (select count(*) from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and c.relforcerowsecurity) >= 26")" \
+    "1.29.0's ENABLE/FORCE statements did not land — tenant data is readable across organizations by the app role."
+  chk "≥ 26 tenant_isolation policies" "t" \
+    "$(q "select (select count(*) from pg_policies where schemaname='public' and policyname='tenant_isolation') >= 26")" \
+    "1.29.0's CREATE POLICY statements did not land."
+fi
+if at_least 1.35.0; then
+  chk "cron claim index present (1.35.0 converges legacy 0072)" "1" \
+    "$(q "select 1 from pg_indexes where schemaname='public' and indexname='cron_run_log_one_running_per_job'")" \
+    "resolve duplicate 'running' cron rows and re-run ./migrate.sh."
+  chk "redundant IVFFlat index is gone" "" \
+    "$(q "select 1 from pg_indexes where schemaname='public' and indexname='knowledge_embeddings_embedding_ivfflat_idx'")" \
+    "0036's DROP INDEX did not run."
+  chk "orphan agent_memory table is gone" "" \
+    "$(q "select 1 from information_schema.tables where table_schema='public' and table_name='agent_memory'")" \
+    "0036's DROP TABLE did not run."
+  chk "document_chunk org FK is ON DELETE CASCADE" "c" \
+    "$(q "select confdeltype from pg_constraint where conname='document_chunk_organization_id_organization_id_fk' and conrelid='public.document_chunk'::regclass")" \
+    "0036's convergence of legacy 0073 did not apply."
+fi
+
+hdr "Grants (every table)"
+# admin_audit_log_quarantine is SELECT-only for the app role by design (1.33.0
+# grants.sql REVOKEs writes); deploy_schema_migrations is the scripts' own.
+NO_INSERT=$(q "select string_agg(c.relname, ' ') from pg_class c join pg_namespace n on n.oid=c.relnamespace
+  where n.nspname='public' and c.relkind in ('r','p')
+    and c.relname not in ('admin_audit_log_quarantine','deploy_schema_migrations')
+    and not has_table_privilege('neo_gen', c.oid, 'INSERT')")
+NO_SELECT=$(q "select string_agg(c.relname, ' ') from pg_class c join pg_namespace n on n.oid=c.relnamespace
+  where n.nspname='public' and c.relkind in ('r','p') and c.relname <> 'deploy_schema_migrations'
+    and not has_table_privilege('neo_gen', c.oid, 'SELECT')")
+chk "neo_gen can INSERT into every app table" "" "$NO_INSERT" \
+  "re-apply grants:  ./compose.sh exec -T postgres psql -U neogen_admin -d neogen < db/$TARGET_VER/grants.sql"
+chk "neo_gen can SELECT from every table" "" "$NO_SELECT" "re-apply grants (see above)."
+chk "neo_gen can use the drizzle schema" "t" "$(q "select has_schema_privilege('neo_gen','drizzle','USAGE')")" "re-apply grants (see above)."
+
 # Every migration in scope must now be recorded.
 while IFS= read -r f <&3; do
   [ -n "$f" ] || continue
@@ -570,28 +677,47 @@ done 3< <(migration_files_through "$TARGET_VER")
 
 # ── The losslessness assertion ──────────────────────────────────────────────
 hdr "Data preservation"
-snapshot_to > "${SNAPSHOT}.after" || die "could not read post-migration row counts"
+rowcount_snapshot > "${SNAPSHOT}.after" || die "could not read post-migration row counts"
 [ -s "${SNAPSHOT}.after" ] || die "post-migration row counts came back empty — verify by hand before rolling the app"
-# awk exits 1 if ANY table shrank, printing one line per loss. `set +e` around
-# it so a non-zero exit is data, not a script abort.
+# rowcount_compare judges every table against the printed allow-list: `!!`
+# lines are violations (exit 1), `ok <kind>` lines are the expected changes
+# with their reason, `new`/`grew` are informational. `set +e` around it so a
+# non-zero exit is data, not a script abort.
 set +e
-SHRANK=$(awk -F'\t' '
-  NR==FNR { before[$1] = $2; next }
-  ($1 in before) && ($2 + 0) < (before[$1] + 0) {
-    printf "    %s: %s -> %s\n", $1, before[$1], $2; found = 1
-  }
-  END { exit(found ? 1 : 0) }
-' "$SNAPSHOT" "${SNAPSHOT}.after")
-SHRANK_RC=$?
+COMPARE=$(rowcount_compare "$SNAPSHOT" "${SNAPSHOT}.after" "$EXPECT")
+COMPARE_RC=$?
 set -e
-
-if [ "$SHRANK_RC" != "0" ]; then
-  warn "TABLES LOST ROWS during the upgrade:"
-  printf '%s\n' "$SHRANK"
-  warn "restore from the backup ./migrate.sh took:  ./restore.sh --yes backups/neogen-<newest>.dump"
+printf '%s\n' "$COMPARE" | grep -E '^(ok|!!|new|grew)' | sed 's/^/    /' || true
+printf '%s\n' "$COMPARE" | grep -E '^unchanged' | sed 's/^/    /' || true
+if [ "$COMPARE_RC" = "2" ]; then
+  warn "could not compare row counts (a snapshot is missing) — verify by hand"; FAILED=$((FAILED + 1))
+elif [ "$COMPARE_RC" != "0" ]; then
+  warn "TABLES LOST ROWS OUTSIDE THE EXPECTED LIST (the '!!' lines above)"
+  warn "restore from the pre-upgrade backup:  ./restore.sh --yes backups/neogen-<newest>.dump"
   FAILED=$((FAILED + 1))
 else
-  ok "no table lost rows ($(wc -l < "$SNAPSHOT" | tr -d ' ') tables compared against the pre-upgrade baseline)"
+  ok "no unexpected row loss ($(wc -l < "$SNAPSHOT" | tr -d ' ') tables compared; expected changes printed above)"
+fi
+if [ -s "$CUSTOM_RBAC" ]; then
+  custom_rbac_rows > "${CUSTOM_RBAC}.after" || die "could not re-read the custom RBAC rows"
+  if cmp -s "$CUSTOM_RBAC" "${CUSTOM_RBAC}.after"; then
+    ok "custom (non-system) role permissions and pack items are byte-identical ($(wc -l < "$CUSTOM_RBAC" | tr -d ' ') rows)"
+  else
+    warn "CUSTOM RBAC ROWS CHANGED — the deltas may only touch is_system rows:"
+    diff "$CUSTOM_RBAC" "${CUSTOM_RBAC}.after" | head -n 40 | sed 's/^/    /' || true
+    FAILED=$((FAILED + 1))
+  fi
+fi
+
+# ── Catalog parity against the shipped schema ───────────────────────────────
+if [ -x ./schema-parity.sh ] && ! $SKIP_PARITY; then
+  hdr "Schema parity vs db/$TARGET_VER/schema.sql"
+  if ./schema-parity.sh "$TARGET_VER" --out "$RUN_DIR/parity-$TARGET_VER"; then
+    ok "live catalog matches db/$TARGET_VER/schema.sql"
+  else
+    warn "schema-parity.sh reported differences (see $RUN_DIR/parity-$TARGET_VER/summary.txt)"
+    FAILED=$((FAILED + 1))
+  fi
 fi
 
 # ── 9. Hand off ─────────────────────────────────────────────────────────────
