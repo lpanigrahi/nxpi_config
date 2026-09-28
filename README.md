@@ -9,12 +9,19 @@ The application itself is an **immutable release artifact**: a Docker image
 *pulls* it — it never builds, compiles, or modifies the application.
 
 ```
-ghcr.io/negentrophi/nxpi_dev   latest | main | sha-<short> | <pkgver>-main.<shortsha> | X.Y.Z
+ghcr.io/negentrophi/nxpi       latest | main | sha-<short> | <pkgver>-main.<shortsha> | X.Y.Z
 ```
 
 Only an exact `X.Y.Z` tag (published from a `v*` release tag) participates in
 DB-version alignment/derivation — every other form is a moving or suffixed
 build tag, and `DB_VERSION` in `.env` is authoritative alongside it.
+
+> **Registry rename (September 2026).** The application repository moved to
+> `github.com/negentrophi/nxpi`, so CI now publishes `ghcr.io/negentrophi/nxpi`.
+> The old `ghcr.io/negentrophi/nxpi_dev` package still resolves but is **frozen
+> at its last build** — an `.env` that still names it never receives another
+> update. `./install.sh` warns about it; `./upgrade-release.sh` rewrites it
+> (see [Upgrading to db 1.41.0](#upgrading-to-db-1410-guided-multi-release)).
 
 ## Prerequisites
 
@@ -47,7 +54,14 @@ on the VM by the public `nxpi-hash` helper. Nothing clones or builds the app.
 | `install.sh` | Single-command idempotent installer / converger |
 | `update.sh` | Pull latest image → schema sync → roll → health gate → auto-rollback |
 | `migrate.sh` | Schema-ONLY migration of the existing database — never initializes, never touches data rows |
-| `upgrade-db.sh` | Guided multi-release upgrade of an existing database to a shipped `db/<version>` (newest by default): data pre-checks, row-count snapshot, `migrate.sh`, then verifies every expected object and that nothing was lost |
+| `upgrade-db.sh` | Guided multi-release upgrade of an existing database to a shipped `db/<version>` (newest by default): data pre-checks (`lib-checks.sh`), row-count + custom-RBAC snapshot against a printed allow-list, `migrate.sh`, then sentinel / load-bearing-object / grants verification and `schema-parity.sh` |
+| `upgrade-release.sh` | **One rehearsed, resumable, rollback-able maintenance window**: preflight → stop app → safety bundle → parity → rehearsal on the fresh dump → privileged role → `upgrade-db.sh` → image switch → `update.sh` → post-verification; `--rollback` restores the bundle |
+| `discover.sh` | Read-only report of a deployment before a window (versions, marker, sentinels, row counts, volumes, secrets present, disk need, uploads inventory, data pre-checks) ending in READY / BLOCKERS / DECISIONS |
+| `schema-parity.sh` | Diffs the live catalog against `db/<version>/schema.sql` loaded into a throwaway postgres; `--rehearse <dump>` applies the pending deltas to a scratch copy of the real data first |
+| `provision-privileged-role.sh` | Mints the `neogen_priv` BYPASSRLS role behind `secrets/postgres_privileged_url` (db ≥ 1.29.0 forces row-level security; the background sweeps need it) |
+| `lib-checks.sh`, `lib-parity.sh`, `parity-inventory.sql` | The data pre-checks / expected row changes, the parity classification, and the catalog inventory query — sourced by the scripts above |
+| `tools/sync-from-app-copy.sh` | Carries new `db/<version>/` bundles over from the app repo's embedded copy and reports script drift (never applies it) |
+| `tests/` | `lib-harness.sh` (pure helpers), `db-bundle-lint.sh`, `checks-harness.sh`, `parity-harness.sh`, `sync-tool-harness.sh`, `bundle-lint-harness.sh`, `compose-config-check.sh`, and `rehearsal.sh` — the end-to-end upgrade + rollback proof on local Docker |
 | `backup.sh` | `pg_dump` + uploads-volume archive + retention with a keep-N floor + optional off-VM shipping to Blob (cron-able) |
 | `restore.sh` | Restore a backup (destructive, `--yes`-gated, health-gated) |
 | `pgbackrest.sh` | Point-in-time recovery: stanza, WAL archive, full/diff/incr backups, restore drill. **Adds to** `backup.sh`, does not replace it |
@@ -85,7 +99,7 @@ on the VM by the public `nxpi-hash` helper. Nothing clones or builds the app.
    ```
    Update the `.env` file with the machine IP, admin email, and (optionally)
    password. The per-release SQL bundle is also published as an OCI artifact —
-   `oras pull ghcr.io/negentrophi/nxpi_dev/db:<version>` fetches
+   `oras pull ghcr.io/negentrophi/nxpi/db:<version>` fetches
    `schema.sql`/`grants.sql`/`seed.sql` for a version this repo doesn't carry
    (the day-2 `migrate-*.sql` deltas ship only here).
 
@@ -138,9 +152,9 @@ from the image tag; set `DB_VERSION` explicitly when the tag is `:latest`.
 
 ```bash
 # deterministic, recommended for production (immutable per-commit tag):
-APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:sha-9b5c610   DB_VERSION=1.15.0
+APP_IMAGE=ghcr.io/negentrophi/nxpi:sha-cb44bba@sha256:1a615b9827059b5dd8d3dc01780cb4385da6db9675590351708d3137dd868af9   DB_VERSION=1.41.0
 # newest build — pin the artifact version explicitly:
-APP_IMAGE=ghcr.io/negentrophi/nxpi_dev:latest        DB_VERSION=1.15.0
+APP_IMAGE=ghcr.io/negentrophi/nxpi:latest            DB_VERSION=1.41.0
 ```
 
 Moving/suffixed tags (`latest`, `main`, `sha-<short>`, `<pkgver>-main.<sha>`)
@@ -244,6 +258,136 @@ counts down.
 Nothing else here is required. The pgvector tuning, memory ceilings and PITR
 switches all default to today's behaviour, and the dedicated-disk layout stays
 opt-in (see [Prerequisites](#prerequisites)).
+
+### Upgrading to db 1.41.0 (guided, multi-release)
+
+A VM at db 1.15.0 (or lower) is 26 releases behind the current image. Three
+of the pending deltas — **1.26.0, 1.29.0, 1.35.0** — are `REQUIRES-REVIEW` and
+**roll-forward-only**: once applied, the previously running image cannot serve
+the schema, so `./update.sh`'s rolling path (with its auto-rollback) is not
+usable and the upgrade needs a **maintenance window**. `upgrade-release.sh`
+runs that window as one rehearsed, resumable, rollback-able sequence.
+
+**Before the window (any day):**
+
+```bash
+git pull                                   # this package, with db/1.16.0 … db/1.41.0
+./install.sh                               # converges secrets (postgres_privileged_url,
+                                           # redis_cache_url) and ./.env.app
+                                           # (TRUSTED_PROXY_MODE=xff, METRICS_TOKEN)
+                                           # — leaves the database and DB_VERSION alone
+./discover.sh                              # read-only; ends in READY / BLOCKERS / DECISIONS
+./upgrade-release.sh --image ghcr.io/negentrophi/nxpi:<tag>@sha256:<digest> --dry-run
+```
+
+`install.sh` must run **first**, with `.env` still at the current
+`DB_VERSION`/`APP_IMAGE` (see [Upgrading THIS PACKAGE](#upgrading-this-package-one-required-step-once)
+for why a missing secret file only fails at container create). Two decisions
+come out of `discover.sh`:
+
+- **Privileged pool.** 1.29.0 forces row-level security; the app's background
+  cross-tenant sweeps (expired grants, knowledge/vector GC) then match zero rows
+  unless a BYPASSRLS role is provisioned. Opt in by setting
+  `POSTGRES_PRIVILEGED_URL_FILE=/run/secrets/postgres_privileged_url` in `.env`
+  (the orchestrator then runs `./provision-privileged-role.sh`), or accept the
+  stopped sweeps with a typed `KNOWN-LIMIT` — the upgrade refuses to leave the
+  choice implicit. See [The privileged-role decision](#the-privileged-role-decision-1290).
+- **Uncataloged uploads.** See [Uploads catalogue behaviour change](#uploads-catalogue-behaviour-change-1360--image).
+  `discover.sh` lists them; the orchestrator's preflight stops until you pass
+  `--accept-uncataloged-uploads`.
+
+**The window:**
+
+```bash
+./upgrade-release.sh --image ghcr.io/negentrophi/nxpi:<tag>@sha256:<digest>   # type UPGRADE once
+```
+
+It stops the app (Caddy keeps answering 502), takes the safety bundle (dump +
+uploads tar + secrets/env/certs/compose + caddy volumes, sha256-manifested),
+proves the database really is at the release `.env` claims (`schema-parity.sh`),
+**rehearses the whole pending set on a scratch copy of that fresh dump**,
+provisions the privileged role, runs `./upgrade-db.sh` (every data pre-check,
+the printed allow-list of row changes, every review header, one confirmation),
+switches `APP_IMAGE` to the digest-pinned new image, rolls with `./update.sh`
+and verifies: row counts against the allow-list, the custom RBAC rows
+byte-for-byte, uploads bytes, users, the credentialed deep probe, schema parity
+against `db/1.41.0`, the privileged pool in the app process, and a login smoke
+test through the ingress. Exit codes: `0` done · `2` refused at a gate before
+any mutation (app restarted) · `3` migrated but not rolled — **app down, run
+`--rollback`** · `4` serving but a verification differs.
+
+**Rollback** (until the run's `OPENED_AT`; afterwards add `--accept-data-loss-since`):
+
+```bash
+./upgrade-release.sh --rollback              # restores .env first, pins the old digest,
+                                             # restore.sh --skip-resync from the bundle
+```
+
+**Rehearse it locally first** — the same tooling, on Docker, from a fresh
+1.15.0 install with seeded data, upgrade and rollback both asserted
+(≈ 15–20 min cold; amd64 images run emulated on Apple Silicon):
+
+```bash
+tests/rehearsal.sh --old-image ghcr.io/negentrophi/nxpi_dev@sha256:<the VM's current digest>
+```
+
+#### What the 26 deltas do to data
+
+| Release | Path | What changes | Data touched |
+|---|---|---|---|
+| 1.16.0 | rolling | `expires_at` on role assignments / resource grants + partial indexes | none (an `optional-0094-drop-agent-memory.sql` ships beside it; 1.35.0 converges it) |
+| 1.17.0 – 1.19.0 | rolling | `org_permission_usage`, access-review campaigns, `org_privilege_request` | new empty tables |
+| 1.20.0 | rolling | `apikey.organization_id` — a key binds to ONE organization at issuance | **existing API keys hold no org authority until re-bound** |
+| 1.21.0, 1.23.0, 1.24.0 | rolling | session impersonation reason, `organization.authz_generation`, functions | none / bumps a counter |
+| 1.22.0 | rolling | audit:view carve-out convergence (0005); `skill_submission` FK action | **deletes** the system `viewer` role's and system `read-only` pack's `audit:view` rows (materialised defaults) |
+| 1.25.0 | rolling (2250 lines) | `org_role.key` NOT NULL + backfill `custom-<id8>`; provenance/tenancy columns with composite FKs; `permission_catalog` (78 slugs); `org_member_deny`; visibility CHECKs; `org_resource_grant` rebuilt as a **partitioned table** (copied, checksummed, swapped); strict-org RBAC junctions | **deletes** the materialised catalog DEFAULTS from system roles/packs (custom roles, deny rows, per-instance grants untouched); **fails closed** on duplicate pending privilege requests, team members outside their org, malformed role keys, grants with a bad type / non-UUID / dangling resource, unknown permission slugs — all pre-checked |
+| **1.26.0** | **REQUIRES-REVIEW** | `audit_chain_head.chain_key` NOT NULL; `authz_decision_log` (partitioned); admin-audit reference fields | none deleted; **roll-forward-only** (the old image cannot write audit rows) |
+| 1.27.0, 1.28.0 | rolling | privilege activation, `sod_rule` platform defaults, append-only floor | seeds reference rows |
+| **1.29.0** | **REQUIRES-REVIEW** | ENABLE + FORCE row-level security on 26 tables, 26 `tenant_isolation` policies, triggers | none; **enforcement** changes — old image reads empty tables; privileged pool decision |
+| 1.30.0 – 1.34.0 | rolling | audit-chain hardening, quarantine table + function, org chains | none (`admin_audit_log_quarantine` is SELECT-only for the app role) |
+| **1.35.0** | **REQUIRES-REVIEW** | 47 legacy constraint names reconciled; `document_chunk` org FK → **ON DELETE CASCADE**; RLS parity on 3 tables; dims CHECK; drops the IVFFlat index and the orphan `agent_memory` table | `agent_memory` disappears (0 rows expected; a non-zero count needs a typed `DROP-AGENT-MEMORY`); deleting an organization now deletes its RAG corpus |
+| 1.36.0 | rolling | `thread_attachment` becomes the catalog for EVERY stored object (`thread_id` nullable, `organization_id`) | none — but see the uploads behaviour change below |
+| 1.37.0 – 1.39.0 | rolling | two-factor columns, integration-event idempotency key, `token_usage` org attribution backfill | backfills |
+| 1.40.0 | rolling | RLS write-frame on `authz_settings` / `sod_rule` | none |
+| 1.40.1 | rolling (data patch) | seeds `permission_catalog` + platform `sod_rule` where a 1.22.0–1.39.0 install left them empty | upsert repair (no-op on a migrated database) |
+| 1.41.0 | rolling | `agent.governance_disabled_by` + backfill | backfill |
+
+`./upgrade-db.sh --dry-run` prints exactly which of these are pending, the
+pre-check verdicts, and the allow-list of row changes the post-check will
+tolerate; anything else that shrinks fails the upgrade.
+
+#### Uploads catalogue behaviour change (1.36.0 + image)
+
+The current image serves `/api/storage/files/uploads/<uuid>-<name>` **only
+when a `thread_attachment` row catalogs it**; the old image served any such
+object to any logged-in user. Objects under `uploads/shared/…` stay servable
+without a row. Bytes are never touched — an uncataloged file simply answers
+404 after the upgrade. `discover.sh` lists them (`…-uploads-uncataloged.txt`);
+decide before the window: catalog them in the product, move them under
+`uploads/shared/`, or accept — then pass `--accept-uncataloged-uploads`. The
+tooling never fabricates catalog rows.
+
+#### The privileged-role decision (1.29.0)
+
+Row-level security is FORCED from 1.29.0. The app connects as `neo_gen`
+(neither SUPERUSER nor BYPASSRLS — the boot preflight requires that) and falls
+back to that same pool for its **privileged** work when `POSTGRES_PRIVILEGED_URL`
+is unset — so the expired role-assignment / resource-grant sweep and the
+knowledge-document / vector-store GC match zero rows, silently
+(`DB_PRIVILEGED_PREFLIGHT_MODE=warn` logs it once at boot). Reads still filter
+expiry at query time; nothing is granted that should not be. This package
+always generates `secrets/postgres_privileged_url` and always mounts it; the
+role behind it exists only when you opt in:
+
+```bash
+# .env
+POSTGRES_PRIVILEGED_URL_FILE=/run/secrets/postgres_privileged_url
+./provision-privileged-role.sh          # or let install.sh / upgrade-release.sh do it
+./provision-privileged-role.sh --check
+```
+
+`neogen_priv` is `LOGIN BYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE IN ROLE
+neo_gen`, so every grant and REVOKE aimed at the app role applies to it.
 
 ### Upgrading to db 1.15.0 (additive — rolling path)
 
@@ -711,15 +855,30 @@ Reboots need nothing: every service has `restart: unless-stopped`.
 semver ordering, version/artifact resolution, migration-file selection,
 percent-decoding, the rollback-pin compose wrapper, the data-placement deciders
 `placement_verdict`/`compose_volume_device`/`mount_ok`/`fstab_has_mount`, the
-backup retention floor `prune_keeping`, and the pgBackRest readiness guards) in a
-throwaway sandbox — no docker or database needed. Run it after any `lib.sh`
-change:
+backup retention floor `prune_keeping`, the pgBackRest readiness guards, the
+release-tooling helpers `rowcount_compare`/`uploads_classify`/`env_set`/
+`image_ref_rename`/`list_pending_destructive`/`SCHEMA_PROBES`) in a throwaway
+sandbox — no docker or database needed. Run it after any `lib.sh` change:
 
 ```bash
 bash tests/lib-harness.sh                 # local
 docker run --rm -v "$PWD":/pkg:ro ubuntu:24.04 \
   bash /pkg/tests/lib-harness.sh /pkg/lib.sh   # target-fidelity (Ubuntu)
+bash tests/db-bundle-lint.sh              # every db/<version> bundle: whole, marker placement,
+                                          # header chain, psql hygiene, flagged set
+bash tests/checks-harness.sh              # lib-checks.sh with the database stubbed
+bash tests/parity-harness.sh              # lib-parity.sh filter/classify on fixtures
+bash tests/sync-tool-harness.sh           # tools/sync-from-app-copy.sh contract
+bash tests/bundle-lint-harness.sh         # the lint rejects each defect class
+bash tests/compose-config-check.sh        # docker-compose.yml renders from the templates
+tools/sync-from-app-copy.sh /path/to/nxpi/azure-deployment   # exit 0 = bundles in sync
+tests/rehearsal.sh                        # END-TO-END on local Docker: install 1.15.0 → seed →
+                                          # upgrade-release.sh → assertions → rollback → assertions
 ```
+
+The rehearsal is the only executable proof of the 1.25.0 preconditions and of
+the image's `TRUSTED_PROXY_MODE` contract — a window is not authorised until
+it has passed in full mode (both images pullable).
 
 ## Troubleshooting
 
@@ -742,24 +901,33 @@ docker run --rm -v "$PWD":/pkg:ro ubuntu:24.04 \
 ## Relationship to the application repository
 
 This package deploys the NXPi application, whose source lives in a separate
-repository (`github.com/negentrophi/nxpi_dev`, folder `azure-deployment/`
-there — that repo now carries its own copy of this same package).
+repository (`github.com/negentrophi/nxpi` — formerly `nxpi_dev`; folder
+`azure-deployment/` there carries its own copy of this same package).
 **Neither the source nor git access to it is needed to deploy from here.**
 The application is consumed only as a pre-built container image from GHCR
-(`ghcr.io/negentrophi/nxpi_dev`), and the database is provisioned from static
+(`ghcr.io/negentrophi/nxpi`), and the database is provisioned from static
 SQL (`db/<version>/`) shipped in this repo — applied on the VM with plain
 `psql`. The admin password is hashed locally by the public `nxpi-hash` helper
 image.
 
-The app repo's CI (`ci.yml`) publishes three artifacts per build: the app
-image, the SQL bundle as an ORAS OCI artifact
-(`ghcr.io/negentrophi/nxpi_dev/db`), and the `nxpi-hash` helper — but it does
-not push into this repo automatically (the earlier cross-repo auto-publish
-design is obsolete; see the note at the top of
+The app repo's CI (`ci.yml`) publishes four artifacts per build: the app
+image, the SQL bundle as an ORAS OCI artifact (`ghcr.io/negentrophi/nxpi/db`),
+the `nxpi-hash` helper and the `nxpi-postgres` image — but it does not push
+into this repo automatically (the earlier cross-repo auto-publish design is
+obsolete; see the note at the top of
 [`docs/SOURCELESS-DEPLOYMENT-PLAN.md`](docs/SOURCELESS-DEPLOYMENT-PLAN.md)).
 New `db/<version>/` folders and deployment-tooling fixes land in the app
-repo's embedded copy first and are carried over here by hand — check that
-copy periodically if a release you need isn't under `db/` yet.
+repo's embedded copy first and are carried over here by hand:
+
+```bash
+tools/sync-from-app-copy.sh /path/to/nxpi/azure-deployment            # report: MISSING / DRIFTED + script diffs
+tools/sync-from-app-copy.sh /path/to/nxpi/azure-deployment --apply    # copy the missing bundles verbatim
+bash tests/db-bundle-lint.sh
+```
+
+Script and template changes are shown as diffs and applied by hand — this
+package carries fixes the embedded copy lacks (see `git log`), so nothing is
+overwritten automatically.
 
 Keep `APP_IMAGE` and the `db/<version>/` artifacts pointing at the **same
 release** — the [Version pinning](#version-pinning) section explains the
