@@ -935,6 +935,17 @@ schema_probe_sql() {
   esac
 }
 
+# image_digest_of REF — the `repo@sha256:…` digest of a LOCALLY present image
+# (pull first), or nothing. When REF itself carries @sha256:, the local image
+# must match it — a tag that moved underneath is refused.
+image_digest_of() {
+  local ref="$1" want="" d
+  case "$ref" in *@sha256:*) want="${ref#*@}" ;; esac
+  d=$($DOCKER image inspect "$ref" --format '{{join .RepoDigests "\n"}}' 2>/dev/null | grep -F '@sha256:' | head -n1 || true)
+  if [ -n "$want" ] && [ -n "$d" ] && [ "${d#*@}" != "$want" ]; then return 1; fi
+  printf '%s' "$d"
+}
+
 # confirm PROMPT WORD — require WORD to be typed. $ASSUME_YES=true bypasses; a
 # non-tty without it must not hang. Callers that must NEVER auto-confirm (typed
 # acknowledgements of data loss) flip ASSUME_YES off around the call.
