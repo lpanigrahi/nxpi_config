@@ -173,11 +173,18 @@ gen_secret redis_url               sh -c "printf 'redis://:%s@redis:6379' \"\$(c
 # unreadable"; a cache URL is freely regenerable, and requiring it would make
 # every existing deployment die on its next install.sh run.
 gen_secret redis_cache_url         sh -c "printf 'redis://:%s@redis-cache:6379' \"\$(cat secrets/redis_password)\""
+# The PRIVILEGED pool's URL (db ≥ 1.29.0 forces RLS; the app's cross-tenant
+# sweeps need a BYPASSRLS role). Always generated — docker-compose.yml mounts
+# it as a file-secret, and a file-secret must exist at container create — but
+# only READ by the app when ./.env sets POSTGRES_PRIVILEGED_URL_FILE, and the
+# role behind it (neogen_priv) exists only once ./provision-privileged-role.sh
+# has run. Freely regenerable, so NOT in the required-secrets list above.
+gen_secret postgres_privileged_url sh -c "printf 'postgres://neogen_priv:%s@postgres:5432/neogen' \"\$(openssl rand -hex 24)\""
 # Compose file-secrets are bind mounts that keep HOST permissions. The app
-# container runs as uid 1001 (nextjs) and must be able to read its three
-# secrets; the root-read files stay owned by the invoking user, mode 600.
-as_root chown 1001 secrets/postgres_url secrets/redis_url secrets/redis_cache_url secrets/better_auth_secret
-as_root chmod 400  secrets/postgres_url secrets/redis_url secrets/redis_cache_url secrets/better_auth_secret
+# container runs as uid 1001 (nextjs) and must be able to read its secrets;
+# the root-read files stay owned by the invoking user, mode 600.
+as_root chown 1001 secrets/postgres_url secrets/postgres_privileged_url secrets/redis_url secrets/redis_cache_url secrets/better_auth_secret
+as_root chmod 400  secrets/postgres_url secrets/postgres_privileged_url secrets/redis_url secrets/redis_cache_url secrets/better_auth_secret
 chmod 600 secrets/postgres_password secrets/redis_password 2>/dev/null \
   || as_root chmod 600 secrets/postgres_password secrets/redis_password
 ok "secret permissions set (app secrets → uid 1001 / 400, rest → 600)"

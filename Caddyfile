@@ -83,6 +83,25 @@
 	# Stream responses immediately (flush_interval -1) so AI chat SSE / token
 	# streaming is not buffered by the proxy. Caddy sets X-Forwarded-* and
 	# upgrades WebSockets automatically.
+	#
+	# This block is what makes `TRUSTED_PROXY_MODE=xff` in ./.env.app a TRUE
+	# statement. Caddy's reverse_proxy "sets or augments" X-Forwarded-For and
+	# "by default … will ignore their values from incoming requests, to prevent
+	# spoofing", so a caller's own X-Forwarded-For never reaches the app and the
+	# rightmost token the app reads is the real peer. NO `header_up
+	# X-Forwarded-For {remote_host}` is needed, and none was added: hard-
+	# overwriting the chain would also erase a legitimately trusted CDN hop if
+	# `trusted_proxies` is ever configured on purpose.
+	#
+	# DO NOT add `trusted_proxies` ANYWHERE IN THIS FILE without re-reading the
+	# above — not here, and not in a global options block (`{ servers {
+	# trusted_proxies static … } }`, the spelling Caddy's own docs recommend and
+	# therefore the likeliest edit). It tells Caddy to BELIEVE an incoming
+	# X-Forwarded-For, and a blanket `trusted_proxies 0.0.0.0/0` (the value most
+	# often copy-pasted for "get the real IP behind my CDN") hands the app a
+	# caller-written address again — a forged rate-limit bucket / org IP
+	# allow-list match / admin_audit_log.ip, one hop out where no app-side
+	# posture can see it.
 	reverse_proxy app:3000 {
 		flush_interval -1
 	}

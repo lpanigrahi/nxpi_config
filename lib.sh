@@ -216,17 +216,38 @@ ingress_probe() {
 # deep_probe_body — print /api/health/deep's response body (empty on failure).
 # Unlike ingress_probe this does NOT use -f: a 503 body is exactly what we want
 # to read. Same --resolve treatment so the real vhost is exercised.
+#
+# CREDENTIALED since DT-4-i-1: the deep probe answers 403 without the metrics
+# bearer or a platform-admin session, because its body names org-scoped tables
+# with no forced row security and the schema objects this image expects. The
+# token is the same METRICS_TOKEN /api/metrics takes. Unset (the default on a
+# deployment that scrapes nothing) means this advisory prints nothing useful —
+# which is what schema_notice already does for every non-matching body, so no
+# install/update/migrate step changes its verdict.
+#
+# deep_probe_auth_header — the Authorization header for that probe. The app
+# reads METRICS_TOKEN from its process env, i.e. ./.env.app (env_file) — so
+# that file is authoritative; ./.env is accepted as a fallback for an operator
+# who put it there. Pure (file reads only); harness-tested.
+deep_probe_auth_header() {
+  local token
+  token=$(env_get .env.app METRICS_TOKEN "")
+  [ -n "$token" ] || token=$(env_get .env METRICS_TOKEN "")
+  if [ -n "$token" ]; then printf 'Authorization: Bearer %s' "$token"
+  else printf 'X-Deep-Probe: none'; fi
+}
 deep_probe_body() {
-  local site http_port https_port
+  local site http_port https_port auth
   site=$(env_get .env SITE_ADDRESS "")
+  auth=$(deep_probe_auth_header)
   if [ -n "$site" ]; then
     https_port=$(env_get .env CADDY_HTTPS_PORT 443)
-    curl -sS --max-time 5 \
+    curl -sS --max-time 5 -H "$auth" \
       --resolve "${site}:${https_port}:127.0.0.1" \
       "https://${site}:${https_port}/api/health/deep" 2>/dev/null || true
   else
     http_port=$(env_get .env CADDY_HTTP_PORT 80)
-    curl -sS --max-time 5 \
+    curl -sS --max-time 5 -H "$auth" \
       "http://127.0.0.1:${http_port}/api/health/deep" 2>/dev/null || true
   fi
 }

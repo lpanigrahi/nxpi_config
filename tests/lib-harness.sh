@@ -559,5 +559,18 @@ t "schema_probe_sql function"   "yes" "$(schema_probe_sql function admin_audit_l
 t "schema_probe_sql constraint" "yes" "$(schema_probe_sql constraint knowledge_embeddings_dims_col_ck | grep -q "conname='knowledge_embeddings_dims_col_ck'" && echo yes || echo no)"
 t "schema_probe_sql index"      "yes" "$(schema_probe_sql index cron_run_log_one_running_per_job | grep -q "indexname='cron_run_log_one_running_per_job'" && echo yes || echo no)"
 
+# ── deep_probe_auth_header(): /api/health/deep is credentialed since DT-4-i-1 ─
+# The app reads METRICS_TOKEN from its process env, i.e. ./.env.app — not ./.env.
+# Unset means the advisory probe stays anonymous (and prints nothing useful).
+t "deep_probe_auth_header is defined" "function" "$(type -t deep_probe_auth_header 2>/dev/null || echo MISSING)"
+mkdir -p dph && ( cd dph && : > .env && : > .env.app )
+t "no token anywhere → placeholder header" "X-Deep-Probe: none" "$(cd dph && deep_probe_auth_header)"
+printf 'METRICS_TOKEN=fromapp\n' > dph/.env.app
+t "token from .env.app"                   "Authorization: Bearer fromapp" "$(cd dph && deep_probe_auth_header)"
+printf 'METRICS_TOKEN=fromenv\n' > dph/.env
+t ".env.app wins over .env"               "Authorization: Bearer fromapp" "$(cd dph && deep_probe_auth_header)"
+: > dph/.env.app
+t ".env is the fallback"                  "Authorization: Bearer fromenv" "$(cd dph && deep_probe_auth_header)"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 exit $((FAIL > 0))
