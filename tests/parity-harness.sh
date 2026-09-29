@@ -89,6 +89,43 @@ mkdir out5; parity_classify scratch2.inv live3.inv out5
 t "superset scratch: the extra table is only-scratch" "1" "$(grep -c 'public.zzz' out5/only-scratch.txt | tr -d ' ')"
 t "superset scratch: nothing is reported extra"       "0" "$(grep -c . out5/only-live.txt | tr -d ' ')"
 
+# ── missing vs differs: an object that EXISTS on live with another posture or
+# definition is not "missing". NX-PI at 1.15.0 (the legacy lineage that ran
+# migrate-1.3.0.sql): `assistant` and `knowledge_embedding_migration_state`
+# exist with RLS forced, schema.sql has them without — one table line on each
+# side. The upgrade (1.35.0) reconciles posture; only a truly absent object
+# means the database is not at the release it claims.
+cat > scratch4.inv <<'EOF2'
+table|public.assistant|r|rls=false|force=false
+table|public.only_in_snapshot|r|rls=false|force=false
+column|public.assistant.id|uuid|notnull=t
+function|public.f()|trigger|secdef=false|vol=v|config=|aaaa
+constraint|public.b|b_org_fk|f|FOREIGN KEY (org) REFERENCES public.organization(id) ON DELETE CASCADE|del=c
+policy|public.assistant|tenant_isolation|PERMISSIVE|{public}|ALL|(x)|(x)
+EOF2
+cat > live4.inv <<'EOF2'
+table|public.assistant|r|rls=true|force=true
+column|public.assistant.id|uuid|notnull=t
+function|public.f()|trigger|secdef=false|vol=v|config=|bbbb
+constraint|public.b|b_org_fk|f|FOREIGN KEY (org) REFERENCES public.organization(id) ON DELETE SET NULL|del=n
+EOF2
+mkdir out6; parity_classify scratch4.inv live4.inv out6
+t "only-scratch still lists every hard line (strict verdict)" "5" "$(grep -c . out6/only-scratch.txt | tr -d ' ')"
+t "missing.txt names only the truly absent objects"          "2" "$(grep -c . out6/missing.txt | tr -d ' ')"
+t "…the absent table"   "yes" "$(grep -q 'public.only_in_snapshot' out6/missing.txt && echo yes || echo no)"
+t "…the absent policy"  "yes" "$(grep -q 'tenant_isolation' out6/missing.txt && echo yes || echo no)"
+t "a table with another RLS posture is differs, not missing" "yes" "$(grep -q 'public.assistant|r' out6/differs.txt && ! grep -q 'public.assistant|r' out6/missing.txt && echo yes || echo no)"
+t "a function with another body hash is differs"             "yes" "$(grep -q 'public.f()' out6/differs.txt && echo yes || echo no)"
+t "a constraint with another definition is differs"          "yes" "$(grep -q 'b_org_fk' out6/differs.txt && echo yes || echo no)"
+t "summary carries the missing count"                        "yes" "$(grep -qE 'missing=2' out6/summary.txt && echo yes || echo no)"
+t "parity_verdict stays strict (3)"                          "3" "$(parity_verdict out6; echo $?)"
+t "parity_missing is 3 while something is absent"            "3" "$(parity_missing out6; echo $?)"
+{ grep -v 'only_in_snapshot\|tenant_isolation' scratch4.inv; } > scratch5.inv
+mkdir out7; parity_classify scratch5.inv live4.inv out7
+t "drift only: parity_missing is 0"                          "0" "$(parity_missing out7; echo $?)"
+t "drift only: parity_verdict is still 3"                    "3" "$(parity_verdict out7; echo $?)"
+t "drift only: missing.txt exists and is empty"              "0" "$(if [ -f out7/missing.txt ]; then grep -c . out7/missing.txt | tr -d ' '; else echo absent; fi)"
+
 # ── accept file: operator-accepted regexes drop hard lines to advisory ───────
 printf 'agent_memory\n' > accept.txt
 mkdir out3; parity_classify scratch.inv live.inv out3 accept.txt

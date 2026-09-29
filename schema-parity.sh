@@ -116,7 +116,8 @@ if [ -z "$REHEARSE" ]; then
 
   hdr "Result"
   cat "$OUT/summary.txt"
-  if [ -s "$OUT/only-scratch.txt" ]; then warn "objects the LIVE database is MISSING (only-scratch):"; head -n 60 "$OUT/only-scratch.txt" | sed 's/^/    /'; fi
+  if [ -s "$OUT/missing.txt" ]; then warn "objects the LIVE database is MISSING (no object of that name — missing):"; head -n 60 "$OUT/missing.txt" | sed 's/^/    /'; fi
+  if [ -s "$OUT/differs.txt" ]; then warn "objects that EXIST on live with another definition or posture (differs — a pending delta must reconcile them):"; head -n 60 "$OUT/differs.txt" | sed 's/^/    /'; fi
   if [ -s "$OUT/only-live.txt" ];    then warn "objects the LIVE database has EXTRA (only-live):";     head -n 60 "$OUT/only-live.txt" | sed 's/^/    /'; fi
   if [ -s "$OUT/advisory.txt" ];     then log  "advisory ($(grep -c . "$OUT/advisory.txt" | tr -d ' ') lines, see $OUT/advisory.txt):"; head -n 20 "$OUT/advisory.txt" | sed 's/^/    /'; fi
   if parity_verdict "$OUT"; then ok "live catalog matches db/$VER/schema.sql"; exit 0

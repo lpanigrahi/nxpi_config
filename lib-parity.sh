@@ -28,11 +28,25 @@ parity_filter() {
 }
 
 # parity_classify SCRATCH LIVE OUTDIR [ACCEPT] — writes OUTDIR/only-scratch.txt
-# (objects the live database is MISSING — always a hard finding),
-# OUTDIR/only-live.txt (objects the live database has EXTRA — hard),
+# (lines of the reference the live database does not render — hard),
+# OUTDIR/only-live.txt (lines the live database renders EXTRA — hard),
 # OUTDIR/advisory.txt (name-only index/constraint renames, operator-accepted
 # patterns) and OUTDIR/summary.txt. ACCEPT is an optional file of regexes;
 # a hard line matching one is moved to advisory as "accepted".
+#
+# only-scratch is further split by IDENTITY (kind + name; the name is field 3
+# for index/constraint/policy/trigger/partition/defacl, field 2 otherwise):
+#   OUTDIR/missing.txt  no live object of that identity at all — the database
+#                       is not at the release it claims (a table never created,
+#                       a policy never added)
+#   OUTDIR/differs.txt  the object exists on live with another definition or
+#                       posture (a table with RLS forced, a function with
+#                       another body, a constraint with another ON DELETE) —
+#                       what a legacy lineage looks like BEFORE the deltas
+#                       that reconcile it; the rehearsal proves they do
+# parity_verdict judges the whole hard set (after an upgrade the live catalog
+# must EQUAL the target); parity_missing judges only missing.txt (before an
+# upgrade, "at least at the claimed release" is the question).
 parity_classify() {
   local scratch="$1" live="$2" out="$3" accept="${4:-}"
   mkdir -p "$out"
@@ -69,15 +83,30 @@ parity_classify() {
     done
   fi
 
-  printf 'only-scratch=%s only-live=%s advisory=%s\n' \
+  # Missing vs differs: does a live object of the same identity exist?
+  : > "$out/missing.txt"; : > "$out/differs.txt"
+  awk -F'|' -v MISS="$out/missing.txt" -v DIFF="$out/differs.txt" '
+    function ident(line,   f, n, k) { n = split(line, f, "|"); k = f[1] "|" f[2]; if (f[1] ~ /^(index|constraint|policy|trigger|partition|defacl)$/) k = k "|" f[3]; return k }
+    FILENAME == ARGV[1] { live[ident($0)] = 1; next }
+    { if (ident($0) in live) print > DIFF; else print > MISS }' "$live" "$out/only-scratch.txt"
+
+  printf 'only-scratch=%s only-live=%s advisory=%s missing=%s\n' \
     "$(grep -c . "$out/only-scratch.txt" | tr -d ' ')" \
     "$(grep -c . "$out/only-live.txt" | tr -d ' ')" \
-    "$(grep -c . "$out/advisory.txt" | tr -d ' ')" > "$out/summary.txt"
+    "$(grep -c . "$out/advisory.txt" | tr -d ' ')" \
+    "$(grep -c . "$out/missing.txt" | tr -d ' ')" > "$out/summary.txt"
   rm -f "$out"/.scratch.sorted "$out"/.live.sorted "$out"/.only-scratch.raw "$out"/.only-live.raw
 }
 
 # parity_verdict OUTDIR — 0 when nothing hard remains, 3 otherwise.
 parity_verdict() {
   if [ -s "$1/only-scratch.txt" ] || [ -s "$1/only-live.txt" ]; then return 3; fi
+  return 0
+}
+
+# parity_missing OUTDIR — 0 when every reference object exists on live (in some
+# form), 3 when at least one is absent. The pre-upgrade gate.
+parity_missing() {
+  if [ -s "$1/missing.txt" ]; then return 3; fi
   return 0
 }

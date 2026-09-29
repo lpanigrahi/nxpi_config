@@ -380,9 +380,16 @@ if begin parity_before "4. Schema parity: is this database really at $OLD_DB_VER
   if $SKIP_PARITY; then log "skipped (--skip-parity)"
   else
     ./schema-parity.sh "$OLD_DB_VERSION" --out "$RUN/parity-before"; PRC=$?
-    if [ "$PRC" = "3" ] && [ -s "$RUN/parity-before/only-scratch.txt" ]; then
-      warn "the live database is MISSING objects db/$OLD_DB_VERSION/schema.sql has — it is not at the release ./.env claims. Establish the real release first (see $RUN/parity-before)."; FINISHED=false; exit 2
-    elif [ "$PRC" = "3" ]; then log "only-live differences (objects the upgrade will reconcile) — continuing"
+    if [ "$PRC" = "3" ] && [ -s "$RUN/parity-before/missing.txt" ]; then
+      warn "the live database is MISSING objects db/$OLD_DB_VERSION/schema.sql has — it is not at the release ./.env claims. Establish the real release first (see $RUN/parity-before/missing.txt)."; FINISHED=false; exit 2
+    elif [ "$PRC" = "3" ]; then
+      # Every reference object exists; some differ in posture or definition
+      # (a legacy lineage: RLS already forced, a NOT VALID CHECK, another body)
+      # and some are extra. Those are the deltas' job — the rehearsal in step 5
+      # applies the pending set to this very dump and must end EQUAL to the
+      # target, so a difference no delta reconciles stops there, live untouched.
+      [ -s "$RUN/parity-before/differs.txt" ] && log "$(grep -c . "$RUN/parity-before/differs.txt" | tr -d ' ') object(s) exist with another definition or posture — the rehearsal must take them to db/$TARGET"
+      log "no reference object is missing — continuing"
     elif [ "$PRC" != "0" ]; then die "schema-parity.sh errored"; fi
   fi
   finish parity_before
