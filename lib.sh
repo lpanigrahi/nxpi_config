@@ -915,7 +915,8 @@ SCHEMA_PROBES=$(printf '%s\n' \
   $'1.38.0\tcolumn\tintegration_event.idempotency_key' \
   $'1.39.0\tcolumn\ttoken_usage.organization_id' \
   $'1.40.0\tpolicy\twrite_frame_insert ON sod_rule' \
-  $'1.41.0\tcolumn\tagent.governance_disabled_by')
+  $'1.41.0\tcolumn\tagent.governance_disabled_by' \
+  $'1.42.0\tcolumn\tthread_attachment.rag_skip_reason')
 
 # schema_probe_sql KIND OBJECT — a query that yields 1 when OBJECT exists in
 # schema public. KIND: table | column (t.c) | index | constraint | function |

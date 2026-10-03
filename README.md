@@ -151,10 +151,10 @@ describe the **same release**. `install.sh` auto-derives the artifact version
 from the image tag; set `DB_VERSION` explicitly when the tag is `:latest`.
 
 ```bash
-# deterministic, recommended for production (immutable per-commit tag):
+# deterministic, recommended for production (immutable per-commit tag) — the db 1.41.0 build:
 APP_IMAGE=ghcr.io/negentrophi/nxpi:sha-cb44bba@sha256:1a615b9827059b5dd8d3dc01780cb4385da6db9675590351708d3137dd868af9   DB_VERSION=1.41.0
-# newest build — pin the artifact version explicitly:
-APP_IMAGE=ghcr.io/negentrophi/nxpi:latest            DB_VERSION=1.41.0
+# newest build (app main ≥ 630753ae1 needs db 1.42.0) — pin the artifact version explicitly:
+APP_IMAGE=ghcr.io/negentrophi/nxpi:latest            DB_VERSION=1.42.0
 ```
 
 Moving/suffixed tags (`latest`, `main`, `sha-<short>`, `<pkgver>-main.<sha>`)
@@ -351,6 +351,7 @@ tests/rehearsal.sh --old-image ghcr.io/negentrophi/nxpi_dev@sha256:<the VM's cur
 | 1.40.0 | rolling | RLS write-frame on `authz_settings` / `sod_rule` | none |
 | 1.40.1 | rolling (data patch) | seeds `permission_catalog` + platform `sod_rule` where a 1.22.0–1.39.0 install left them empty | upsert repair (no-op on a migrated database) |
 | 1.41.0 | rolling | `agent.governance_disabled_by` + backfill | backfill |
+| 1.42.0 | rolling | `thread_attachment.rag_skip_reason` (nullable text, why a file was not indexed); app main ≥ `630753ae1` names it in every attachment status write | none (catalog-only `ADD COLUMN`, no backfill) |
 
 `./upgrade-db.sh --dry-run` prints exactly which of these are pending, the
 pre-check verdicts, and the allow-list of row changes the post-check will

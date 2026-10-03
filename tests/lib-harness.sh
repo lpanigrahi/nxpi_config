@@ -552,7 +552,7 @@ unset -f ensure_migration_marker is_migration_applied
 # ── SCHEMA_PROBES: one sentinel per release, sorted, with SQL renderers ───────
 t "SCHEMA_PROBES is set"        "yes" "$([ -n "${SCHEMA_PROBES:-}" ] && echo yes || echo no)"
 t "SCHEMA_PROBES is sorted -V"  "yes" "$([ "$(printf '%s\n' "$SCHEMA_PROBES" | cut -f1)" = "$(printf '%s\n' "$SCHEMA_PROBES" | cut -f1 | sort -V)" ] && echo yes || echo no)"
-t "SCHEMA_PROBES reaches 1.41.0" "yes" "$(printf '%s\n' "$SCHEMA_PROBES" | grep -q '^1\.41\.0	' && echo yes || echo no)"
+t "SCHEMA_PROBES reaches 1.42.0" "yes" "$(printf '%s\n' "$SCHEMA_PROBES" | grep -q '^1\.42\.0	' && echo yes || echo no)"
 t "SCHEMA_PROBES keeps the legacy 1.5.0 probe" "yes" "$(printf '%s\n' "$SCHEMA_PROBES" | grep -q '^1\.5\.0	table	skill_scan$' && echo yes || echo no)"
 t "schema_probe_sql column"     "yes" "$(schema_probe_sql column agent.governance_disabled_by | grep -q "table_name='agent'.*column_name='governance_disabled_by'" && echo yes || echo no)"
 t "schema_probe_sql table"      "yes" "$(schema_probe_sql table permission_catalog | grep -q "table_name='permission_catalog'" && echo yes || echo no)"

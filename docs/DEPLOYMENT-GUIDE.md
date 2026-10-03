@@ -7,9 +7,10 @@ assumed. Written for the operator with SSH and sudo on the VM; every command
 runs from the package directory and every script prints `--help`.
 
 The companion `docs/RELEASE-UPGRADE-RUNBOOK.md` is Part B §4.1 written for
-the current move: a VM at db 1.41.0 on `sha-cb44bba` rolled to
-`nxpi:latest` (no database change). The 1.15.0 → 1.41.0 window runbook is
-at `git show 00bb498:docs/RELEASE-UPGRADE-RUNBOOK.md`.
+the current move: a VM at db 1.41.0 rolled to `nxpi:latest` and db 1.42.0
+(one additive column, still `update.sh`). Earlier runbooks: the image-only roll
+to `2a22ae7c9` at `git show 4df2d18:docs/RELEASE-UPGRADE-RUNBOOK.md`, the
+1.15.0 → 1.41.0 window at `git show 00bb498:docs/RELEASE-UPGRADE-RUNBOOK.md`.
 
 ## 1. Which path am I on?
 
@@ -61,14 +62,14 @@ script from this package. That is what makes every guarantee checkable.
                            LLM keys         in caddy-data)      off the VM
 ```
 
-**Components (package `main` 00bb498; app `main` 2a22ae7c9, 2026-10-01)**
+**Components (package `main` after 4df2d18; app `main` cd1397249, 2026-10-03)**
 
 | Piece | Value | Why it matters |
 |---|---|---|
 | App image | `ghcr.io/negentrophi/nxpi` (`latest`, `sha-<short>`, `X.Y.Z`); `nxpi_dev` is frozen | pin `tag@sha256:…`; an `.env` naming `nxpi_dev` never updates again |
 | Deployed build | `nxpi:sha-cb44bba@sha256:1a615b98…868af9`, linux/amd64 | needs `TRUSTED_PROXY_MODE=xff` in `.env.app` to boot; `/api/health/deep` wants `METRICS_TOKEN` |
-| Next build | `nxpi:latest` from app `2a22ae7c9` (server-side document tools); still db 1.41.0 | image-only roll via `update.sh`; `DB_VERSION=1.41.0` must stay set with a moving tag |
-| Database | PostgreSQL 17 + pgvector; newest shipped `db/1.41.0` (= app migration 0042) | `DB_VERSION` is authoritative for every non-`X.Y.Z` tag |
+| Next build | `nxpi:latest` = app `cd1397249` (`sha256:53241602…ace12f1e`): PDF delivery modes (worker fixed in `18816f6a2`), large spreadsheets, RAG skip reasons; needs **db 1.42.0** | `update.sh` with `DB_VERSION=1.42.0` set in the same edit; never roll `aa7534c7b` (broken PDF worker) |
+| Database | PostgreSQL 17 + pgvector; newest shipped `db/1.42.0` (= app migration 0043) | `DB_VERSION` is authoritative for every non-`X.Y.Z` tag |
 | Bookkeeping | marker `public.deploy_schema_migrations`, one row per applied delta | pending set = shipped deltas minus marker rows; never guess it |
 | Roll-forward-only | 1.3.0, 1.9.0, 1.26.0, 1.29.0, 1.35.0 (`REQUIRES-REVIEW` in the first lines) | old image cannot serve the schema afterwards; rollback = restore the bundle |
 | Row-level security | forced on 26+ tables since 1.29.0 | sweeps need the BYPASSRLS role `neogen_priv` |
@@ -127,7 +128,7 @@ cp .env.example .env && nano .env
 | Key | Set to | Notes |
 |---|---|---|
 | `APP_IMAGE` | `ghcr.io/negentrophi/nxpi:sha-<short>@sha256:<digest>` | tag + digest: readable and immutable |
-| `DB_VERSION` | the release matching the image (`1.41.0` today) | must be a folder under `db/` |
+| `DB_VERSION` | the release matching the image (`1.42.0` for `latest` today) | must be a folder under `db/` |
 | `BETTER_AUTH_URL` | IP mode: leave the placeholder (auto-filled). Domain mode: `https://your.domain` | exact match with what browsers use |
 | `SITE_ADDRESS` | domain mode only | turns on auto-HTTPS; mismatch with `BETTER_AUTH_URL` is refused |
 | `SUPER_ADMIN_EMAIL` | your address | change before the first run |
