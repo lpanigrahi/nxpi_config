@@ -100,10 +100,42 @@ ALTER TABLE thread_attachment ADD COLUMN IF NOT EXISTS rag_skip_reason text;
 `cd1397249` also carries one agents-list UI fix. Neither commit touches
 `azure-deployment/`, migrations, `.env.example` or compose.
 
+### 1.4 Application since the last analysis (`cd1397249..57efccedd`, 354 commits, 2026-10-03 → 2026-10-05)
+
+`latest` moved again on 2026-10-05 (16:19 UTC). It is built from `57efccedd`,
+the head of app `main`, and is also published as `sha-57efcce` and
+`1.2.0-main.57efccedd`; index digest
+`sha256:0394839f61f99ba05da234a54683e7885a7cd5d3b8c861a95a84bbbb4aa34d3e`.
+`630753ae1` and `18816f6a2` are ancestors, so everything in §1.2 and §1.3
+still holds: the image needs **db 1.42.0** and its PDF worker is the fixed one.
+
+**What did not change.** No migration: the app journal still ends at 0043 =
+`db/1.42.0`. `schema.pg.ts` gains two optional keys inside existing `json`
+columns (`cron_job.config.calendar`, `cron_run_log.token_usage.totalTokens`),
+which is no DDL and nothing for the package. The permission catalog,
+`azure-deployment/`, `docker/Dockerfile`, compose, Caddy, secrets and the
+runtime dependency list are unchanged (`tools/sync-from-app-copy.sh`: 42
+bundles identical, scripts differ only by this package's own fixes). The
+354 commits are the workflow canvas, the scheduler and the execution center,
+plus their tests.
+
+| Area | Change | Consequence for the VM |
+|---|---|---|
+| Workflow **Files node** | new node that reads files from SharePoint (as the run user, through Graph), from an organization's Azure Blob connector, or (ADR-0118) from an **allow-listed folder on the app server**. Every fetched file takes the upload path (MIME allow-list, magic bytes, storage governance, quota) and lands in `uploads` with a `thread_attachment` row | Off by default twice: the organization's **Workflow file inputs** switch (Organizations → Settings), and for the local-folder source `WORKFLOW_LOCAL_FILE_ROOTS` in `.env.app` **plus** a read-only bind mount of that folder into `app` (commented block in `docker-compose.yml`). Every org with the switch on can read everything under the roots. Fetched files consume storage quota and the uploads volume |
+| Delegated Graph scope | `GRAPH_DELEGATED_FILES_SCOPE` (default `https://graph.microsoft.com/Sites.Read.All`) is the scope the Files node redeems for SharePoint. Needs admin consent on the Microsoft registration; the run user must have signed in with Microsoft | none unless the SharePoint source is used; documented in `.env.app.example` |
+| Generate / Edit with AI | `POST /api/workflow/ai` drafts a workflow, `/api/workflow/<id>/ai-edit` proposes a validated change set, `/api/agent/ai` refines an agent. Blocked prompt injection and a declining model are shown as notices | billed model calls for the editor, through the normal gateway; nothing to configure |
+| Scheduler | calendar schedules compiled to cron (the choice is stored beside the cron in the job config); targets picked by name; a new trigger does not fire for a tick before it existed; event triggers only see their own org's events; a trigger whose owner left the org stops; a deleted workflow retires its synced triggers; scheduled runs bypass the response cache | none; existing cron rows are read as before |
+| Execution center | real token counts (summed in SQL); per-run Output tab and report downloads; cancel a queued or waiting run; **delete finished runs** (single and bulk); edit-and-rerun; AI diagnosis of a failed run | run deletion is user-driven data removal, with the backup as the only recourse. Raw-query timestamps are now read as UTC (the container already runs UTC, so no visible change here) |
+| Tool node | Multiple-tools mode runs a metered LLM tool loop over a toolset; `createPdfDocument` is available to Tool nodes | more tokens per run on such workflows |
+| Validators and engine | cyclic graphs refused before compile; the graph is validated on the server before publishing (ADR-0117) through one publish gate; long waits chunked so `setTimeout` never overflows; file references re-gated at every scheduled run; an over-window LLM prompt is refused instead of trimmed | a workflow that was published while invalid may fail to re-publish until it is fixed. Regression-test (§5) |
+| MCP | files a stdio server writes into a workdir subfolder are captured; tool-name matches rank above description matches in discovery | none |
+| Node guide, i18n | a guide for all 52 node kinds (en, hi); translated node labels | none |
+
 **Image tag.** The runbook uses the label `latest`. Before anything is rolled,
 §3 checks that `latest` was built from `630753ae1` or later (and, for working PDF conversion, `18816f6a2`
-or later: today `cd1397249`). `update.sh` records the running **digest** as its
-rollback reference, so the moving tag does not weaken rollback.
+or later: `cd1397249` on 2026-10-03, `57efccedd` from 2026-10-05, see §1.4).
+`update.sh` records the running **digest** as its rollback reference, so the
+moving tag does not weaken rollback.
 
 ## 2. Scope and guarantees
 
@@ -136,10 +168,13 @@ Run on the VM from the package directory (`~/nxpi_config`, or
    ```
    - If it is not `OK`, CI has not published the new build yet. Stop and try
      again later.
-   - Expected on 2026-10-03: `rev=cd1397249…`, digest
-     `sha256:53241602e236e460409f096135e5b6565c22e09dfe9f0e7955a853c7ace12f1e`.
-   - If `<rev>` is later than `cd1397249`, run
-     `git -C <nxpi_dev> diff --stat cd1397249..<rev> -- azure-deployment src/lib/db/migrations .env.example`
+   - Expected from 2026-10-05: `rev=57efccedd…`, index digest
+     `sha256:0394839f61f99ba05da234a54683e7885a7cd5d3b8c861a95a84bbbb4aa34d3e`
+     (same build as the `sha-57efcce` tag; analysed in §1.4). The previous
+     build, `rev=cd1397249…` / `sha256:53241602…ace12f1e`, is also fine to
+     roll; it lacks only §1.4's features.
+   - If `<rev>` is later than `57efccedd`, run
+     `git -C <nxpi_dev> diff --stat 57efccedd..<rev> -- azure-deployment src/lib/db/migrations src/lib/db/pg/schema.pg.ts .env.example docker next.config.ts`
      and repeat §1's checks. In particular, a newer `db/<version>` means you
      sync the package again first.
    - **Write the digest down.**
@@ -283,6 +318,14 @@ New in this build:
 - [ ] A reply that generated files lists them at its end; a new thread's title comes from the typed message, not the file name
 - [ ] A workflow node that generates a file passes it to the next node, and the file appears in the run history
 - [ ] Admin enables image input on a model: the vision probe passes (one small model call)
+
+New since `cd1397249` (only on `57efccedd` or later, §1.4):
+
+- [ ] **Generate with AI** on the Workflows page produces a draft that opens on the canvas; **Edit with AI** on an existing workflow previews a change, applies it as one undo step, and the run still passes
+- [ ] **Scheduler calendar**: create a trigger with the calendar editor; its next run is in the future, and it does not fire for the tick that preceded its creation
+- [ ] **Execution center**: a finished run shows real token counts and an Output tab; cancel a waiting scheduled run; delete one finished run (the row is gone, nothing else is)
+- [ ] **Files node** (only if an org has Workflow file inputs on): a SharePoint link resolves as the run user; with `WORKFLOW_LOCAL_FILE_ROOTS` unset the local-folder source fails naming the variable, and with it set plus the bind mount a folder's files are listed. A path outside the roots is refused
+- [ ] A workflow published before this build still re-publishes after an edit; if the server-side validation refuses it, the message names the node
 
 **Close the seed gap** if this host has not done it yet (product UI, Skills →
 the skill → edit). Add the matching tool to `allowed-tools`:

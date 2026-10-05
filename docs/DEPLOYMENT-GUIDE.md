@@ -62,13 +62,13 @@ script from this package. That is what makes every guarantee checkable.
                            LLM keys         in caddy-data)      off the VM
 ```
 
-**Components (package `main` after 4df2d18; app `main` cd1397249, 2026-10-03)**
+**Components (package `main` after 8435119; app `main` 57efccedd, 2026-10-05)**
 
 | Piece | Value | Why it matters |
 |---|---|---|
 | App image | `ghcr.io/negentrophi/nxpi` (`latest`, `sha-<short>`, `X.Y.Z`); `nxpi_dev` is frozen | pin `tag@sha256:…`; an `.env` naming `nxpi_dev` never updates again |
 | Deployed build | `nxpi:sha-cb44bba@sha256:1a615b98…868af9`, linux/amd64 | needs `TRUSTED_PROXY_MODE=xff` in `.env.app` to boot; `/api/health/deep` wants `METRICS_TOKEN` |
-| Next build | `nxpi:latest` = app `cd1397249` (`sha256:53241602…ace12f1e`): PDF delivery modes (worker fixed in `18816f6a2`), large spreadsheets, RAG skip reasons; needs **db 1.42.0** | `update.sh` with `DB_VERSION=1.42.0` set in the same edit; never roll `aa7534c7b` (broken PDF worker) |
+| Next build | `nxpi:latest` = app `57efccedd` (`sha-57efcce`, `sha256:0394839f…4aa34d3e`): PDF delivery modes (worker fixed in `18816f6a2`), large spreadsheets, RAG skip reasons, workflow Generate/Edit with AI, Files node, calendar triggers, execution-center actions; needs **db 1.42.0**, no new migration since `cd1397249` | `update.sh` with `DB_VERSION=1.42.0` set in the same edit; never roll `aa7534c7b` (broken PDF worker). Files node local folders are opt-in: `WORKFLOW_LOCAL_FILE_ROOTS` + a read-only bind mount (see `.env.app.example`, `docker-compose.yml`) |
 | Database | PostgreSQL 17 + pgvector; newest shipped `db/1.42.0` (= app migration 0043) | `DB_VERSION` is authoritative for every non-`X.Y.Z` tag |
 | Bookkeeping | marker `public.deploy_schema_migrations`, one row per applied delta | pending set = shipped deltas minus marker rows; never guess it |
 | Roll-forward-only | 1.3.0, 1.9.0, 1.26.0, 1.29.0, 1.35.0 (`REQUIRES-REVIEW` in the first lines) | old image cannot serve the schema afterwards; rollback = restore the bundle |

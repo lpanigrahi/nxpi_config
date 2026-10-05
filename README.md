@@ -155,6 +155,8 @@ from the image tag; set `DB_VERSION` explicitly when the tag is `:latest`.
 APP_IMAGE=ghcr.io/negentrophi/nxpi:sha-cb44bba@sha256:1a615b9827059b5dd8d3dc01780cb4385da6db9675590351708d3137dd868af9   DB_VERSION=1.41.0
 # newest build (app main ≥ 630753ae1 needs db 1.42.0) — pin the artifact version explicitly:
 APP_IMAGE=ghcr.io/negentrophi/nxpi:latest            DB_VERSION=1.42.0
+# the same build, pinned (latest = app 57efccedd on 2026-10-05; still db 1.42.0):
+APP_IMAGE=ghcr.io/negentrophi/nxpi:sha-57efcce@sha256:0394839f61f99ba05da234a54683e7885a7cd5d3b8c861a95a84bbbb4aa34d3e   DB_VERSION=1.42.0
 ```
 
 Moving/suffixed tags (`latest`, `main`, `sha-<short>`, `<pkgver>-main.<sha>`)

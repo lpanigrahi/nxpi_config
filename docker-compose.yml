@@ -303,6 +303,15 @@ services:
       # once per volume lifetime, not per boot.
       - npm-cache-data:/app/.npm-cache
       - ./secrets-entrypoint.sh:/secrets-entrypoint.sh:ro
+      # OPT-IN (ADR-0118, app main ≥ 57efccedd): a folder on this VM that a
+      # workflow Files node may read with its local-folder source. Mount it
+      # READ-ONLY, then list the SAME container path in ./.env.app's
+      # WORKFLOW_LOCAL_FILE_ROOTS — the variable is the allow-list, the mount
+      # is what makes the path exist; one without the other refuses the node.
+      # The app runs as uid 1001, so the host folder must be world-readable
+      # (or owned by 1001). Every organization with Workflow file inputs on
+      # can read everything under it.
+      # - /srv/shared/drawings:/srv/shared/drawings:ro
       # /tmp → tmpfs (ephemeral), sized so the bash sandbox + ad-hoc writes
       # fail with ENOSPC instead of OOMing the container.
       - type: tmpfs
