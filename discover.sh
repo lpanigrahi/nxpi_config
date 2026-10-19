@@ -152,10 +152,10 @@ if [ -n "$PG_CID" ]; then
   while IFS= read -r base; do
     [ -n "$base" ] || continue
     f=$(find db -mindepth 2 -maxdepth 2 -name "$base" | head -n1)
-    [ -n "$f" ] && [ -n "$(review_marker_line "$f")" ] && DESTR="${DESTR}${base} "
+    [ -n "$f" ] && is_review_delta "$f" && DESTR="${DESTR}${base} "
   done <<<"$PENDING"
   kv "REQUIRES-REVIEW pending" "${DESTR:-none}"
-  [ -z "$DESTR" ] || note "roll-forward-only deltas in scope ($DESTR) — the window needs the maintenance path; the previously-running image cannot serve the migrated schema"
+  [ -z "$DESTR" ] || note "roll-forward-only deltas in scope ($DESTR) — the window needs the maintenance path; the previously-running image cannot serve the migrated schema, or the data change cannot be undone in place (PACKAGE_REVIEW_VERSIONS)"
   if [ -n "$CUR_DB_VERSION" ] && ! ver_le "$CUR_DB_VERSION" "$TARGET"; then
     blocker "./.env DB_VERSION=$CUR_DB_VERSION is NEWER than the report target $TARGET"
   fi

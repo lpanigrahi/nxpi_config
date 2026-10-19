@@ -29,7 +29,9 @@
 #           duplicates, team members outside their org, malformed role keys,
 #           grants with a bad type / non-UUID / dangling resource, unknown
 #           permission slugs, junction orphans), 1.29.0's app-role posture,
-#           1.35.0's cron duplicates and agent_memory rows. Each delta would
+#           1.35.0's cron duplicates and agent_memory rows, 1.53.0's orphan
+#           run→thread references; and what 1.46.0/1.50.0/1.51.0/1.54.0 will
+#           privatise, overwrite or drop. Each delta would
 #           abort INSIDE the window otherwise — after the backup and the .env
 #           edit. A non-zero ack-class count (agent_memory rows) needs a typed
 #           word, also with --yes (pass --ack WORD to pre-supply it).
@@ -39,7 +41,8 @@
 #           (expect_rows_for in lib-checks.sh: 1.22.0/1.25.0 delete the
 #           materialised SYSTEM-role defaults, 1.25.0 rebuilds
 #           org_resource_grant checksummed, 1.35.0 drops agent_memory,
-#           1.25.0/1.27.0/1.40.1 seed reference rows).
+#           1.25.0/1.27.0/1.40.1 seed reference rows, 1.46.0 lists
+#           knowledge-base shares, 1.51.0/1.54.0 remove org label assignments).
 #   • POST: asserts every sentinel object each release in scope introduces,
 #           the load-bearing objects (catalog rows, chain head, partitions, RLS
 #           posture, cron index, dropped orphans), that grants reached EVERY
@@ -47,8 +50,9 @@
 #           table shrank outside the expected list. Then ./schema-parity.sh
 #           (when present) diffs the live catalog against db/<target>/schema.sql.
 #
-# Every REQUIRES-REVIEW delta in scope (1.9.0, 1.26.0, 1.29.0, 1.35.0) is
-# surfaced with its own header and rationale before ONE confirmation; the
+# Every REQUIRES-REVIEW delta in scope (1.9.0, 1.26.0, 1.29.0, 1.35.0, and the
+# package-gated 1.46.0, 1.50.0, 1.51.0, 1.54.0 — PACKAGE_REVIEW_VERSIONS in
+# lib.sh) is surfaced with its own header and rationale before ONE confirmation; the
 # rolling ./update.sh path refuses those by design. 1.29.0 additionally needs
 # the privileged-pool decision to be explicit: POSTGRES_PRIVILEGED_URL_FILE set
 # in ./.env and the neogen_priv role provisioned, or the KNOWN-LIMIT ack.
@@ -248,7 +252,7 @@ if [ -n "$CHECK_ACKS" ]; then
   while read -r ack_name ack_word ack_count; do
     [ -n "$ack_name" ] || continue
     if ack_given "$ack_word"; then log "$ack_name: $ack_count row(s) — acknowledged via --ack $ack_word"; continue; fi
-    warn "$ack_name reports $ack_count row(s) that the pending delta will DROP with the table."
+    warn "$ack_name reports $ack_count row(s) that the pending delta drops or rewrites for good (its line above says how)."
     if $DRY_RUN; then log "(dry run) the real run will ask you to type $ack_word (or pass --ack $ack_word)"; continue; fi
     ASSUME_YES_SAVED=$ASSUME_YES; ASSUME_YES=false   # an ack is never auto-confirmed
     confirm "Accept losing these rows." "$ack_word"
@@ -373,7 +377,7 @@ fi
 
 # ── 7. Surface EVERY REQUIRES-REVIEW delta, then migrate ────────────────────
 # lib.sh's list_pending_destructive prints every flagged file apply_migrations
-# would run — a 1.15.0 → 1.41.0 jump carries three. Only then do we arm the
+# would run — a 1.15.0 → 1.41.0 jump carries three, 1.42.0 → 1.54.0 four. Only then do we arm the
 # override — a purely additive upgrade (e.g. 1.9.0 → 1.10.0) never asks for it.
 # review_notes FILE — what each flagged delta does to DATA, in one paragraph.
 review_notes() {
@@ -412,6 +416,40 @@ EOF
   DROPPED (zero readers and writers in the app — its row count was acknowledged
   in the pre-checks above). The delta aborts, whole, on duplicate 'running'
   cron rows (pre-checked). Row counts: agent_memory disappears; nothing else.
+EOF
+    ;;
+    migrate-1.46.0.sql) cat <<'EOF'
+  Gated by THIS package (PACKAGE_REVIEW_VERSIONS in lib.sh); upstream routes it
+  through update.sh. No DDL. Knowledge bases are shared only through the
+  Marketplace from here (ADR-0120): an APPROVED team/org/public share in an
+  organization becomes a published listing; EVERY OTHER direct share becomes
+  PRIVATE and its previous audience is not recorded — users lose access until
+  the owner publishes it. Counted above (p46_*). Row counts: marketplace_listing
+  grows; nothing is deleted except non-owner attachments of shares going private.
+EOF
+    ;;
+    migrate-1.50.0.sql) cat <<'EOF'
+  Gated by THIS package. One UPDATE: every prompt_template.category becomes
+  'user' (ADR-0123: prompts insert text; they no longer steer the system prompt).
+  The previous category is not kept — the pre-upgrade dump is the only record.
+  Row-count preserving.
+EOF
+    ;;
+    migrate-1.51.0.sql) cat <<'EOF'
+  Gated by THIS package. Creates org_label (RLS forced), copies the platform
+  labels each organization uses into it, REPOINTS org_user_label.label_id at the
+  copies (old ids are not kept) and DELETES assignments whose label no longer
+  resolves (p51_*). An image older than 1.51.0 then fails to save member labels
+  (23503 on the new FK). 1.54.0 drops both tables again in the same window.
+EOF
+    ;;
+    migrate-1.54.0.sql) cat <<'EOF'
+  Gated by THIS package. DROP TABLE org_user_label, org_label — org-scoped label
+  assignments are removed with no data migration (ADR-0124 amendment: they were
+  never enforced). Platform labels (user_access_label → user_tool_permission)
+  are untouched. An image older than 1.54.0 answers 42P01 on the labels routes:
+  ROLL-FORWARD-ONLY; the pre-upgrade dump is the only way back. The row count
+  was acknowledged above (DROP-ORG-LABELS).
 EOF
     ;;
     *) printf '  (no packaged review note for %s — read its header above)\n' "$(basename "$1")" ;;

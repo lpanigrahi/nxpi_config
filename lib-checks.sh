@@ -6,7 +6,7 @@
 # Requires lib.sh to be sourced first (psql_scalar, psql_admin, rel_ready).
 #
 # Every packaged delta that can FAIL CLOSED on live data (1.9.0, 1.11.0,
-# 1.25.0, 1.35.0) does so from inside a single-transaction psql apply — AFTER
+# 1.25.0, 1.35.0, 1.53.0) does so from inside a single-transaction psql apply — AFTER
 # a full backup has been taken and ./.env has been edited. Mirroring each of
 # those predicates here as a read-only SELECT is what lets --dry-run and
 # discover.sh say "this window will stop at 1.25.0 on 3 grants" a week early.
@@ -49,6 +49,14 @@ CHECKS=$(printf '%s\n' \
   $'p26_audit_chain_head_rows\tmigrate-1.26.0.sql\tblock\taudit_chain_head\taudit_chain_head rows OTHER than the single platform head (id=1) — 1.26.0/0020 refuses to key a chain it did not expect' \
   $'p29_app_role_can_bypass_rls\tmigrate-1.29.0.sql\tblock\t-\tthe neo_gen app role is SUPERUSER or BYPASSRLS — 1.29.0\'s FORCE ROW LEVEL SECURITY would be inert' \
   $'p35_agent_memory_rows\tmigrate-1.35.0.sql\tack:DROP-AGENT-MEMORY\tagent_memory\trows in agent_memory, which 1.35.0 DROPS (an orphan store with no readers — expected 0)' \
+  $'p46_kb_shares_to_marketplace\tmigrate-1.46.0.sql\tinfo\tknowledge_base,marketplace_listing,team\tdirectly shared knowledge bases 1.46.0 turns into PUBLISHED Marketplace listings (approved, in an organization)' \
+  $'p46_kb_shares_go_private\tmigrate-1.46.0.sql\tack:PRIVATIZE-KB-SHARES\tknowledge_base,marketplace_listing,team\tdirectly shared knowledge bases 1.46.0 makes PRIVATE — not approved, no organization, a vanished team or an unpublished listing; the previous audience is NOT recorded' \
+  $'p48_index_build_rows\tmigrate-1.48.0.sql\tinfo\tknowledge_base_document,ingestion_jobs\trows 1.48.0 indexes (three plain CREATE INDEX) while writes to knowledge_base_document / ingestion_jobs wait' \
+  $'p50_prompt_category_rewrites\tmigrate-1.50.0.sql\tinfo\tprompt_template\tprompt templates whose category 1.50.0 overwrites to \'user\' (forward-only; the old category is not kept)' \
+  $'p51_label_assignments_unresolvable\tmigrate-1.51.0.sql\tinfo\torg_user_label,user_access_label\torg label assignments 1.51.0 DELETES because their platform label no longer exists' \
+  $'p53_run_orphan_threads\tmigrate-1.53.0.sql\tblock\torchestration_run,chat_thread\torchestration_run rows whose thread_id names no chat_thread — 1.53.0\'s VALIDATE CONSTRAINT aborts the whole delta on them' \
+  $'p53_fk_validate_rows\tmigrate-1.53.0.sql\tinfo\torchestration_run\torchestration_run rows 1.53.0 scans (FK validation + index build) while holding its locks' \
+  $'p54_org_label_assignments\tmigrate-1.54.0.sql\tack:DROP-ORG-LABELS\torg_user_label\torg label assignments 1.54.0 DROPS with org_user_label / org_label (no data migration; platform labels are untouched)' \
   $'rls_posture\talways\tinfo\t-\ttables with row-level security FORCED (0 before 1.29.0, ≥26 after)' \
   $'privileged_role_present\talways\tinfo\t-\tthe neogen_priv BYPASSRLS role exists (1 = provisioned)')
 
@@ -121,6 +129,26 @@ check_sql() {
       printf '%s' "select count(*) from pg_roles where rolname = 'neo_gen' and (rolsuper or rolbypassrls)" ;;
     p35_agent_memory_rows)
       printf '%s' "select count(*) from agent_memory" ;;
+    # 1.46.0 (0047) step 1 lists a share when it is approved, in an organization,
+    # its team (if any) belongs there, and no NON-published listing blocks the
+    # upsert; step 4 makes every other team/org/public share private. Exact on a
+    # database at ≤ 1.45.0, where no listing can carry previousVisibility yet.
+    p46_kb_shares_to_marketplace)
+      printf '%s' "select count(*) from knowledge_base kb where kb.visibility in ('team','org','public') and kb.organization_id is not null and kb.governance_status = 'approved' and (kb.visibility <> 'team' or exists (select 1 from team t where t.id = kb.team_id and t.organization_id = kb.organization_id)) and not exists (select 1 from marketplace_listing ml where ml.resource_type = 'knowledge_pack' and ml.resource_id = kb.id and ml.status <> 'published')" ;;
+    p46_kb_shares_go_private)
+      printf '%s' "select count(*) from knowledge_base kb where kb.visibility in ('team','org','public') and not (kb.organization_id is not null and kb.governance_status = 'approved' and (kb.visibility <> 'team' or exists (select 1 from team t where t.id = kb.team_id and t.organization_id = kb.organization_id)) and not exists (select 1 from marketplace_listing ml where ml.resource_type = 'knowledge_pack' and ml.resource_id = kb.id and ml.status <> 'published'))" ;;
+    p48_index_build_rows)
+      printf '%s' "select (select count(*) from knowledge_base_document) + (select count(*) from ingestion_jobs)" ;;
+    p50_prompt_category_rewrites)
+      printf '%s' "select count(*) from prompt_template where category is distinct from 'user'" ;;
+    p51_label_assignments_unresolvable)
+      printf '%s' "select count(*) from org_user_label oul where not exists (select 1 from user_access_label ual where ual.id = oul.label_id)" ;;
+    p53_run_orphan_threads)
+      printf '%s' "select count(*) from orchestration_run r where r.thread_id is not null and not exists (select 1 from chat_thread t where t.id = r.thread_id)" ;;
+    p53_fk_validate_rows)
+      printf '%s' "select count(*) from orchestration_run" ;;
+    p54_org_label_assignments)
+      printf '%s' "select count(*) from org_user_label" ;;
     rls_posture)
       printf '%s' "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relforcerowsecurity" ;;
     privileged_role_present)
@@ -149,6 +177,9 @@ check_sample_sql() {
     p25_junction_orphans)         printf '%s' "select 'org_role_permission' as junction, rp.role_id::text as parent, rp.permission from org_role_permission rp left join org_role r on r.id = rp.role_id where r.id is null union all select 'org_permission_group_item', gi.group_id::text, gi.permission from org_permission_group_item gi left join org_permission_group g on g.id = gi.group_id where g.id is null union all select 'org_role_permission_group', rg.role_id::text, rg.group_id::text from org_role_permission_group rg left join org_role r on r.id = rg.role_id where r.id is null limit 20" ;;
     p25_role_group_org_mismatch)  printf '%s' "select rg.role_id, r.organization_id as role_org, rg.group_id, g.organization_id as group_org from org_role_permission_group rg join org_role r on r.id = rg.role_id join org_permission_group g on g.id = rg.group_id where r.organization_id <> g.organization_id limit 20" ;;
     p29_app_role_can_bypass_rls)  printf '%s' "select rolname, rolsuper, rolbypassrls from pg_roles where rolname in ('neo_gen','neogen_priv','neogen_admin')" ;;
+    p46_kb_shares_go_private)     printf '%s' "select kb.id, kb.name, kb.visibility, kb.governance_status, kb.organization_id is null as no_org from knowledge_base kb where kb.visibility in ('team','org','public') and not (kb.organization_id is not null and kb.governance_status = 'approved' and (kb.visibility <> 'team' or exists (select 1 from team t where t.id = kb.team_id and t.organization_id = kb.organization_id)) and not exists (select 1 from marketplace_listing ml where ml.resource_type = 'knowledge_pack' and ml.resource_id = kb.id and ml.status <> 'published')) order by kb.name limit 20" ;;
+    p53_run_orphan_threads)       printf '%s' "select r.id, r.thread_id, r.status from orchestration_run r where r.thread_id is not null and not exists (select 1 from chat_thread t where t.id = r.thread_id) limit 20" ;;
+    p54_org_label_assignments)    printf '%s' "select organization_id, count(*) as assignments from org_user_label group by 1 order by 2 desc limit 20" ;;
     *) printf '' ;;
   esac
 }
@@ -282,6 +313,19 @@ expect_rows_for() {
   if has migrate-1.40.1.sql; then
     printf 'permission_catalog\tgrow\t1.40.1: upsert repair of the catalog (no-op on a migrated database)\n'
     printf 'sod_rule\tgrow\t1.40.1: upsert repair of the platform sod_rule rows (no-op on a migrated database)\n'
+  fi
+  if has migrate-1.46.0.sql; then
+    printf 'marketplace_listing\tgrow\t1.46.0/0047: approved direct knowledge-base shares become published listings\n'
+    printf 'knowledge_base_attachment\tshrink\t1.46.0/0047: attachments outside a share that goes private are removed (owners keep theirs)\n'
+  fi
+  if has migrate-1.51.0.sql; then
+    printf 'org_user_label\tshrink\t1.51.0/0052: assignments whose platform label no longer exists are deleted\n'
+  fi
+  # Printed AFTER 1.51.0's line: the last kind for a table wins, so a run that
+  # carries both judges org_user_label as gone, not shrunk.
+  if has migrate-1.54.0.sql; then
+    printf 'org_user_label\tgone\t1.54.0/0055: org label assignments are dropped with the table\n'
+    printf 'org_label\tgone\t1.54.0/0055: org labels are dropped with the table\n'
   fi
   unset -f has
 }

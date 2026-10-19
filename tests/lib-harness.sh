@@ -546,13 +546,26 @@ t "lists every pending flagged delta in order" "db/1.3.0/migrate-1.3.0.sql db/1.
 t "has_pending_destructive still prints only the first" "db/1.3.0/migrate-1.3.0.sql" "$(has_pending_destructive)"
 printf 'DB_VERSION=1.2.0\n' > .env
 t "nothing flagged within a lower target" "" "$(list_pending_destructive)"
+# PACKAGE_REVIEW_VERSIONS gates an UNMARKED upstream delta the same way.
+mkdir -p db/1.5.0 && printf -- '-- d (no marker)\n' > db/1.5.0/migrate-1.5.0.sql
+printf 'DB_VERSION=1.5.0\n' > .env
+t "an unmarked delta is not a review delta by default" "" "$(list_pending_destructive | grep 1.5.0)"
+SAVED_PRV=$PACKAGE_REVIEW_VERSIONS; PACKAGE_REVIEW_VERSIONS="1.5.0"
+t "is_review_delta: listed version" "y" "$(is_review_delta db/1.5.0/migrate-1.5.0.sql && echo y || echo n)"
+t "is_review_delta: own marker"     "y" "$(is_review_delta db/1.3.0/migrate-1.3.0.sql && echo y || echo n)"
+t "is_review_delta: neither"        "n" "$(is_review_delta db/1.2.0/migrate-1.2.0.sql && echo y || echo n)"
+t "a package-listed version is pending-destructive" "db/1.5.0/migrate-1.5.0.sql" "$(list_pending_destructive | grep 1.5.0)"
+PACKAGE_REVIEW_VERSIONS=$SAVED_PRV
+t "the shipped list is the four forward-only deltas" "1.46.0 1.50.0 1.51.0 1.54.0" "$PACKAGE_REVIEW_VERSIONS"
 cd ..
 unset -f ensure_migration_marker is_migration_applied
 
 # ── SCHEMA_PROBES: one sentinel per release, sorted, with SQL renderers ───────
 t "SCHEMA_PROBES is set"        "yes" "$([ -n "${SCHEMA_PROBES:-}" ] && echo yes || echo no)"
 t "SCHEMA_PROBES is sorted -V"  "yes" "$([ "$(printf '%s\n' "$SCHEMA_PROBES" | cut -f1)" = "$(printf '%s\n' "$SCHEMA_PROBES" | cut -f1 | sort -V)" ] && echo yes || echo no)"
-t "SCHEMA_PROBES reaches 1.42.0" "yes" "$(printf '%s\n' "$SCHEMA_PROBES" | grep -q '^1\.42\.0	' && echo yes || echo no)"
+t "SCHEMA_PROBES reaches 1.54.0" "yes" "$(printf '%s\n' "$SCHEMA_PROBES" | grep -q '^1\.54\.0	no_table	org_user_label$' && echo yes || echo no)"
+t "SCHEMA_PROBES has no 1.51.0 row (its objects die in 1.54.0)" "no" "$(printf '%s\n' "$SCHEMA_PROBES" | grep -q '^1\.51\.0	' && echo yes || echo no)"
+t "schema_probe_sql no_table"   "yes" "$(schema_probe_sql no_table org_user_label | grep -q "to_regclass('public.org_user_label') is null.*column_name='tool_calls'" && echo yes || echo no)"
 t "SCHEMA_PROBES keeps the legacy 1.5.0 probe" "yes" "$(printf '%s\n' "$SCHEMA_PROBES" | grep -q '^1\.5\.0	table	skill_scan$' && echo yes || echo no)"
 t "schema_probe_sql column"     "yes" "$(schema_probe_sql column agent.governance_disabled_by | grep -q "table_name='agent'.*column_name='governance_disabled_by'" && echo yes || echo no)"
 t "schema_probe_sql table"      "yes" "$(schema_probe_sql table permission_catalog | grep -q "table_name='permission_catalog'" && echo yes || echo no)"

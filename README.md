@@ -153,10 +153,12 @@ from the image tag; set `DB_VERSION` explicitly when the tag is `:latest`.
 ```bash
 # deterministic, recommended for production (immutable per-commit tag) — the db 1.41.0 build:
 APP_IMAGE=ghcr.io/negentrophi/nxpi:sha-cb44bba@sha256:1a615b9827059b5dd8d3dc01780cb4385da6db9675590351708d3137dd868af9   DB_VERSION=1.41.0
-# newest build (app main ≥ 630753ae1 needs db 1.42.0) — pin the artifact version explicitly:
-APP_IMAGE=ghcr.io/negentrophi/nxpi:latest            DB_VERSION=1.42.0
-# the same build, pinned (latest = app 57efccedd on 2026-10-05; still db 1.42.0):
+# newest build (app main ≥ eb1f292f8 needs db 1.54.0) — pin the artifact version explicitly:
+APP_IMAGE=ghcr.io/negentrophi/nxpi:latest            DB_VERSION=1.54.0
+# the db 1.42.0 build (app 57efccedd, 2026-10-05), pinned:
 APP_IMAGE=ghcr.io/negentrophi/nxpi:sha-57efcce@sha256:0394839f61f99ba05da234a54683e7885a7cd5d3b8c861a95a84bbbb4aa34d3e   DB_VERSION=1.42.0
+# newest reviewed build (latest = app 9bd203913 on 2026-10-14) — needs db 1.54.0, via ./upgrade-release.sh:
+APP_IMAGE=ghcr.io/negentrophi/nxpi:sha-9bd2039@sha256:cbacdbe481d99c7b249ec81bf858420e27e546e36ab5e00940418c62f07969d2   DB_VERSION=1.54.0
 ```
 
 Moving/suffixed tags (`latest`, `main`, `sha-<short>`, `<pkgver>-main.<sha>`)
@@ -261,6 +263,40 @@ Nothing else here is required. The pgvector tuning, memory ceilings and PITR
 switches all default to today's behaviour, and the dedicated-disk layout stays
 opt-in (see [Prerequisites](#prerequisites)).
 
+### Upgrading to db 1.54.0 (guided, from 1.42.0)
+
+App `9bd203913` (`latest` since 2026-10-14) needs db **1.54.0** — twelve
+deltas past 1.42.0. Upstream labels every one `Route: ./update.sh`; this
+package does not. Four of them rewrite or drop data the pre-upgrade dump alone
+can bring back, so `lib.sh` gates them as REQUIRES-REVIEW
+(`PACKAGE_REVIEW_VERSIONS`) and `./update.sh` refuses the jump:
+
+| Release | What it does to data | Typed ack (when non-zero) |
+|---|---|---|
+| **1.46.0** | direct knowledge-base shares: approved → published Marketplace listing, **everything else → private** (previous audience not kept) | `PRIVATIZE-KB-SHARES` |
+| **1.50.0** | every `prompt_template.category` → `user` | — |
+| **1.51.0** | org label assignments repointed to the new `org_label`; unresolvable ones **deleted** | — |
+| **1.54.0** | **drops `org_user_label` and `org_label`**; an older image then fails 42P01 on the labels routes | `DROP-ORG-LABELS` |
+
+1.48.0 (three non-concurrent index builds) and 1.53.0 (an FK swap validated in
+the same transaction; **blocks** on orphan run→thread references) hold write
+locks for as long as the tables take — sized by `./upgrade-db.sh --dry-run`.
+The window itself is `docs/RELEASE-UPGRADE-RUNBOOK.md`:
+
+```bash
+git pull                                       # this package, with db/1.43.0 … db/1.54.0
+./upgrade-db.sh --dry-run --target 1.54.0      # pending set, pre-checks, acks, lock sizing
+./upgrade-release.sh --target 1.54.0 \
+  --image ghcr.io/negentrophi/nxpi:sha-9bd2039@sha256:cbacdbe481d99c7b249ec81bf858420e27e546e36ab5e00940418c62f07969d2 \
+  --ack PRIVATIZE-KB-SHARES --ack DROP-ORG-LABELS   # only the acks the dry run asked for
+```
+
+The image no longer runs code in the browser or the app container: JS,
+Python, bash, `runTests` and deck generation need the separate code-runner
+service (ADR-0125/0126), which **this package does not ship yet** — on this
+stack those tools are withheld after the roll (see `.env.app.example`,
+"Code runner").
+
 ### Upgrading to db 1.41.0 (guided, multi-release)
 
 A VM at db 1.15.0 (or lower) is 26 releases behind the current image. Three
@@ -333,7 +369,7 @@ any mutation (app restarted) · `3` migrated but not rolled — **app down, run
 tests/rehearsal.sh --old-image ghcr.io/negentrophi/nxpi_dev@sha256:<the VM's current digest>
 ```
 
-#### What the 26 deltas do to data
+#### What each delta does to data (1.16.0 → 1.54.0)
 
 | Release | Path | What changes | Data touched |
 |---|---|---|---|
@@ -354,6 +390,18 @@ tests/rehearsal.sh --old-image ghcr.io/negentrophi/nxpi_dev@sha256:<the VM's cur
 | 1.40.1 | rolling (data patch) | seeds `permission_catalog` + platform `sod_rule` where a 1.22.0–1.39.0 install left them empty | upsert repair (no-op on a migrated database) |
 | 1.41.0 | rolling | `agent.governance_disabled_by` + backfill | backfill |
 | 1.42.0 | rolling | `thread_attachment.rag_skip_reason` (nullable text, why a file was not indexed); app main ≥ `630753ae1` names it in every attachment status write | none (catalog-only `ADD COLUMN`, no backfill) |
+| 1.43.0 | rolling | 8 nullable `knowledge_base` ingestion-setting columns, `marketplace_install.installed_resource_id`, two CHECKs | none |
+| 1.44.0 | rolling | `marketplace_listing.metadata` jsonb | none |
+| 1.45.0 | rolling | `knowledge_base_attachment` + owner backfill | backfill (owners only) |
+| **1.46.0** | **REQUIRES-REVIEW (package)** | knowledge bases shared only through the Marketplace (ADR-0120) | approved shares → listings; **other direct shares → private** (`PRIVATIZE-KB-SHARES`) |
+| 1.47.0 | rolling | `knowledge_upload_batch` / `_item` (RLS forced), 3 `knowledge_base_document` + 4 `org_storage_governance` columns, one index | new empty tables |
+| 1.48.0 | window (locks) | three plain `CREATE INDEX` on `knowledge_base_document` / `ingestion_jobs`; `knowledge_base_folder` + backfill | backfill from `relative_path` |
+| 1.49.0 | rolling | `prompt_template_comment` | new empty table |
+| **1.50.0** | **REQUIRES-REVIEW (package)** | prompt categories normalised (ADR-0123) | **every category → `user`** |
+| **1.51.0** | **REQUIRES-REVIEW (package)** | `org_label` (RLS forced) copied from platform labels; `org_user_label` repointed + FK | **unresolvable assignments deleted**; old image cannot save member labels |
+| 1.52.0 | rolling | `org_presentation_template` (RLS forced) | new empty table |
+| 1.53.0 | window (locks) | `cron_run_log.tool_calls`, `orchestration_run.user_id` + FK + index; run→thread FK becomes **ON DELETE CASCADE** | none; deleting a chat thread now deletes its runs; **blocks** on orphan `thread_id`s (pre-checked) |
+| **1.54.0** | **REQUIRES-REVIEW (package)** | `DROP TABLE org_user_label, org_label` (ADR-0124 amendment) | **org label assignments gone** (`DROP-ORG-LABELS`); **roll-forward-only** |
 
 `./upgrade-db.sh --dry-run` prints exactly which of these are pending, the
 pre-check verdicts, and the allow-list of row changes the post-check will

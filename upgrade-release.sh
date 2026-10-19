@@ -13,7 +13,8 @@
 # (required forward; tag@sha256 recommended — a bare tag is pinned to the digest
 # it resolves to) · --dry-run (preflight only; nothing changes) · --yes (skip
 # the one typed UPGRADE — and ROLLBACK on --rollback; typed ACKS are never
-# skipped, pre-supply them) · --ack WORD (DROP-AGENT-MEMORY, KNOWN-LIMIT; a
+# skipped, pre-supply them) · --ack WORD (DROP-AGENT-MEMORY, KNOWN-LIMIT,
+# PRIVATIZE-KB-SHARES, DROP-ORG-LABELS; a
 # required ack that is neither supplied nor answerable — no terminal — is
 # refused in preflight, before anything changes) · --accept-uncataloged-uploads
 # · --no-rehearse · --skip-parity · --smoke-login (real sign-in with
@@ -296,9 +297,15 @@ if begin preflight "1. Preflight → db $TARGET, image $IMAGE"; then
   # A typed acknowledgement the real run will demand must be answerable now:
   # pre-supplied with --ack, or a terminal on stdin. Otherwise refuse HERE.
   NEED_ACKS=$(grep -oE 'will ask you to type [A-Z-]+' "$RUN/.dryrun.out" | awk '{print $NF}' | sort -u | tr '\n' ' ')
+  # Collect EVERY missing word before refusing — naming only the first sends the
+  # operator round the loop once per ack (1.42.0 → 1.54.0 needs two).
+  MISSING_ACKS=""
   for w in $NEED_ACKS; do
-    case " $ACKS " in *" $w "*) ;; *) [ -t 0 ] || die "the real run will require the typed acknowledgement $w and stdin is not a terminal — re-run with --ack $w (nothing was changed)" ;; esac
+    case " $ACKS " in *" $w "*) ;; *) MISSING_ACKS="$MISSING_ACKS $w" ;; esac
   done
+  if [ -n "$MISSING_ACKS" ] && [ ! -t 0 ]; then
+    die "the real run will require the typed acknowledgement(s)$MISSING_ACKS and stdin is not a terminal — re-run with$(for w in $MISSING_ACKS; do printf ' --ack %s' "$w"; done) (nothing was changed)"
+  fi
   [ -z "$NEED_ACKS" ] || kvp "typed acks required" "$NEED_ACKS$([ -n "$ACKS" ] && printf ' (supplied:%s)' "$ACKS")"
   rm -f "$RUN/.dryrun.out"
 
