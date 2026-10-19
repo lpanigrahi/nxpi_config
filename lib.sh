@@ -736,6 +736,31 @@ review_marker_line() {
   grep -nE '^-- REQUIRES-REVIEW:' "$1" 2>/dev/null | head -n1 | cut -d: -f1
 }
 
+# PACKAGE_REVIEW_VERSIONS — releases THIS package gates as REQUIRES-REVIEW
+# although the upstream delta carries no marker. Upstream routes every 1.4x/1.5x
+# delta through ./update.sh; these four are forward-only and lose data the
+# pre-upgrade dump alone can bring back, so here they ride the reviewed window
+# (./upgrade-release.sh / ./upgrade-db.sh), never the rolling path:
+#   1.46.0  direct knowledge-base shares → Marketplace or PRIVATE (audience not kept)
+#   1.50.0  every prompt_template.category overwritten to 'user'
+#   1.51.0  org_user_label repointed to org_label; unresolvable assignments DELETED
+#   1.54.0  DROP TABLE org_user_label, org_label (an older image then fails 42P01)
+# The shipped SQL stays byte-identical to the app copy (tools/sync-from-app-copy.sh
+# treats a changed shipped folder as drift), which is why the gate lives here and
+# not in the files. Adding a version here is the deliberate act.
+PACKAGE_REVIEW_VERSIONS="1.46.0 1.50.0 1.51.0 1.54.0"
+
+# is_review_delta FILE — true when apply_migrations must refuse FILE without
+# ALLOW_DESTRUCTIVE_MIGRATION=1: its own marker in the first six lines, or its
+# version listed in PACKAGE_REVIEW_VERSIONS.
+is_review_delta() {
+  local v
+  head -n 6 "$1" | grep -q 'REQUIRES-REVIEW' && return 0
+  v=$(basename "$1"); v=${v#migrate-}; v=${v%.sql}
+  case " $PACKAGE_REVIEW_VERSIONS " in *" $v "*) return 0 ;; esac
+  return 1
+}
+
 # ── Release-tooling helpers (pure unless noted) ──────────────────────────────
 # image_ref_rename REF [OLD_REPO NEW_REPO] — the app image moved registries
 # (github.com/negentrophi/nxpi_dev → negentrophi/nxpi, so CI now publishes
@@ -881,6 +906,10 @@ uploads_classify() {
 # exists" report. Releases without a unique sentinel (1.7.0, 1.21.0, 1.28.0,
 # 1.34.0, 1.40.1) are omitted — their deltas are IF NOT EXISTS / CREATE OR
 # REPLACE, so choosing the LOWER neighbour and re-applying them is a no-op.
+# 1.46.0 and 1.50.0 change data only; 1.51.0's org_label is DROPPED again by
+# 1.54.0, so no object proves 1.51.0 on a database past it — all three omitted.
+# 1.54.0 adds nothing, so its sentinel is an ABSENCE (no_table) anchored on
+# 1.53.0's column: a pre-1.51.0 schema lacks org_label too and must not match.
 # Format: version<TAB>kind<TAB>object; kinds match schema_probe_sql.
 SCHEMA_PROBES=$(printf '%s\n' \
   $'1.5.0\ttable\tskill_scan' \
@@ -916,11 +945,21 @@ SCHEMA_PROBES=$(printf '%s\n' \
   $'1.39.0\tcolumn\ttoken_usage.organization_id' \
   $'1.40.0\tpolicy\twrite_frame_insert ON sod_rule' \
   $'1.41.0\tcolumn\tagent.governance_disabled_by' \
-  $'1.42.0\tcolumn\tthread_attachment.rag_skip_reason')
+  $'1.42.0\tcolumn\tthread_attachment.rag_skip_reason' \
+  $'1.43.0\tcolumn\tknowledge_base.extraction_method' \
+  $'1.44.0\tcolumn\tmarketplace_listing.metadata' \
+  $'1.45.0\ttable\tknowledge_base_attachment' \
+  $'1.47.0\ttable\tknowledge_upload_batch' \
+  $'1.48.0\ttable\tknowledge_base_folder' \
+  $'1.49.0\ttable\tprompt_template_comment' \
+  $'1.52.0\ttable\torg_presentation_template' \
+  $'1.53.0\tcolumn\tcron_run_log.tool_calls' \
+  $'1.54.0\tno_table\torg_user_label')
 
 # schema_probe_sql KIND OBJECT — a query that yields 1 when OBJECT exists in
 # schema public. KIND: table | column (t.c) | index | constraint | function |
-# policy ("name ON table"). Names come from SCHEMA_PROBES (this file), never
+# policy ("name ON table") | no_table (yields 1 when the table is GONE and
+# 1.53.0's cron_run_log.tool_calls exists — 1.54.0's only footprint is a drop). Names come from SCHEMA_PROBES (this file), never
 # from user input.
 schema_probe_sql() {
   local kind="$1" obj="$2"
@@ -931,6 +970,7 @@ schema_probe_sql() {
     constraint) printf "select 1 from pg_constraint where conname='%s'" "$obj" ;;
     function)   printf "select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public' and p.proname='%s'" "$obj" ;;
     policy)     printf "select 1 from pg_policies where schemaname='public' and policyname='%s' and tablename='%s'" "${obj%% ON *}" "${obj##* ON }" ;;
+    no_table)   printf "select 1 where to_regclass('public.%s') is null and exists (select 1 from information_schema.columns where table_schema='public' and table_name='cron_run_log' and column_name='tool_calls')" "$obj" ;;
     *) return 1 ;;
   esac
 }
@@ -1132,7 +1172,7 @@ apply_migrations() {
     [ "$applied" = "1" ] && { log "migration already applied: $base"; continue; }
     # A CI-flagged destructive migration is refused unless explicitly allowed —
     # mirrors the old "destructive drizzle-kit push fails loudly" safety.
-    if head -n 6 "$f" | grep -q 'REQUIRES-REVIEW'; then
+    if is_review_delta "$f"; then
       if [ "${ALLOW_DESTRUCTIVE_MIGRATION:-}" != "1" ]; then
         die "migration $base is flagged REQUIRES-REVIEW (potentially destructive —
   DROP / type narrowing). Review $f and take a backup, then re-run with
@@ -1208,7 +1248,7 @@ list_pending_destructive() {
     [ -n "$f" ] || continue
     base=$(basename "$f")
     is_migration_applied "$base" && continue
-    if head -n 6 "$f" | grep -q 'REQUIRES-REVIEW'; then printf '%s\n' "$f"; fi
+    if is_review_delta "$f"; then printf '%s\n' "$f"; fi
   done 3< <(migration_files_through "$target")
 }
 

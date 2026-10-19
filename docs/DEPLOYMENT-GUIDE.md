@@ -6,11 +6,14 @@ app image (Part B). In both, zero data loss is verified by the scripts, never
 assumed. Written for the operator with SSH and sudo on the VM; every command
 runs from the package directory and every script prints `--help`.
 
-The companion `docs/RELEASE-UPGRADE-RUNBOOK.md` is Part B §4.1 written for
-the current move: a VM at db 1.41.0 rolled to `nxpi:latest` and db 1.42.0
-(one additive column, still `update.sh`). Earlier runbooks: the image-only roll
-to `2a22ae7c9` at `git show 4df2d18:docs/RELEASE-UPGRADE-RUNBOOK.md`, the
-1.15.0 → 1.41.0 window at `git show 00bb498:docs/RELEASE-UPGRADE-RUNBOOK.md`.
+The companion `docs/RELEASE-UPGRADE-RUNBOOK.md` is Part B §4.2 written for
+the current move: a VM at db 1.42.0 taken to `nxpi:sha-9bd2039` and db 1.54.0
+in a maintenance window — twelve deltas, four of them forward-only and gated by
+this package. Earlier runbooks: 1.41.0 → 1.42.0 at
+`git show 8435119:docs/RELEASE-UPGRADE-RUNBOOK.md` (with the `57efccedd` note
+at `7838a3f`), the image-only roll to `2a22ae7c9` at
+`git show 4df2d18:docs/RELEASE-UPGRADE-RUNBOOK.md`, the 1.15.0 → 1.41.0 window
+at `git show 00bb498:docs/RELEASE-UPGRADE-RUNBOOK.md`.
 
 ## 1. Which path am I on?
 
@@ -19,7 +22,7 @@ to `2a22ae7c9` at `git show 4df2d18:docs/RELEASE-UPGRADE-RUNBOOK.md`, the
 | No VM yet, or an empty database | Part A | `./install.sh` | none |
 | Already at the newest shipped `db/<version>`, only a newer image build to roll | Part B §4.1 | `./update.sh` | seconds |
 | One additive release behind (no `REQUIRES-REVIEW` delta pending) | Part B §4.1 | `./update.sh` | seconds |
-| Several releases behind, or any pending delta is `REQUIRES-REVIEW` (1.26.0, 1.29.0, 1.35.0 today) | Part B §4.2 | `./upgrade-release.sh` | minutes, announced |
+| Several releases behind, or any pending delta is `REQUIRES-REVIEW` (1.26.0, 1.29.0, 1.35.0; package-gated 1.46.0, 1.50.0, 1.51.0, 1.54.0) | Part B §4.2 | `./upgrade-release.sh` | minutes, announced |
 | Old package checkout in another directory | README, *Migrating from a legacy checkout* | `./migrate-legacy-deployment.sh` | minutes |
 
 `./discover.sh` tells you which row you are in: it prints the pending delta
@@ -62,16 +65,16 @@ script from this package. That is what makes every guarantee checkable.
                            LLM keys         in caddy-data)      off the VM
 ```
 
-**Components (package `main` after 8435119; app `main` 57efccedd, 2026-10-05)**
+**Components (package with `db/1.54.0`; app `main` 9bd203913, 2026-10-14)**
 
 | Piece | Value | Why it matters |
 |---|---|---|
 | App image | `ghcr.io/negentrophi/nxpi` (`latest`, `sha-<short>`, `X.Y.Z`); `nxpi_dev` is frozen | pin `tag@sha256:…`; an `.env` naming `nxpi_dev` never updates again |
-| Deployed build | `nxpi:sha-cb44bba@sha256:1a615b98…868af9`, linux/amd64 | needs `TRUSTED_PROXY_MODE=xff` in `.env.app` to boot; `/api/health/deep` wants `METRICS_TOKEN` |
-| Next build | `nxpi:latest` = app `57efccedd` (`sha-57efcce`, `sha256:0394839f…4aa34d3e`): PDF delivery modes (worker fixed in `18816f6a2`), large spreadsheets, RAG skip reasons, workflow Generate/Edit with AI, Files node, calendar triggers, execution-center actions; needs **db 1.42.0**, no new migration since `cd1397249` | `update.sh` with `DB_VERSION=1.42.0` set in the same edit; never roll `aa7534c7b` (broken PDF worker). Files node local folders are opt-in: `WORKFLOW_LOCAL_FILE_ROOTS` + a read-only bind mount (see `.env.app.example`, `docker-compose.yml`) |
-| Database | PostgreSQL 17 + pgvector; newest shipped `db/1.42.0` (= app migration 0043) | `DB_VERSION` is authoritative for every non-`X.Y.Z` tag |
+| Deployed build | `nxpi:sha-57efcce@sha256:0394839f…4aa34d3e` at db 1.42.0 (or `sha-cb44bba` at 1.41.0/1.42.0), linux/amd64 | needs `TRUSTED_PROXY_MODE=xff` in `.env.app` to boot; `/api/health/deep` wants `METRICS_TOKEN` |
+| Next build | `nxpi:sha-9bd2039@sha256:cbacdbe4…f07969d2` (= `latest` on 2026-10-14): knowledge folder uploads + OCR on by default, Marketplace-only KB sharing, prompt library, org-governed tool access (ADR-0124), code runner (ADR-0125, **not packaged**); needs **db 1.54.0** | `upgrade-release.sh` in a window (four forward-only deltas); never `update.sh`. No new env var is needed to boot; JS/Python/bash/deck tools are withheld without a runner |
+| Database | PostgreSQL 17 + pgvector; newest shipped `db/1.54.0` (= app migration 0055) | `DB_VERSION` is authoritative for every non-`X.Y.Z` tag |
 | Bookkeeping | marker `public.deploy_schema_migrations`, one row per applied delta | pending set = shipped deltas minus marker rows; never guess it |
-| Roll-forward-only | 1.3.0, 1.9.0, 1.26.0, 1.29.0, 1.35.0 (`REQUIRES-REVIEW` in the first lines) | old image cannot serve the schema afterwards; rollback = restore the bundle |
+| Roll-forward-only | 1.3.0, 1.9.0, 1.26.0, 1.29.0, 1.35.0 (`REQUIRES-REVIEW` in the first lines); 1.46.0, 1.50.0, 1.51.0, 1.54.0 (gated by `PACKAGE_REVIEW_VERSIONS` in `lib.sh` — upstream files are unmarked) | old image cannot serve the schema afterwards, or the data change cannot be undone; rollback = restore the bundle |
 | Row-level security | forced on 26+ tables since 1.29.0 | sweeps need the BYPASSRLS role `neogen_priv` |
 | Uploads rule | since 1.36.0 + this image, a file with no `thread_attachment` row answers 404 (except `uploads/shared/`) | `discover.sh` inventories them; nothing catalogs for you |
 | Compose project | `neogen`; volumes `neogen_postgres-data`, `neogen_postgres-wal`, `neogen_redis-data`, `neogen_uploads-data`, `neogen_caddy-data` | Docker-managed on the OS disk by default; dedicated disks opt-in |
@@ -128,7 +131,7 @@ cp .env.example .env && nano .env
 | Key | Set to | Notes |
 |---|---|---|
 | `APP_IMAGE` | `ghcr.io/negentrophi/nxpi:sha-<short>@sha256:<digest>` | tag + digest: readable and immutable |
-| `DB_VERSION` | the release matching the image (`1.42.0` for `latest` today) | must be a folder under `db/` |
+| `DB_VERSION` | the release matching the image (`1.54.0` for `latest` today) | must be a folder under `db/` |
 | `BETTER_AUTH_URL` | IP mode: leave the placeholder (auto-filled). Domain mode: `https://your.domain` | exact match with what browsers use |
 | `SITE_ADDRESS` | domain mode only | turns on auto-HTTPS; mismatch with `BETTER_AUTH_URL` is refused |
 | `SUPER_ADMIN_EMAIL` | your address | change before the first run |

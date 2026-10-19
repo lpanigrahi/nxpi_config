@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
 # rehearsal.sh — the end-to-end proof, on local Docker, that upgrade-release.sh
-# takes a 1.15.0-shaped deployment with REAL-LOOKING data to 1.41.0 + the new
+# takes a 1.15.0-shaped deployment with REAL-LOOKING data to 1.54.0 + the new
 # image with zero data loss, and that --rollback brings it back byte-for-byte.
 #
-#   tests/rehearsal.sh [--old-image REF] [--new-image REF] [--from 1.15.0] [--to 1.41.0]
+#   tests/rehearsal.sh [--old-image REF] [--new-image REF] [--from 1.15.0] [--to 1.54.0]
 #                      [--http-port 18080] [--https-port 18443] [--project neogen-rehearsal]
 #                      [--dir DIR] [--skip-rollback] [--keep] [--force-clean]
 #
@@ -29,8 +29,8 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PKG=$(cd -- "$HERE/.." && pwd)
 
 OLD_IMAGE="ghcr.io/negentrophi/nxpi_dev:latest"
-NEW_IMAGE="ghcr.io/negentrophi/nxpi:sha-cb44bba"
-FROM=1.15.0; TO=1.41.0; HTTP=18080; HTTPS=18443; PROJECT=neogen-rehearsal; DIR=""
+NEW_IMAGE="ghcr.io/negentrophi/nxpi:sha-9bd2039"
+FROM=1.15.0; TO=1.54.0; HTTP=18080; HTTPS=18443; PROJECT=neogen-rehearsal; DIR=""
 SKIP_ROLLBACK=false; KEEP=false; FORCE_CLEAN=false
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -153,7 +153,12 @@ cnt() { awk -F'\t' -v t="$1" '$1==t{print $2}' "$S/counts.$2"; }
 # ── (d) the upgrade ──────────────────────────────────────────────────────────
 phase "(d) upgrade-release.sh → $TO on $NEW_PINNED"
 TU=$(date +%s)
-./upgrade-release.sh --yes --target "$TO" --image "$NEW_PINNED" --accept-uncataloged-uploads --ack DROP-AGENT-MEMORY > "$DIR/upgrade.log" 2>&1; URC=$?
+# Every typed ack the seed provokes on the way to $TO (an unused ack is ignored).
+REH_ACKS="--ack DROP-AGENT-MEMORY"
+ver_le 1.46.0 "$TO" && REH_ACKS="$REH_ACKS --ack PRIVATIZE-KB-SHARES"
+ver_le 1.54.0 "$TO" && REH_ACKS="$REH_ACKS --ack DROP-ORG-LABELS"
+# shellcheck disable=SC2086
+./upgrade-release.sh --yes --target "$TO" --image "$NEW_PINNED" --accept-uncataloged-uploads $REH_ACKS > "$DIR/upgrade.log" 2>&1; URC=$?
 echo "  upgrade-release.sh exit $URC in $(( $(date +%s) - TU ))s (log: $DIR/upgrade.log)"
 [ "$URC" = "0" ] || { grep -E '✖|FAIL|!!|BLOCK|warn|⚠' "$DIR/upgrade.log" | tail -n 30; }
 t "upgrade exits 0" "0" "$URC"
@@ -194,7 +199,18 @@ t "agent_memory dropped"                "" "$(psql_scalar "select 1 from informa
 t "document_chunk FK is CASCADE"        "c" "$(psql_scalar "select confdeltype from pg_constraint where conname='document_chunk_organization_id_organization_id_fk'")"
 t "RLS forced on ≥ 26 tables"           "t" "$(psql_scalar "select (select count(*) from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and c.relforcerowsecurity) >= 26")"
 t "thread_attachment.thread_id nullable" "YES" "$(psql_scalar "select is_nullable from information_schema.columns where table_name='thread_attachment' and column_name='thread_id'")"
-t "24 new tables, 1 gone"               "24 1" "$(echo "$(comm -13 "$S/tables.pre" "$S/tables.post" | grep -c .) $(comm -23 "$S/tables.pre" "$S/tables.post" | grep -c .)")"
+# The expected table delta is read off the two shipped schemas (24 new / 1 gone
+# for 1.15.0 → 1.41.0; 30 / 2 for → 1.54.0) — the live catalog must match them.
+schema_tables() { grep -oE '^CREATE TABLE public\.[a-z_0-9]+' "$PKG/db/$1/schema.sql" | sed 's/.*\.//' | sort -u; }
+WANT_TBL="$(comm -13 <(schema_tables "$FROM") <(schema_tables "$TO") | grep -c .) $(comm -23 <(schema_tables "$FROM") <(schema_tables "$TO") | grep -c .)"
+t "table delta matches the shipped schemas ($WANT_TBL)" "$WANT_TBL" "$(echo "$(comm -13 "$S/tables.pre" "$S/tables.post" | grep -c .) $(comm -23 "$S/tables.pre" "$S/tables.post" | grep -c .)")"
+if ver_le 1.54.0 "$TO"; then
+  t "1.46.0: approved org share is a published listing" "published" "$(psql_scalar "select status from marketplace_listing where resource_type='knowledge_pack' and resource_id='40000000-0000-4000-8000-000000000001'")"
+  t "1.46.0: pending org share went private"   "private" "$(psql_scalar "select visibility from knowledge_base where id='40000000-0000-4000-8000-000000000002'")"
+  t "1.50.0: prompt category is 'user'"        "user"    "$(psql_scalar "select category from prompt_template where id='80000000-0000-4000-8000-000000000001'")"
+  t "1.54.0: org_user_label dropped"           ""        "$(psql_scalar "select to_regclass('public.org_user_label')")"
+  t "1.54.0: platform label survives"          "1"       "$(psql_scalar "select count(*) from user_access_label where id='81000000-0000-4000-8000-000000000001'")"
+fi
 t "uploads bytes identical"             "yes" "$(cmp -s "$S/uploads.pre" "$S/uploads.post" && echo yes || echo no)"
 t "app runs the new digest"             "${NEW_DIGEST#*@}" "$(app_image_digest | sed 's/.*@//')"
 t "ingress ready on the new image"      "yes" "$(ingress_probe && echo yes || echo no)"

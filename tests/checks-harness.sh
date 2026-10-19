@@ -124,5 +124,26 @@ t "1.35.0 expects agent_memory gone"  "yes" "$(grep -qE $'^agent_memory\tgone\t'
 OUT=$(expect_rows_for $'migrate-1.16.0.sql')
 t "an additive-only set expects nothing" "" "$OUT"
 
+# ── 1.42.0 → 1.54.0: the package-gated deltas ───────────────────────────────
+SEL=$(checks_for_pending $'migrate-1.46.0.sql\nmigrate-1.53.0.sql\nmigrate-1.54.0.sql')
+t "1.46.0 pending selects the share checks"   "yes" "$(grep -qx 'p46_kb_shares_go_private' <<<"$SEL" && grep -qx 'p46_kb_shares_to_marketplace' <<<"$SEL" && echo yes || echo no)"
+t "1.53.0 pending selects the orphan check"   "yes" "$(grep -qx 'p53_run_orphan_threads' <<<"$SEL" && echo yes || echo no)"
+t "1.54.0 pending selects the label check"    "yes" "$(grep -qx 'p54_org_label_assignments' <<<"$SEL" && echo yes || echo no)"
+t "1.50.0 not pending → its check is skipped" "no"  "$(grep -qx 'p50_prompt_category_rewrites' <<<"$SEL" && echo yes || echo no)"
+STUB="p53_run_orphan_threads=3 p53_fk_validate_rows=10"
+run_checks report $'migrate-1.53.0.sql' >/dev/null
+t "orphan run→thread rows BLOCK 1.53.0" "yes" "$(grep -qx 'p53_run_orphan_threads' <<<"$CHECK_BLOCKERS" && echo yes || echo no)"
+STUB="p46_kb_shares_go_private=4 p46_kb_shares_to_marketplace=2 p54_org_label_assignments=7"
+run_checks report $'migrate-1.46.0.sql\nmigrate-1.54.0.sql' >/dev/null
+t "shares going private need PRIVATIZE-KB-SHARES" "yes" "$(grep -q '^p46_kb_shares_go_private PRIVATIZE-KB-SHARES 4$' <<<"$CHECK_ACKS" && echo yes || echo no)"
+t "dropped label assignments need DROP-ORG-LABELS" "yes" "$(grep -q '^p54_org_label_assignments DROP-ORG-LABELS 7$' <<<"$CHECK_ACKS" && echo yes || echo no)"
+t "neither is a blocker"                           ""    "$CHECK_BLOCKERS"
+OUT=$(expect_rows_for $'migrate-1.46.0.sql\nmigrate-1.50.0.sql\nmigrate-1.51.0.sql\nmigrate-1.54.0.sql')
+t "1.46.0 lets marketplace_listing grow" "yes" "$(grep -qE $'^marketplace_listing\tgrow\t' <<<"$OUT" && echo yes || echo no)"
+t "1.54.0's gone is printed after 1.51.0's shrink (last wins)" "gone" "$(awk -F'\t' '$1=="org_user_label"{k=$2} END{print k}' <<<"$OUT")"
+t "1.54.0 expects org_label gone" "yes" "$(grep -qE $'^org_label\tgone\t' <<<"$OUT" && echo yes || echo no)"
+OUT=$(expect_rows_for $'migrate-1.50.0.sql')
+t "1.50.0 alone (an UPDATE) expects no row-count change" "" "$OUT"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 exit $((FAIL > 0))

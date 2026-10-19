@@ -140,5 +140,16 @@ norm() { printf '%s\n' $1 | sort -V | tr '\n' ' ' | sed 's/ $//'; }
 if [ "$(norm "$FLAGGED")" = "$(norm "$EXPECT_FLAGGED")" ]; then ok_ "flagged set: ${FLAGGED:-(none)} — matches the expected set"
 else fail_ "flagged set is [${FLAGGED:-none}] but this file expects [${EXPECT_FLAGGED:-none}] — a new REQUIRES-REVIEW release must be added here deliberately (and documented in README)"; fi
 
+# 7. the package-gated releases (lib.sh PACKAGE_REVIEW_VERSIONS) are shipped
+#    folders whose delta does NOT already carry its own marker — a stale or
+#    redundant entry is a sign the upstream copy changed underneath it.
+for pv in $PACKAGE_REVIEW_VERSIONS; do
+  if [ ! -s "$DB/$pv/migrate-$pv.sql" ]; then
+    [ "$DB" = "$PKG/db" ] && fail_ "PACKAGE_REVIEW_VERSIONS names $pv, which ships no db/$pv/migrate-$pv.sql"
+  elif [ -n "$(review_marker_line "$DB/$pv/migrate-$pv.sql")" ]; then
+    fail_ "$pv is in PACKAGE_REVIEW_VERSIONS AND carries its own marker — drop it from the list and add it to EXPECT_FLAGGED"
+  else ok_ "$pv: gated by the package (PACKAGE_REVIEW_VERSIONS)"; fi
+done
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 exit $((FAIL > 0))

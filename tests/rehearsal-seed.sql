@@ -18,6 +18,9 @@
 --   knowledge base / documents / chunks   → the RAG corpus survives 0073's CASCADE change
 --   expired org_invite + expired session  → the expiry rows that exist at 1.15.0
 --   cron_job + ONE finished cron_run_log  → no duplicate 'running' rows (1.35.0 pre-check)
+--   an approved AND a pending org-shared KB → 1.46.0 lists one, privatises the other
+--   prompt_template category 'system'     → 1.50.0 rewrites it to 'user'
+--   one org_user_label assignment         → 1.51.0 repoints it, 1.54.0 drops it (DROP-ORG-LABELS)
 
 \set org    '17c3b09a-27d7-46cc-8756-604c9f033d93'
 \set admin  'a95df531-0ef4-4d3e-9c5c-ce373b5c0178'
@@ -65,6 +68,9 @@ INSERT INTO thread_attachment (id, thread_id, user_id, storage_key, filename, mi
 
 INSERT INTO knowledge_base (id, name, organization_id, user_id, visibility) VALUES
   ('40000000-0000-4000-8000-000000000001', 'Rehearsal KB', :'org', :'owner', 'org');
+-- 1.46.0 (0047): an org share still PENDING governance review goes private.
+INSERT INTO knowledge_base (id, name, organization_id, user_id, visibility, governance_status) VALUES
+  ('40000000-0000-4000-8000-000000000002', 'Rehearsal pending KB', :'org', :'owner', 'org', 'pending');
 INSERT INTO knowledge_documents (id, knowledge_base_id, source_key, source_filename, organization_id, user_id, chunk_count) VALUES
   ('41000000-0000-4000-8000-000000000001', '40000000-0000-4000-8000-000000000001', 'uploads/kb/handbook.txt', 'handbook.txt', :'org', :'owner', 2);
 INSERT INTO knowledge_base_document (knowledge_base_id, source_key) VALUES
@@ -88,3 +94,12 @@ INSERT INTO cron_job (id, name, schedule, user_id, organization_id, target_type,
   ('70000000-0000-4000-8000-000000000001', 'Rehearsal nightly', '0 3 * * *', :'owner', :'org', 'workflow', NULL);
 INSERT INTO cron_run_log (id, cron_job_id, status, finished_at, duration_ms) VALUES
   ('71000000-0000-4000-8000-000000000001', '70000000-0000-4000-8000-000000000001', 'success', now(), 1200);
+
+-- 1.50.0 (0051) overwrites the category; 1.51.0 (0052) repoints the label
+-- assignment and 1.54.0 (0055) drops it — the acked losses on a 1.54.0 target.
+INSERT INTO prompt_template (id, organization_id, name, slug, template, category, created_by) VALUES
+  ('80000000-0000-4000-8000-000000000001', :'org', 'Rehearsal prompt', 'rehearsal-prompt', 'Summarise {{text}}', 'system', :'owner');
+INSERT INTO user_access_label (id, name, created_by) VALUES
+  ('81000000-0000-4000-8000-000000000001', 'Rehearsal label', :'admin');
+INSERT INTO org_user_label (id, organization_id, user_id, label_id, updated_by) VALUES
+  ('82000000-0000-4000-8000-000000000001', :'org', :'member', '81000000-0000-4000-8000-000000000001', :'admin');

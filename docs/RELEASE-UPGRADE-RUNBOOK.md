@@ -1,378 +1,327 @@
-# Release upgrade runbook — db 1.41.0 → 1.42.0 with `ghcr.io/negentrophi/nxpi:latest`
+# Release upgrade runbook — db 1.42.0 → 1.54.0 with `ghcr.io/negentrophi/nxpi:sha-9bd2039`
 
-An Azure VM at database release **1.41.0** (running
-`ghcr.io/negentrophi/nxpi:sha-cb44bba@sha256:1a615b98…868af9`, or the
-`2a22ae7c9` document-tools build if the previous roll was done) moves to the
-newest app build, **`ghcr.io/negentrophi/nxpi:latest`**, and to database
-release **1.42.0**. The one pending delta is additive (one nullable column),
-so this is still a rolling update driven by `./update.sh`, with seconds of
-downtime. You do not need a maintenance window or `upgrade-release.sh`.
+An Azure VM at database release **1.42.0** (running
+`ghcr.io/negentrophi/nxpi:sha-57efcce@sha256:0394839f…4aa34d3e`, or the
+`sha-cb44bba` / `cd1397249` builds) moves to the newest app build,
+**`ghcr.io/negentrophi/nxpi:sha-9bd2039@sha256:cbacdbe481d99c7b249ec81bf858420e27e546e36ab5e00940418c62f07969d2`**
+(= `latest` on 2026-10-14), and to database release **1.54.0**.
 
-What is different from the last roll: **the package must be updated on the VM
-first** (it now ships `db/1.42.0/`), and **`DB_VERSION` moves to `1.42.0` in
-the same edit as `APP_IMAGE`**.
+This is **not** a rolling update. Twelve deltas are pending; four of them
+(1.46.0, 1.50.0, 1.51.0, 1.54.0) rewrite or drop data that only the
+pre-upgrade dump can bring back, and two (1.48.0, 1.53.0) hold write locks for
+as long as their tables take. Upstream labels every one of them
+`Route: ./update.sh`; this package gates the four as REQUIRES-REVIEW
+(`PACKAGE_REVIEW_VERSIONS` in `lib.sh`), so `./update.sh` refuses the jump and
+the move runs as one **maintenance window** driven by `./upgrade-release.sh`.
+
+A host still **below** 1.42.0 (for example one that never completed the
+1.15.0 → 1.41.0 window) takes the same window with the same target; its
+pending set then also carries 1.26.0, 1.29.0 and 1.35.0, so do that runbook's
+preparation as well (`git show 00bb498:docs/RELEASE-UPGRADE-RUNBOOK.md` §3–§4:
+privileged pool, uploads inventory, `DROP-AGENT-MEMORY`).
 
 Earlier runbooks are in git history:
-`git show 4df2d18:docs/RELEASE-UPGRADE-RUNBOOK.md` (1.41.0 → `latest`, image
-only) and `git show 00bb498:docs/RELEASE-UPGRADE-RUNBOOK.md` (the 1.15.0 →
-1.41.0 window).
+`git show 7838a3f:docs/RELEASE-UPGRADE-RUNBOOK.md` (1.41.0 → 1.42.0 with
+`latest` = `57efccedd`), `git show 4df2d18:…` (image-only roll) and
+`git show 00bb498:…` (the 1.15.0 → 1.41.0 window).
 
 ## 1. Analysis: what changed
 
 ### 1.1 Deployment package (`nxpi_dev/azure-deployment` → this repo)
 
-`tools/sync-from-app-copy.sh` against the app copy at `aa7534c7b` (`cd1397249`
-changes nothing in `azure-deployment/`):
+`tools/sync-from-app-copy.sh ../nxpi_dev/azure-deployment` (2026-10-19):
 
 | Item | Finding | Done here |
 |---|---|---|
-| `db/1.42.0/` | **new** (app commit `630753ae1`, 2026-10-02): `migrate-1.42.0.sql` (migration 0043), `schema.sql` = 1.41.0 + one column line, `seed.sql` with a 44-row journal stamp, `grants.sql` identical to 1.41.0 | copied verbatim; `tests/db-bundle-lint.sh` 327/327 |
-| `db/1.2.0` … `db/1.41.0` | 41 folders identical on both sides | none |
-| Scripts, compose, Caddyfile, `.env*.example`, README | **no change** in the app copy since `cb44bba`; the 17 files that differ are this package's own later fixes (report only, as before) | none |
-| `lib.sh` `SCHEMA_PROBES` | had no 1.42.0 sentinel | added `1.42.0 column thread_attachment.rag_skip_reason`; `tests/lib-harness.sh` 204/204 |
-| `.env.example`, README | still said `DB_VERSION=1.41.0` for `latest` | now `1.42.0`; README release table has the 1.42.0 row |
+| `db/1.43.0` … `db/1.54.0` | **new** (app migrations 0044–0055) | copied verbatim with `--apply`; `tests/db-bundle-lint.sh` 424/424 |
+| `db/1.2.0` … `db/1.42.0` | 42 folders identical on both sides | none |
+| Scripts, compose, Caddyfile, `.env*.example`, README | the 17 files that differ are this package's own later fixes; the app copy documents none of the new app variables | report only, as before |
+| Destructive-delta gate | none of the 12 new files carries a `REQUIRES-REVIEW` marker, so `./update.sh` would have applied 1.54.0's `DROP TABLE`s unasked | `PACKAGE_REVIEW_VERSIONS` + `is_review_delta` in `lib.sh` gate 1.46.0, 1.50.0, 1.51.0, 1.54.0 without editing the shipped SQL |
+| Pre-checks (`lib-checks.sh`) | nothing knew the new deltas | `p46_*`, `p48_*`, `p50_*`, `p51_*`, `p53_*`, `p54_*` checks; row-count allow-list for 1.46.0 / 1.51.0 / 1.54.0 |
+| `upgrade-db.sh` | no review notes past 1.35.0 | review notes for the four gated deltas |
+| `SCHEMA_PROBES` | stopped at 1.42.0 | rows for 1.43–1.45, 1.47–1.49, 1.52–1.54; 1.54.0 uses a new `no_table` kind (its only footprint is a drop); 1.46/1.50 (data only) and 1.51 (its objects die in 1.54) have none |
+| Tests | — | `lib-harness` 212, `checks-harness` 49, rehearsal seed + assertions extended to 1.54.0 |
 
-**Delta proof (local, pgvector:pg17).** Loading `db/1.41.0/schema.sql` and
-applying `migrate-1.42.0.sql` gives a schema byte-identical to
-`db/1.42.0/schema.sql` (`pg_dump -s` diff empty apart from pg_dump's random
-`\restrict` token). Running the delta a second time is a no-op
-(`ADD COLUMN IF NOT EXISTS`).
+**Delta proof (local, pgvector:pg17).** `db/1.42.0/schema.sql` plus the twelve
+deltas in order gives a catalog identical to `db/1.54.0/schema.sql` (the only
+difference is the three `GRANT … TO neo_gen` the 1.47/1.52 deltas issue
+themselves, which `grants.sql` asserts on every upgrade anyway). Every new
+probe reads absent on 1.42.0 and present after; every pre-check query runs
+against a 1.42.0 catalog.
 
-### 1.2 The 1.42.0 delta
+### 1.2 The twelve deltas
 
-```sql
-SET lock_timeout = '5s';
-ALTER TABLE thread_attachment ADD COLUMN IF NOT EXISTS rag_skip_reason text;
-```
+| Release | Migration | What it does | Risk |
+|---|---|---|---|
+| 1.43.0 | 0044 | 8 nullable `knowledge_base` ingestion-setting columns, `marketplace_install.installed_resource_id`, two CHECKs | additive |
+| 1.44.0 | 0045 | `marketplace_listing.metadata` jsonb | additive |
+| 1.45.0 | 0046 | `knowledge_base_attachment` + owner backfill | additive |
+| **1.46.0** | 0047 | knowledge bases shared only through the Marketplace (ADR-0120): an approved team/org/public share in an organization becomes a **published listing**; **every other direct share becomes private**, its previous audience not recorded | **gated** — ack `PRIVATIZE-KB-SHARES` when non-zero |
+| 1.47.0 | 0048 | `knowledge_upload_batch` / `_item` (RLS forced), 3 `knowledge_base_document` + 4 `org_storage_governance` columns, one index | additive; short write block on `knowledge_base_document` |
+| 1.48.0 | 0049 | three plain `CREATE INDEX` on `knowledge_base_document` / `ingestion_jobs`; `knowledge_base_folder` + backfill | **write lock for the build time** — sized by `p48_index_build_rows` |
+| 1.49.0 | 0050 | `prompt_template_comment` | additive |
+| **1.50.0** | 0051 | every `prompt_template.category` → `user` (ADR-0123) | **gated**; not undoable |
+| **1.51.0** | 0052 | `org_label` (RLS forced) copied from the platform labels each org uses; `org_user_label.label_id` repointed; unresolvable assignments **deleted**; FK added | **gated**; an older image cannot save member labels (23503) |
+| 1.52.0 | 0053 | `org_presentation_template` (RLS forced) | additive |
+| 1.53.0 | 0054 | `cron_run_log.tool_calls`, `orchestration_run.user_id` + FK + index; the run→thread FK becomes **ON DELETE CASCADE** and is validated in the same transaction | **write lock on `orchestration_run` / `chat_thread` through validation**; **blocks** on orphan `thread_id`s (`p53_run_orphan_threads`) |
+| **1.54.0** | 0055 | `DROP TABLE org_user_label, org_label` (ADR-0124 amendment: they were never enforced) | **gated**, roll-forward-only — ack `DROP-ORG-LABELS` when non-zero |
 
-- Nullable, no default, no backfill: a catalog-only change. The `ACCESS
-  EXCLUSIVE` lock on `thread_attachment` is held for milliseconds, and
-  `lock_timeout` bounds the wait for it.
-- It is not `REQUIRES-REVIEW`, so `update.sh` applies it before rolling the
-  app.
-- The new image names the column in **every** attachment status write. An
-  image from `630753ae1` or later on a 1.41.0 database fails those writes
-  (`42703`), and uploads stay `pending`. The boot sentinel names the missing
-  column. This is why `DB_VERSION` must move in the same edit as `APP_IMAGE`.
-- The **old** image ignores the column, so rollback to the old digest needs
-  no schema change (§6).
-- Like 1.40.0–1.41.0, the delta does not stamp the app's drizzle journal
-  (`AUTO_DB_MIGRATE=false`; the package marker `deploy_schema_migrations` is
-  the record).
+No new role, extension or `optional-*.sql`; `grants.sql` is byte-identical
+across 1.42.0–1.54.0; nothing touches `thread_attachment`, the privileged
+role or BYPASSRLS. Each delta starts `SET lock_timeout = '5s'` — that bounds
+the wait for a lock, not how long it is held. With the app stopped (window
+step 2) nothing competes for the locks.
 
-### 1.3 Application (`2a22ae7c9..cd1397249`, about 60 commits)
+### 1.3 Application (`57efccedd..9bd203913`, about 690 commits, 2026-10-05 → 2026-10-14)
 
-| Area | Change | Consequence for the VM |
-|---|---|---|
-| Attachments: PDF | every model now takes PDFs. Native models get them inline. Images-only models get server-rendered page images (`pdfjs-dist` + `@napi-rs/canvas` on worker threads, hard timeout). Text models get extracted text. Fail-soft. | CPU and memory per PDF go up on the app container. Watch it (§4.3) |
-| Attachments: spreadsheets | large workbooks are parsed on a worker thread. `readDocument` lists sheets with row counts, reads one sheet, gives whole-file overviews and row windows | new optional knobs `XLSX_WORKER_*`, `XLSX_SCAN_TIMEOUT_MS`, `RAG_XLSX_MAX_SHEET_ROWS`, `PDF_RENDER_WORKER_FILE`. **All have defaults; `.env.app` needs no change** |
-| RAG quota | an over-quota upload is refused **before** parsing and embedding. A file skipped for quota is labelled "document limit full", not "re-upload" (this is the 1.42.0 column) | users at `knowledge_max_docs_per_user` (default 100) get an honest message |
-| Documents | `readDocument` reads past 50k characters, pages losslessly, and extracts once across slices. Generated PDFs embed Unicode fonts (`Ø`, `≤`, `≥`) | none |
-| Agents and workflows | documents, retrieval, generated files and step budget on every agent path. Generated files carry through every workflow node, log, webhook and `workflow.failed`. No-tools scheduled agents get Documents only | none; regression-test agents and workflows (§5) |
-| Chat | lists the files a reply generated; thread titles come from what the user typed; dedupes repeated attachments | none |
-| Models | when an admin enables image input on a model, a **vision probe** sends one small image through the AI gateway to check it | one tiny billed model call per enable |
-| Dependencies and image | `@napi-rs/canvas`, `pdfjs-dist`, `@pdf-lib/fontkit`, `sharp` added. `next.config.ts` traces the worker modules, fonts and the native `.node` binary into the standalone output. From `18816f6a2` the image build also runs `scripts/verify-standalone-pdf-worker.mjs` in the runner stage. Runtime is `node:24-alpine` | re-run that script on the pulled image before rolling (§3 step 2) |
-| Compose, Caddy, secrets, env schema | no change | none |
-| Seeded skills | no change since `2a22ae7c9` | the seed gap from the previous roll remains (§5) |
+Verified from the published image (config labels `revision=9bd2039136…`,
+`version=1.2.0-main.9bd2039136`; Node 24.13.1; `CMD node server.js`; no
+Dockerfile change). The app checkout is 10 commits ahead of `origin`
+(bulk-import / ADR-0128) — **no published image carries them**; they are not
+part of this move.
 
-**PDF worker: fixed in `18816f6a2`, published as `latest` = `cd1397249`.**
-`aa7534c7b` built an image whose PDF worker could not load `pdfjs-dist` or
-`@napi-rs/canvas`. Every PDF job failed with `PdfRenderUnavailableError`.
-- **Why nothing caught it.** The worker reported ready, health checks passed
-  and CI was green, but a PDF sent to a model without native PDF input reached
-  it as "could not be converted for this model".
-- **The fix.**
-  - The worker resolves both packages from pnpm's store.
-  - pdfjs's entry file is now shipped.
-  - Canvas is loaded first, together with its globals.
-  - `docker/Dockerfile` runs `scripts/verify-standalone-pdf-worker.mjs` in
-    the runner stage, so a broken worker now fails the image build. The
-    script stays in the image for ops (§3 step 2).
-- **Checked on the published image** (`sha256:53241602…`):
-  `OK verify-standalone-pdf-worker: /app — extract 1 page, render 4427 B PNG`.
-  Driving the worker directly gives `extract OK text=["Hello nxpi"]` and
-  `render OK` (PNG).
-- **One harmless line.** pdfjs still prints `Warning: Cannot load
-  "@napi-rs/canvas" package` from its own directory. The worker supplies
-  canvas itself, as the render shows. The line is expected.
-- **Never roll `aa7534c7b` (`sha256:98abcdd2…`).**
+| Change | Operator consequence |
+|---|---|
+| **Code runner** (ADR-0125/0126): JS, Python, bash, `runTests` and `createPresentation` run only in a separate isolated service; the browser runtime is gone and bash no longer runs in the app | **this package does not ship the runner and no runner image is published**: those tools are withheld after the roll (the model is told so), org presentation-template uploads answer 503, `/api/health/deep` shows `codeRunner: not_configured` (not gating). `.env.app.example` "Code runner" |
+| **Org-governed tool access** (ADR-0124): `org_user_tool_permission` allows/denies become enforced at deploy (they were display-only) | an org allow of `bash-execution` / `browser-automation` now grants the tool; the composer's toolkit toggles no longer narrow tools. Inventory in §3 |
+| Knowledge folder uploads (ADR-0121): multipart into the uploads volume, own BullMQ queue `kbBatchIngestion` | runs inside `app` on the existing noeviction Redis; size the disk for large batches; `KB_*` knobs documented |
+| KB OCR and multimodal extraction **on by default** | tesseract language data is downloaded from its CDN on first use into the `/tmp` tmpfs (refetched after restarts); `KNOWLEDGE_OCR_LANG_PATH` for offline VMs |
+| Prompt library / sharing (ADR-0122/0123) | flags default OFF (`PROMPT_LIBRARY_V2`, `PROMPT_SHARING_V1`) |
+| Built-in skill bodies | the boot seed now refreshes built-in skill bodies still byte-identical to a shipped version (log: `refreshed N unmodified built-in skill body(ies)`); edited, pinned and attested rows are left alone |
+| `worker-main.js` | still a broken CJS bundle — irrelevant here (no worker service; `app` runs the background services) |
 
-`cd1397249` also carries one agents-list UI fix. Neither commit touches
-`azure-deployment/`, migrations, `.env.example` or compose.
+No new variable is needed to boot; `TRUSTED_PROXY_MODE` and `METRICS_TOKEN`
+are unchanged. `/api/metrics` gains two KB-ingest gauges.
 
-### 1.4 Application since the last analysis (`cd1397249..57efccedd`, 354 commits, 2026-10-03 → 2026-10-05)
+### 1.4 Calls made for this release (review them)
 
-`latest` moved again on 2026-10-05 (16:19 UTC). It is built from `57efccedd`,
-the head of app `main`, and is also published as `sha-57efcce` and
-`1.2.0-main.57efccedd`; index digest
-`sha256:0394839f61f99ba05da234a54683e7885a7cd5d3b8c861a95a84bbbb4aa34d3e`.
-`630753ae1` and `18816f6a2` are ancestors, so everything in §1.2 and §1.3
-still holds: the image needs **db 1.42.0** and its PDF worker is the fixed one.
-
-**What did not change.** No migration: the app journal still ends at 0043 =
-`db/1.42.0`. `schema.pg.ts` gains two optional keys inside existing `json`
-columns (`cron_job.config.calendar`, `cron_run_log.token_usage.totalTokens`),
-which is no DDL and nothing for the package. The permission catalog,
-`azure-deployment/`, `docker/Dockerfile`, compose, Caddy, secrets and the
-runtime dependency list are unchanged (`tools/sync-from-app-copy.sh`: 42
-bundles identical, scripts differ only by this package's own fixes). The
-354 commits are the workflow canvas, the scheduler and the execution center,
-plus their tests.
-
-| Area | Change | Consequence for the VM |
-|---|---|---|
-| Workflow **Files node** | new node that reads files from SharePoint (as the run user, through Graph), from an organization's Azure Blob connector, or (ADR-0118) from an **allow-listed folder on the app server**. Every fetched file takes the upload path (MIME allow-list, magic bytes, storage governance, quota) and lands in `uploads` with a `thread_attachment` row | Off by default twice: the organization's **Workflow file inputs** switch (Organizations → Settings), and for the local-folder source `WORKFLOW_LOCAL_FILE_ROOTS` in `.env.app` **plus** a read-only bind mount of that folder into `app` (commented block in `docker-compose.yml`). Every org with the switch on can read everything under the roots. Fetched files consume storage quota and the uploads volume |
-| Delegated Graph scope | `GRAPH_DELEGATED_FILES_SCOPE` (default `https://graph.microsoft.com/Sites.Read.All`) is the scope the Files node redeems for SharePoint. Needs admin consent on the Microsoft registration; the run user must have signed in with Microsoft | none unless the SharePoint source is used; documented in `.env.app.example` |
-| Generate / Edit with AI | `POST /api/workflow/ai` drafts a workflow, `/api/workflow/<id>/ai-edit` proposes a validated change set, `/api/agent/ai` refines an agent. Blocked prompt injection and a declining model are shown as notices | billed model calls for the editor, through the normal gateway; nothing to configure |
-| Scheduler | calendar schedules compiled to cron (the choice is stored beside the cron in the job config); targets picked by name; a new trigger does not fire for a tick before it existed; event triggers only see their own org's events; a trigger whose owner left the org stops; a deleted workflow retires its synced triggers; scheduled runs bypass the response cache | none; existing cron rows are read as before |
-| Execution center | real token counts (summed in SQL); per-run Output tab and report downloads; cancel a queued or waiting run; **delete finished runs** (single and bulk); edit-and-rerun; AI diagnosis of a failed run | run deletion is user-driven data removal, with the backup as the only recourse. Raw-query timestamps are now read as UTC (the container already runs UTC, so no visible change here) |
-| Tool node | Multiple-tools mode runs a metered LLM tool loop over a toolset; `createPdfDocument` is available to Tool nodes | more tokens per run on such workflows |
-| Validators and engine | cyclic graphs refused before compile; the graph is validated on the server before publishing (ADR-0117) through one publish gate; long waits chunked so `setTimeout` never overflows; file references re-gated at every scheduled run; an over-window LLM prompt is refused instead of trimmed | a workflow that was published while invalid may fail to re-publish until it is fixed. Regression-test (§5) |
-| MCP | files a stdio server writes into a workdir subfolder are captured; tool-name matches rank above description matches in discovery | none |
-| Node guide, i18n | a guide for all 52 node kinds (en, hi); translated node labels | none |
-
-**Image tag.** The runbook uses the label `latest`. Before anything is rolled,
-§3 checks that `latest` was built from `630753ae1` or later (and, for working PDF conversion, `18816f6a2`
-or later: `cd1397249` on 2026-10-03, `57efccedd` from 2026-10-05, see §1.4).
-`update.sh` records the running **digest** as its rollback reference, so the
-moving tag does not weaken rollback.
+- **Ship without the code runner.** Packaging it means building and
+  publishing a runner image (none exists) and merging the app repo's
+  `compose.code-runner.yml` overlay; that is its own release. Tell users that
+  JS/Python/bash/deck generation are unavailable on this VM until then.
+- **Gate in the package, not in the SQL.** The shipped folders stay
+  byte-identical to the app copy so the sync tool keeps reporting real drift.
+- **1.48.0 and 1.53.0 are not gated** (nothing is lost and the old image runs
+  on them); the window covers their locks, and `p53_run_orphan_threads` blocks
+  the run before anything is written.
 
 ## 2. Scope and guarantees
 
-| Data | Effect of this update | Proof |
+| Data | Effect | Proof |
 |---|---|---|
-| Database rows | none changed. One nullable column added (NULL on every existing row) | `update.sh` safety dump; marker ends at `migrate-1.42.0.sql`; `schema-parity.sh 1.42.0` |
-| Uploaded files | none | untouched volume |
-| Sessions, secrets, credentials | none | secrets never regenerated; sign-in check |
-| Downtime | one container recreate plus the health gate | `update.sh` 300 s gate through the ingress |
+| Users, orgs, chats, messages, uploads, documents, chunks, grants | unchanged | window step 10: row counts against the printed allow-list; uploads bytes compared |
+| Knowledge-base shares | approved ones become Marketplace listings; the rest become private | `p46_*` counts in the dry run; `PRIVATIZE-KB-SHARES` ack |
+| Prompt categories | all `user` | `p50_prompt_category_rewrites` count |
+| Org label assignments (not platform labels) | **dropped** | `p54_org_label_assignments` count; `DROP-ORG-LABELS` ack; allow-list `gone` |
+| Secrets, sessions, credentials | unchanged | secrets never regenerated; sign-in probes |
+| Downtime | stop → bundle → parity → scratch rehearsal → migrate → roll → verify | ≈ 8 min on seed data (§4 step 6); plan ≥ 2× plus the lock steps |
 
-Rollback does **not** restore a bundle. The old image runs on the 1.42.0
-schema, so rolling back means running the previous image digest again (§6).
+Rollback restores the **bundle** (dump + uploads + config) taken in the
+window, never just the old image: after 1.54.0 the old image fails on the
+labels routes, and 1.46.0/1.50.0 cannot be undone in place.
 
-## 3. Before you start (T-1 hour)
+## 3. Prerequisites (T-7 days)
 
-Run on the VM from the package directory (`~/nxpi_config`, or
-`/nxpi/nxpi_config` on `neogen-nayara`). Do the whole runbook on
-**`neogen-nayara` first**, and only then on `neogen-vm`.
+- [ ] **The image is pullable from the VM** and is the reviewed build:
+  ```bash
+  docker manifest inspect ghcr.io/negentrophi/nxpi:sha-9bd2039 >/dev/null && echo pullable
+  docker pull ghcr.io/negentrophi/nxpi:sha-9bd2039@sha256:cbacdbe481d99c7b249ec81bf858420e27e546e36ab5e00940418c62f07969d2
+  docker image inspect ghcr.io/negentrophi/nxpi:sha-9bd2039 --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+  # 9bd2039136ae23c57977c147ee836ac2b5ea59bf
+  ```
+  If `latest` has moved past `9bd203913` by the window, either stay on this
+  pin or redo §1.3 for the new range (`git -C <nxpi_dev> diff --stat 9bd203913..<rev> -- azure-deployment src/lib/db/migrations .env.example docker`) — a new `db/<version>` means another sync first.
+- [ ] **This package revision is on `origin`** (branch `feat/db-1.54-upgrade`
+  merged to `main` and pushed; `neogen-nayara` gets a git bundle).
+- [ ] **Tell the people affected, before the window** — the deltas change
+  what they see, and the dry run (T-1) gives the exact numbers:
+  - owners of directly shared knowledge bases that are not approved (they go private; re-share through the Marketplace after the window);
+  - org admins using org-scoped user labels (the assignments are dropped; platform labels stay);
+  - users of JS/Python/bash/deck generation (withheld until a code runner is packaged).
+- [ ] **ADR-0124 inventory** — which org tool rules start enforcing (read-only,
+  `./compose.sh exec -T postgres psql -U neogen_admin -d neogen`):
+  ```sql
+  SELECT organization_id, user_id, allowed_tools, denied_tools
+    FROM org_user_tool_permission
+   WHERE cardinality(allowed_tools) > 0 OR cardinality(denied_tools) > 0;
+  SELECT organization_id, user_id FROM org_user_tool_permission
+   WHERE allowed_tools && ARRAY['bash-execution','browser-automation'];
+  ```
+  Clear anything that should not start granting a tool **before** the window.
+- [ ] **Record the VM's current image digest** (rollback image; rehearsal start):
+  `./compose.sh ps -q app | xargs docker inspect --format '{{index .RepoDigests 0}}'`.
+- [ ] **Copy `secrets/` off the VM** (it is in no backup):
+  `tar czf - secrets .env .env.app | gpg -c > nxpi-secrets-$(date +%F).tgz.gpg`, then move it off the machine.
+- [ ] **Tooling rehearsal passed** on a workstation (done for this package
+  revision, §4 step 6): `bash tests/rehearsal.sh --force-clean` — 1.15.0 →
+  1.54.0 on the new image, including the rollback half, must end `0 failed`.
+  The in-window rehearsal (step 5) repeats the migration on the VM's real dump.
 
-1. **`latest` is the new build.**
+## 4. VM preparation (T-1 day)
+
+Read-only for the database.
+
+1. **Get the package revision onto the VM** (`git status --porcelain` must be
+   empty; `.env`, `.env.app`, `secrets/`, `backups/` are gitignored):
    ```bash
-   docker pull ghcr.io/negentrophi/nxpi:latest       # pull only; the running container is untouched
-   docker image inspect ghcr.io/negentrophi/nxpi:latest --format \
-     '{{index .RepoDigests 0}}  rev={{index .Config.Labels "org.opencontainers.image.revision"}}'
+   cd ~/nxpi_config            # /nxpi/nxpi_config on neogen-nayara
+   git fetch origin && git checkout main && git pull
+   ls db | sort -V | tail -1                               # 1.54.0
+   bash tests/lib-harness.sh && bash tests/db-bundle-lint.sh && bash tests/checks-harness.sh   # all "0 failed"
    ```
-   On a machine with the app checkout, confirm the revision contains the
-   column change:
+   `./install.sh` is **not** needed: no compose service, secret or required
+   `.env.app` key changed since 1.42.0. (A host coming from below 1.41.0 runs
+   it per the 00bb498 runbook.)
+2. **The VM is at the release it claims.**
    ```bash
-   git -C <nxpi_dev> merge-base --is-ancestor 18816f6a2 <rev> && echo OK   # implies 630753ae1
+   grep -E '^(DB_VERSION|APP_IMAGE|POSTGRES_PRIVILEGED_URL_FILE)=' .env   # DB_VERSION=1.42.0
+   ./schema-parity.sh 1.42.0
+   ./provision-privileged-role.sh --check                                 # five ok lines
    ```
-   - If it is not `OK`, CI has not published the new build yet. Stop and try
-     again later.
-   - Expected from 2026-10-05: `rev=57efccedd…`, index digest
-     `sha256:0394839f61f99ba05da234a54683e7885a7cd5d3b8c861a95a84bbbb4aa34d3e`
-     (same build as the `sha-57efcce` tag; analysed in §1.4). The previous
-     build, `rev=cd1397249…` / `sha256:53241602…ace12f1e`, is also fine to
-     roll; it lacks only §1.4's features.
-   - If `<rev>` is later than `57efccedd`, run
-     `git -C <nxpi_dev> diff --stat 57efccedd..<rev> -- azure-deployment src/lib/db/migrations src/lib/db/pg/schema.pg.ts .env.example docker next.config.ts`
-     and repeat §1's checks. In particular, a newer `db/<version>` means you
-     sync the package again first.
-   - **Write the digest down.**
-
-2. **The PDF worker works in the image as shipped** (read-only, a throwaway
-   container). The image carries its own check:
+3. **Discovery**: `./discover.sh` must end `READY`, with
+   `REQUIRES-REVIEW pending: migrate-1.46.0.sql migrate-1.50.0.sql migrate-1.51.0.sql migrate-1.54.0.sql`.
+4. **Dry run** (pulls the image, runs every pre-check, prints the review notes
+   and the row-count allow-list; changes nothing):
    ```bash
-   docker run --rm --entrypoint node ghcr.io/negentrophi/nxpi:latest \
-     scripts/verify-standalone-pdf-worker.mjs
-   # OK verify-standalone-pdf-worker: /app — extract 1 page, render <n> B PNG
+   ./upgrade-release.sh --dry-run --target 1.54.0 \
+     --image ghcr.io/negentrophi/nxpi:sha-9bd2039@sha256:cbacdbe481d99c7b249ec81bf858420e27e546e36ab5e00940418c62f07969d2 \
+     2>&1 | tee backups/dryrun-1.54.0-$(date +%Y%m%d-%H%M).log
    ```
-   The pdfjs `Warning: Cannot load "@napi-rs/canvas"` line above the `OK` is
-   expected (§1.3).
-   - `Cannot find module …/verify-standalone-pdf-worker.mjs`: the build
-     predates `18816f6a2`. Do not roll it.
-   - Any other failure: do not roll it; report it against the app build.
+   Read the pre-check block and resolve every line:
 
-3. **Record the running digest** (the rollback reference):
-   ```bash
-   ./compose.sh ps -q app | xargs docker inspect --format '{{index .RepoDigests 0}}'
+   | Line | Meaning | Do |
+   |---|---|---|
+   | `BLOCK p53_run_orphan_threads N` | runs pointing at deleted chat threads — 1.53.0's validation would abort | list them (the sample is printed); null their `thread_id` or delete the runs in the product **with the owner's agreement**; re-run the dry run |
+   | `ACK p46_kb_shares_go_private N` | N shares will go private | confirm with the owners (§3), then pass `--ack PRIVATIZE-KB-SHARES` |
+   | `ACK p54_org_label_assignments N` | N org label assignments are dropped | confirm with the org admins, then pass `--ack DROP-ORG-LABELS` |
+   | `info p46_kb_shares_to_marketplace N` | N shares become published listings | none |
+   | `info p50_prompt_category_rewrites N` | N prompt categories become `user` | none (the dump keeps the old values) |
+   | `info p51_label_assignments_unresolvable N` | assignments whose platform label is gone | none (1.54.0 drops them anyway) |
+   | `info p48_index_build_rows`, `p53_fk_validate_rows` | rows the lock-holding steps scan | budget the window (step 6) |
+
+   Expected tail: `Dry run complete`, 12 pending files, disk verdict `ok`,
+   `typed acks required` listing exactly the words you will pass.
+5. **Record what will change** — paste into the ops log, run read-only:
+   ```sql
+   SELECT visibility, governance_status, organization_id IS NULL AS no_org, count(*)
+     FROM knowledge_base WHERE visibility IN ('team','org','public') GROUP BY 1,2,3;
+   SELECT category, count(*) FROM prompt_template GROUP BY 1;
+   SELECT organization_id, count(*) FROM org_user_label GROUP BY 1;
+   SELECT relname, pg_size_pretty(pg_total_relation_size(oid)) FROM pg_class
+    WHERE relname IN ('knowledge_base_document','ingestion_jobs','orchestration_run','chat_thread');
    ```
+6. **Announce the window.** Budget = the measured rehearsal wall-clock × 2, two
+   300 s health gates, your own checks, plus the 1.48.0 / 1.53.0 lock steps
+   (seconds per million rows on Premium SSD). Measured locally on the seed
+   database (amd64 emulated): see `RUN-TIMINGS` below.
 
-4. **The database is at 1.41.0 and matches it.**
-   ```bash
-   grep -E '^(DB_VERSION|APP_IMAGE|APP_MEM_LIMIT)=' .env    # DB_VERSION=1.41.0
-   ./schema-parity.sh 1.41.0                               # live catalog matches
-   ```
-   If parity differs, stop. That is a different runbook
-   (`docs/DEPLOYMENT-GUIDE.md` §4.2).
+   Measured 2026-10-19 (`tests/rehearsal.sh`, 1.15.0 → 1.54.0 on
+   `sha-9bd2039`, seed-sized data, Apple Silicon emulating amd64):
+   `upgrade-release.sh` 471 s end to end, rollback 17 s, whole rehearsal
+   638 s, 77/77 assertions. A real VM is native amd64 but has more data:
+   scale the migrate step by the row counts from step 4.
 
-5. **Bring the package to this commit** (it carries `db/1.42.0/`). Off-VM
-   copies first, as always.
-   - `neogen-vm`: run `git status --porcelain` (it must be empty), then
-     `git pull`.
-   - `neogen-nayara` (no GitHub access): ship it as a git bundle, as for the
-     1.41.0 upgrade, and `git pull` from the bundle.
-   ```bash
-   git log -1 --oneline                          # this runbook's commit
-   ls db/1.42.0                                  # grants.sql migrate-1.42.0.sql schema.sql seed.sql
-   ./discover.sh                                 # pending: migrate-1.42.0.sql only, no REQUIRES-REVIEW
-   ```
-   **Do not run `./install.sh`** for this roll. Nothing it converges changed.
-   It also pulls and starts whatever `APP_IMAGE` names, without `update.sh`'s
-   backup, delta ordering and rollback.
-
-6. **Memory headroom for PDF rendering.** In `docker stats --no-stream`, note
-   the app's current usage against its limit. If the VM runs the 1 GB default
-   on a 16 GB machine, decide now whether to set `APP_MEM_LIMIT=4g` (the
-   16 GB profile in `.env.example`) in step 4.1. `update.sh`'s `up -d app`
-   applies it in the same recreate.
-
-7. **Disk.** `df -h .` must show ≥ 3 GB free (backup plus the new image
-   layers). Only remove the frozen `ghcr.io/negentrophi/nxpi_dev` images,
-   never the digest from step 3.
-
-8. **Off-VM copies.** The last nightly dump and an encrypted copy of
-   `secrets/` exist off the VM (`docs/DEPLOYMENT-GUIDE.md` §3.7).
-
-## 4. The update
-
-Announce a short blip (≈ 1–5 min, dominated by the backup and the health gate).
-
-### 4.1 Point `.env` at `latest` **and** 1.42.0, in one edit
+## 5. The window, step by step
 
 ```bash
-cp .env .env.bak-$(date +%Y%m%d-%H%M%S)
-sed -i -e 's|^APP_IMAGE=.*|APP_IMAGE=ghcr.io/negentrophi/nxpi:latest|' \
-       -e 's|^DB_VERSION=.*|DB_VERSION=1.42.0|' .env
-# optional, decided in §3 step 6:
-#   grep -q '^APP_MEM_LIMIT=' .env && sed -i 's|^APP_MEM_LIMIT=.*|APP_MEM_LIMIT=4g|' .env || echo 'APP_MEM_LIMIT=4g' >> .env
-grep -E '^(DB_VERSION|APP_IMAGE|APP_MEM_LIMIT)=' .env
-# APP_IMAGE=ghcr.io/negentrophi/nxpi:latest
-# DB_VERSION=1.42.0
+cd ~/nxpi_config
+./upgrade-release.sh --target 1.54.0 \
+  --image ghcr.io/negentrophi/nxpi:sha-9bd2039@sha256:cbacdbe481d99c7b249ec81bf858420e27e546e36ab5e00940418c62f07969d2 \
+  [--ack PRIVATIZE-KB-SHARES] [--ack DROP-ORG-LABELS] \
+  2>&1 | tee backups/upgrade-1.54.0-$(date +%Y%m%d-%H%M).log
 ```
 
-`DB_VERSION` is mandatory with a moving tag: `latest` never derives a release.
-If you leave it at `1.41.0`, `update.sh` finds nothing pending and rolls an
-image whose attachment writes fail.
+Pass only the acks the dry run asked for. Type `UPGRADE` at the single
+prompt. Every step is recorded in `backups/release-<id>/state.env`;
+`--resume <id>` continues after any interruption. **Nothing is written to the
+live database before step 7.**
 
-### 4.2 Roll
-
-```bash
-./update.sh 2>&1 | tee backups/update-$(date +%Y%m%d-%H%M%S).log
-```
-
-| Stage | Expect on screen |
-|---|---|
-| Preflight | `target image: ghcr.io/negentrophi/nxpi:latest (SQL artifacts: 1.42.0)` |
-| Safety backup | a new `backups/neogen-<ts>.dump` |
-| Rollback reference | `rollback image digest: …` = §3 step 3 |
-| Pull | the digest from §3 step 1 |
-| Schema sync | `applying migration: migrate-1.42.0.sql`, then `grants.sql` re-applied, then `schema migrated to ./db/1.42.0` |
-| Roll + gate | app recreated, health gate passes through the ingress |
-
-| Exit | Meaning | Do |
+| Step | What happens | What to check |
 |---|---|---|
-| 0 | updated and healthy | §4.3, then §5 |
-| 2 | gate failed, **automatically rolled back** to the old digest, `.rollback-image.yml` installed. The column stays, which is harmless | read the log and `./compose.sh logs --tail 200 app`; see §6 |
-| 1 before "Rolling update" | the pull or the delta failed. The running app and database are as they were (the delta runs in one transaction) | read the error. A `lock_timeout` failure means a long transaction held `thread_attachment`; retry `./update.sh` |
-| 1 after "Rolling update" | rollback not healthy | §6 |
+| 1 Preflight | discovery, image pull + digest, disk need, dry run, review notes for 1.46/1.50/1.51/1.54, acks | `READY`; `new image (pinned)` = `sha256:cbacdbe4…`; `typed acks required` matches what you passed |
+| 2 Stop app | Caddy answers 502 from here | downtime starts — note the time |
+| 3 Bundle | dump, uploads tar, config tar (secrets, env, Caddyfile, compose, certs), caddy volumes, row counts, `manifest.sha256` | `config tar: … (secrets, …)`; a "WITHOUT secrets" warning means sudo expired — copy `secrets/` off by hand before continuing |
+| 4 Parity vs 1.42.0 | scratch load of `db/1.42.0/schema.sql` diffed against the live catalog | `missing=0` |
+| 5 Rehearsal | the fresh dump restored to a scratch postgres, every pre-check and all 12 deltas applied there, counts and catalog compared | `the pending set takes this data to db/1.54.0 cleanly` |
+| 6 Privileged pool | `provision-privileged-role.sh` (idempotent) | `neogen_priv ready` |
+| 7 Migrate | `upgrade-db.sh`: `DB_VERSION` → 1.54.0, deltas one transaction each, sentinels / grants / marker verified, row counts against the allow-list | `org_user_label gone`, `marketplace_listing grow`, `no unexpected row loss`, `Upgrade complete` |
+| 8 Switch `.env` | `APP_IMAGE` := the digest-pinned new image | — |
+| 9 Roll | `update.sh` recreates the app, 300 s health gate through Caddy | `app rolled and health-gated` |
+| 10 Verify | counts vs allow-list, custom RBAC rows, uploads bytes, users, credentialed deep probe, schema parity vs `db/1.54.0`, privileged pool in the app process | every line ✔, `release-<id>/summary.txt` |
 
-A `REQUIRES-REVIEW` refusal cannot happen on this path. If you see one,
-`DB_VERSION` or the package is not what §3 established. Stop.
+**Go / no-go before letting users in** (plus §6): sign in as a real admin;
+open a chat and send a message; open a knowledge base and search it; upload a
+file and open it; `./compose.sh logs --tail 300 app | grep -Ei 'error|42P01|42703|org_label|sentinel|POSTGRES_PRIVILEGED_URL|codeRunner'`
+shows nothing unexplained. If any of that fails, roll back now (§7), before
+users write.
 
-### 4.3 Confirm what is running
-
-```bash
-./compose.sh ps -q app | xargs docker inspect --format '{{index .RepoDigests 0}}'   # the §3 step 1 digest
-curl -s -o /dev/null -w '%{http_code}\n' localhost/api/health/ready                # 200
-./schema-parity.sh 1.42.0                                                           # live catalog matches
-./discover.sh                                                                       # nothing pending; probe reports 1.42.0
-./provision-privileged-role.sh --check                                              # five ok lines
-./compose.sh logs --tail 300 app | grep -Ei 'error|42703|rag_skip_reason|POSTGRES_PRIVILEGED_URL|TRUSTED_PROXY|contentNotRefreshed'
-docker stats --no-stream                                                            # app well under its limit
-```
-
-`contentNotRefreshed` naming the four Builder skills is expected, unless the
-gap was closed earlier. `42703` or a sentinel line naming `rag_skip_reason`
-means the delta did not land. Check `DB_VERSION` and run `./discover.sh`.
-Any other error line needs a reason before users are let in.
-
-## 5. Functional verification
+## 6. Functional verification
 
 Regression (what already worked still works):
 
 - [ ] Sign in with an existing password as an admin and as a member
 - [ ] An existing chat opens; a new message streams to completion
-- [ ] Open an existing upload; upload a new file and open it. Its status leaves `pending`
-- [ ] Knowledge-base search returns chunks
+- [ ] Open an existing upload; upload a new file and open it; its status leaves `pending`
+- [ ] Knowledge-base search returns chunks; a quota-limited upload still says the knowledge base is full
 - [ ] Roles & Permissions renders; a custom role keeps its grants
-- [ ] An agent, a workflow and an MCP server open; a short agent turn runs
-- [ ] Document tools from the last roll: a `.docx`, `.xlsx`, `.pdf` and `.pptx` are generated, download and open
+- [ ] An agent, a workflow and an MCP server open; a short agent turn runs; a scheduled trigger fires
+- [ ] A `.docx`, `.xlsx` and `.pdf` are generated, download and open
+
+What the deltas changed (compare with the §4 step 5 record):
+
+- [ ] A knowledge base that was org-shared and approved is visible to another member through its Marketplace listing; **Stop sharing** puts it back to private
+- [ ] A knowledge base that was shared but not approved is now private to its owner
+- [ ] Prompt templates insert text into the composer; their category reads `user`
+- [ ] Organization → member labels: the tab loads with no org labels; platform labels and their tool policies still apply
 
 New in this build:
 
-- [ ] **PDF to a native model** (e.g. Claude/GPT-4o class): attach a PDF and ask about page 2. The answer uses the content
-- [ ] **PDF to a model without native PDF input** (e.g. Kimi, DeepSeek, Mistral): same question. The PDF is converted (page images, or text), not reported as "could not be converted". Then check `docker stats --no-stream`
-- [ ] **Large spreadsheet** (several sheets, thousands of rows): `readDocument` lists the sheets with row counts, reads one sheet on request, and the chat stays responsive while it parses
-- [ ] **Quota message**: as a user at the document limit (or with `knowledge_max_docs_per_user` lowered on a test org), upload a file. The model says the knowledge base is full, **not** "re-upload". In the database the new row has `rag_status='skipped', rag_skip_reason='quota'`
-- [ ] A generated PDF with `Ø`, `≤`, `≥` and non-Latin text renders the characters
-- [ ] A reply that generated files lists them at its end; a new thread's title comes from the typed message, not the file name
-- [ ] A workflow node that generates a file passes it to the next node, and the file appears in the run history
-- [ ] Admin enables image input on a model: the vision probe passes (one small model call)
+- [ ] **Folder upload** into a knowledge base (a small folder of mixed files): the batch progresses, the folder tree shows, the files become searchable
+- [ ] **OCR**: a scanned PDF or an image in a knowledge base yields searchable text (first use downloads the language data — if the VM has no egress, set `KNOWLEDGE_OCR_LANG_PATH` or `MEDIA_INGEST_ENABLED=false`)
+- [ ] **Tool access**: a member's org-level tool allow/deny (ADR-0124 inventory, §3) is enforced in chat
+- [ ] **Code tools withheld**: ask the model to run a short Python snippet — it says the tool is unavailable (no error page, no hang); `( . ./lib.sh; deep_probe_body ) | grep -o '"codeRunner"[^}]*}'` shows `not_configured` (the helper presents `METRICS_TOKEN` and handles domain mode)
+- [ ] `./compose.sh logs app | grep 'refreshed .* built-in skill'` — record the count
 
-New since `cd1397249` (only on `57efccedd` or later, §1.4):
-
-- [ ] **Generate with AI** on the Workflows page produces a draft that opens on the canvas; **Edit with AI** on an existing workflow previews a change, applies it as one undo step, and the run still passes
-- [ ] **Scheduler calendar**: create a trigger with the calendar editor; its next run is in the future, and it does not fire for the tick that preceded its creation
-- [ ] **Execution center**: a finished run shows real token counts and an Output tab; cancel a waiting scheduled run; delete one finished run (the row is gone, nothing else is)
-- [ ] **Files node** (only if an org has Workflow file inputs on): a SharePoint link resolves as the run user; with `WORKFLOW_LOCAL_FILE_ROOTS` unset the local-folder source fails naming the variable, and with it set plus the bind mount a folder's files are listed. A path outside the roots is refused
-- [ ] A workflow published before this build still re-publishes after an edit; if the server-side validation refuses it, the message names the node
-
-**Close the seed gap** if this host has not done it yet (product UI, Skills →
-the skill → edit). Add the matching tool to `allowed-tools`:
-
-| Skill | Add to `allowed-tools` |
-|---|---|
-| Word Document Builder | `createWordDocument` |
-| Spreadsheet Builder | `createSpreadsheet` |
-| PDF Builder | `createPdfDocument` |
-| Presentation Builder | `createPresentation` |
-
-Do **not** delete the rows to force a re-seed. That discards admin edits and
-anything that references the skill.
-
-## 6. Rollback
-
-The old image does not read `rag_skip_reason`, so rollback swaps the image and
-leaves the schema at 1.42.0:
+## 7. Rollback and the failure matrix
 
 ```bash
-cp .env .env.bak-$(date +%Y%m%d-%H%M%S)
-sed -i 's|^APP_IMAGE=.*|APP_IMAGE=<repo>:<old tag>@sha256:<full digest from §3 step 3>|' .env
-# DB_VERSION stays 1.42.0 — do NOT set it back to 1.41.0
-./update.sh
+./upgrade-release.sh --rollback                                  # type ROLLBACK; exit 5 = back and healthy
+./upgrade-release.sh --rollback <id> --accept-data-loss-since    # after users were let in
 ```
 
-- Use the **digest pin**, not `latest`. `latest` would pull the new build
-  again.
-- Leave `DB_VERSION=1.42.0`. The alignment check only compares exact-semver
-  tags, so a `sha-…@sha256:` pin runs against it. With it set back,
-  `schema-parity.sh` would report the extra column.
-- **Never drop the column by hand.** The marker records `migrate-1.42.0.sql`
-  as applied, so a later `./update.sh` would not re-add it, and the next new
-  image would fail every attachment write. If the column really must go, drop
-  it **and** delete that marker row in one transaction, and record it.
-- If `update.sh` exited 1 after the roll and the app is down,
-  `./compose.sh up -d app` is safe: the schema is compatible with both images.
-- Restore from the safety dump (`./restore.sh --yes backups/neogen-<ts>.dump`)
-  only if a data problem is proven. It discards everything written since that
-  dump.
+It verifies the manifest, restores `.env`/`.env.app` from the bundle first
+(`DB_VERSION=1.42.0`, the old `APP_IMAGE`), pins the old digest with
+`.rollback-image.yml`, restores the dump and the uploads tar, starts the old
+image and health-gates it, then compares counts against the bundle. Every
+share, prompt category and label assignment comes back exactly as it was at
+step 3 — and everything written since is lost.
 
-## 7. Aftercare
+| Exit | Meaning | State | Do |
+|---|---|---|---|
+| 0 | upgraded, every verification passed | new image on 1.54.0 | §6, close the window |
+| 1 | preflight or usage failure | nothing changed, old app running | fix, re-run |
+| 2 | refused at a gate before any write (parity, rehearsal, ack, a `BLOCK`) | old app restarted, database untouched | resolve; `--resume <id>` reuses the bundle |
+| 3 | migrated but not rolled (a delta failed, or the health gate) | **app down**, database at an intermediate or final release | fix and `--resume <id>`, or `--rollback <id>` |
+| 4 | serving on the new image, a verification differs | new image serving | investigate `backups/release-<id>/`; rollback valid until users write |
+| 5 | rollback completed and healthy | old image on 1.42.0, pin installed | back; the pin clears on the next successful `./update.sh` |
+| 6 | rollback failed | app stopped, `.env` reverted, old digest pinned | **do not start the app by hand**; read the restore log, fix the cause, re-run `--rollback <id>` |
 
-- [ ] Record the rolled digest, its `rev=` label, the time, and the `update.sh` log in your ops log
-- [ ] **Pin what you rolled** (recommended). Change `APP_IMAGE` to `ghcr.io/negentrophi/nxpi:latest@sha256:<digest>`. `latest` keeps moving, and the next `./install.sh` or `./compose.sh pull` would otherwise roll an unreviewed build outside `update.sh`
-- [ ] Watch app memory and restarts for a day (`docker stats`, `./compose.sh ps`): exit 137 means OOM, so raise `APP_MEM_LIMIT`
-- [ ] Seed gap closed on each host (§5), or recorded as deferred
+A delta that fails (for example 1.53.0's validation on an orphan the
+pre-check missed, or a `lock_timeout`) rolls its own transaction back; the
+marker records only the deltas that completed, so `--resume <id>` continues
+from the failed one after the cause is fixed.
+
+**Never** point `.env` at the old image with the database past 1.51.0 and
+start it by hand: member-label saves fail on 1.51–1.53 and the labels routes
+fail on 1.54.
+
+## 8. Aftercare
+
+- [ ] Copy `backups/neogen-<id>.dump` and `backups/uploads-<id>.tar.gz` off the VM; keep `backups/release-<id>/` until the next backup cycle has proven itself — it is the only copy of the pre-1.46 shares, pre-1.50 categories and the dropped label assignments
+- [ ] Record the rolled digest, `rev=`, the acks given, the §4 step 5 numbers and the measured window timings in the ops log
+- [ ] Watch app memory and restarts for a day (`docker stats`, `./compose.sh ps`); exit 137 means OOM — raise `APP_MEM_LIMIT`
+- [ ] Watch the uploads volume after the first folder uploads (`docker system df -v | grep uploads`)
 - [ ] Delete `.env.bak-*` once confident
-- [ ] Repeat on the next host: `neogen-nayara` → `neogen-vm` (NX-PI once it is at 1.41.0)
-- [ ] Next build: sync first. Run `tools/sync-from-app-copy.sh <nxpi_dev>/azure-deployment` (report), then `--apply` for any new `db/<version>`, `bash tests/db-bundle-lint.sh`, add a `SCHEMA_PROBES` row in `lib.sh`, and bump `DB_VERSION` in `.env.example` and the README. A single additive release goes through `./update.sh` with `DB_VERSION` bumped in the same edit as `APP_IMAGE`. A `REQUIRES-REVIEW` or multi-release jump goes through `docs/DEPLOYMENT-GUIDE.md` §4.2
+- [ ] Repeat on the next host: `neogen-nayara` → `neogen-vm`
+- [ ] Open items for the next release: package the code runner (image publish + `compose.code-runner.yml` merged into this compose, `secrets/code_runner_token`, `CODE_RUNNER_URL`/`CODE_RUNNER_TOKEN_FILE` on `app`); the 10 unpushed app commits (ADR-0128 bulk import) once CI publishes them
+- [ ] Next sync: `tools/sync-from-app-copy.sh <nxpi_dev>/azure-deployment`, then `--apply`; for every new delta decide **here** whether it belongs in `PACKAGE_REVIEW_VERSIONS` (upstream's `Route:` line is not the gate), add its pre-checks and its `SCHEMA_PROBES` row, bump `DB_VERSION` in `.env.example` and the README
