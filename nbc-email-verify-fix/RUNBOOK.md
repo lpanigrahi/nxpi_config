@@ -93,12 +93,14 @@ cd ~
 
 ```bash
 docker ps --format '{{.Names}}' | grep -E 'neogen-(postgres|caddy|app)-1'
-docker exec neogen-caddy-1 sh -c 'grep -rn "nbcbearings" /etc/caddy/'
+docker exec neogen-caddy-1 printenv SITE_ADDRESS
+docker exec neogen-app-1 printenv BETTER_AUTH_URL
 ```
 
-**Expect:** the three container names, and at least one Caddy line mentioning
-`momentumai.nbcbearings.in`.
-**If the grep prints nothing, stop.** This VM does not serve the site; find the one that does.
+**Expect:** the three container names, then `momentumai.nbcbearings.in` and
+`https://momentumai.nbcbearings.in`. (The Caddyfile reads the host from `{$SITE_ADDRESS}`,
+so grepping `/etc/caddy/` finds nothing even on the right VM.)
+**If neither shows `momentumai.nbcbearings.in`, stop.** This VM does not serve the site; find the one that does.
 
 ### Step 3: Find the organization id (read-only)
 
@@ -284,7 +286,7 @@ Future bulk imports at that domain then need no "skip domain check" and no scrip
 | `--skip-host-check` | Skip the Caddy wrong-server check |
 
 **Environment overrides:** `PG_CONTAINER` (default `neogen-postgres-1`), `CADDY_CONTAINER`
-(default `neogen-caddy-1`), `SITE_HOST` (default `momentumai.nbcbearings.in`), `PG_DB`
+(default `neogen-caddy-1`), `APP_CONTAINER` (default `neogen-app-1`), `SITE_HOST` (default `momentumai.nbcbearings.in`), `PG_DB`
 (default: the container's `POSTGRES_DB`).
 
 **Manual check of one user** (read-only):

@@ -14,6 +14,7 @@ set -euo pipefail
 DOMAIN="nbcbearings.in"
 PG_CONTAINER="${PG_CONTAINER:-neogen-postgres-1}"
 CADDY_CONTAINER="${CADDY_CONTAINER:-neogen-caddy-1}"
+APP_CONTAINER="${APP_CONTAINER:-neogen-app-1}"
 SITE_HOST="${SITE_HOST:-momentumai.nbcbearings.in}"
 ORG_ID="" ONLY_EMAIL="" APPLY=0 LIST_ORGS=0 SKIP_HOST_CHECK=0
 
@@ -49,9 +50,14 @@ psql_c() {
 
 docker inspect "$PG_CONTAINER" >/dev/null 2>&1 || die "container $PG_CONTAINER not found"
 
-# Wrong-server guard: this VM must actually serve the affected site.
+# Wrong-server guard: this VM must actually serve the affected site. The
+# package Caddyfile reads the host from {$SITE_ADDRESS}, so check Caddy's env
+# (and the app's BETTER_AUTH_URL) rather than grepping /etc/caddy.
 if [[ $SKIP_HOST_CHECK -eq 0 ]]; then
-  docker exec "$CADDY_CONTAINER" sh -c "grep -rqs '$SITE_HOST' /etc/caddy/" \
+  served="$(docker exec "$CADDY_CONTAINER" printenv SITE_ADDRESS 2>/dev/null || true)"
+  served+=" $(docker exec "$APP_CONTAINER" printenv BETTER_AUTH_URL 2>/dev/null || true)"
+  served+=" $(docker exec "$CADDY_CONTAINER" sh -c 'cat /etc/caddy/* 2>/dev/null' || true)"
+  grep -qiF "$SITE_HOST" <<<"$served" \
     || die "$CADDY_CONTAINER does not serve $SITE_HOST — wrong VM? (--skip-host-check to override)"
 fi
 
