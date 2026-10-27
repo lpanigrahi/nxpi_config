@@ -53,7 +53,7 @@ table.
 | Guard | Behaviour |
 |---|---|
 | Dry run by default | Nothing is written unless you pass `--apply` |
-| Wrong-server check | Exits if `neogen-caddy-1` does not serve `momentumai.nbcbearings.in` |
+| Wrong-server hint | Warns (does not exit) if the domain is not found in Caddy/app config |
 | Org check | Exits if the org id does not exist |
 | Foreign domain claim | Exits if **another** org has verified `nbcbearings.in`. Verified users would otherwise be auto-joined into that org at their next sign-in. |
 | Backup first | Writes `before.csv` and `rollback.sql` before any change |
@@ -93,14 +93,15 @@ cd ~
 
 ```bash
 docker ps --format '{{.Names}}' | grep -E 'neogen-(postgres|caddy|app)-1'
-docker exec neogen-caddy-1 printenv SITE_ADDRESS
-docker exec neogen-app-1 printenv BETTER_AUTH_URL
 ```
 
-**Expect:** the three container names, then `momentumai.nbcbearings.in` and
-`https://momentumai.nbcbearings.in`. (The Caddyfile reads the host from `{$SITE_ADDRESS}`,
-so grepping `/etc/caddy/` finds nothing even on the right VM.)
-**If neither shows `momentumai.nbcbearings.in`, stop.** This VM does not serve the site; find the one that does.
+**Expect:** the three container names. If any is missing, stop.
+
+Where the domain is configured differs per VM (Caddyfile, `SITE_ADDRESS`, or TLS
+terminated upstream on older hosts), so the script only **warns** if it cannot find
+`momentumai.nbcbearings.in` in config. The real proof that you are on the right server
+comes in Steps 3–4: the organization and ~1200 `@nbcbearings.in` users must be in
+**this** database.
 
 ### Step 3: Find the organization id (read-only)
 
@@ -216,7 +217,7 @@ are **not** written to the in-app Audit log, so these files are the record.
 
 | Message | Meaning | What to do |
 |---|---|---|
-| `neogen-caddy-1 does not serve momentumai.nbcbearings.in — wrong VM?` | This server does not host the site | Run on the correct VM. Use `--skip-host-check` only if you are certain the site is proxied differently |
+| `WARNING: could not confirm from config that this VM serves …` | Advisory only; the domain is configured somewhere the script does not look | Continue, but check the org name, count and sample emails in the dry run |
 | `container neogen-postgres-1 not found` | Different container name on this VM | `docker ps`, then run with `PG_CONTAINER=<name> ./fix-…sh …` |
 | `ERROR: organization not found` | Wrong org id | Re-run Step 3 |
 | `ERROR: domain verified by another organization` | Another org owns `nbcbearings.in` | **Do not proceed.** Escalate to engineering; verifying users would move them into that org |
@@ -283,7 +284,7 @@ Future bulk imports at that domain then need no "skip domain check" and no scrip
 | `--email <addr>` | Limit to one user |
 | `--apply` | Actually write (otherwise dry run) |
 | `--domain <d>` | Default `nbcbearings.in` |
-| `--skip-host-check` | Skip the Caddy wrong-server check |
+| `--skip-host-check` | Skip the advisory wrong-server hint |
 
 **Environment overrides:** `PG_CONTAINER` (default `neogen-postgres-1`), `CADDY_CONTAINER`
 (default `neogen-caddy-1`), `APP_CONTAINER` (default `neogen-app-1`), `SITE_HOST` (default `momentumai.nbcbearings.in`), `PG_DB`

@@ -50,15 +50,17 @@ psql_c() {
 
 docker inspect "$PG_CONTAINER" >/dev/null 2>&1 || die "container $PG_CONTAINER not found"
 
-# Wrong-server guard: this VM must actually serve the affected site. The
-# package Caddyfile reads the host from {$SITE_ADDRESS}, so check Caddy's env
-# (and the app's BETTER_AUTH_URL) rather than grepping /etc/caddy.
+# Wrong-server hint, advisory only. Where the host is configured differs per
+# deployment (Caddyfile, {$SITE_ADDRESS}, upstream TLS on legacy hosts), so a
+# miss here proves nothing. The hard guards are in the database: the org UUID
+# must exist here, and the dry run shows its name, count and sample emails.
 if [[ $SKIP_HOST_CHECK -eq 0 ]]; then
   served="$(docker exec "$CADDY_CONTAINER" printenv SITE_ADDRESS 2>/dev/null || true)"
   served+=" $(docker exec "$APP_CONTAINER" printenv BETTER_AUTH_URL 2>/dev/null || true)"
   served+=" $(docker exec "$CADDY_CONTAINER" sh -c 'cat /etc/caddy/* 2>/dev/null' || true)"
   grep -qiF "$SITE_HOST" <<<"$served" \
-    || die "$CADDY_CONTAINER does not serve $SITE_HOST — wrong VM? (--skip-host-check to override)"
+    || echo "WARNING: could not confirm from config that this VM serves $SITE_HOST;" \
+            "check the org name and sample emails below before applying." >&2
 fi
 
 if [[ $LIST_ORGS -eq 1 ]]; then
